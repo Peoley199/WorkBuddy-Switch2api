@@ -73,6 +73,20 @@ pub struct Endpoint {
     /// 共用一个名单只会让人在两处改同一件事。
     #[serde(default)]
     pub accounts: Vec<String>,
+    /// **额外放行**的模型：上游列表里没有、但本入口实测可用的。
+    ///
+    /// 🔴 为什么必须有它：上游的 `/v2/enterprises/personal/models` 是**给客户端 UI 看的展示列表**，
+    /// 里面混着 `default-model` / `fast-model` / `primary-model` / `deep-model` 这类「模式名」，
+    /// **不等于可用模型全集**。实测（2026-10-11）：`deepseek-v4.1-flash` 在国际版上游
+    /// `/v2/chat/completions` 上是 200 成功的，却**完全不在国际版的列表里**
+    /// （那 29 KB JSON 里 `"deepseek"` 出现 0 次）；反过来列表里的 `deep-model` 直发反而 11102。
+    ///
+    /// 版本防火墙是按列表判定归属的，于是这类「能用但没列出」的模型会被误判成另一版专属、
+    /// 直接 400 掉。填进这里的模型：
+    /// ① 会并入本入口 `GET /v1/models` 的返回；
+    /// ② **跳过版本防火墙**（用户显式声明优先于自动推断）。
+    #[serde(default)]
+    pub extra_models: Vec<String>,
 }
 
 impl Default for Endpoint {
@@ -82,6 +96,7 @@ impl Default for Endpoint {
             listen: String::new(),
             api_key: String::new(),
             accounts: Vec::new(),
+            extra_models: Vec::new(),
         }
     }
 }
@@ -204,6 +219,7 @@ impl ProxyConfig {
                 listen: old.listen.unwrap_or_default(),
                 api_key: old.api_key.unwrap_or_default(),
                 accounts: old.accounts,
+                ..Endpoint::default()
             },
             international: Endpoint::default(),
         }
@@ -221,12 +237,14 @@ impl ProxyConfig {
                 listen: old.domestic.listen,
                 api_key: old.domestic.api_key,
                 accounts: old.accounts.clone(),
+                ..Endpoint::default()
             },
             international: Endpoint {
                 enabled: old.international.enabled,
                 listen: old.international.listen,
                 api_key: old.international.api_key,
                 accounts: old.accounts,
+                ..Endpoint::default()
             },
         }
         .resolved()
@@ -429,29 +447,57 @@ fn models_url(acc: &Value) -> String {
     format!("{}/v2/enterprises/personal/models", upstream_endpoint(acc))
 }
 
-/// 模型 id → 属于哪一档。由「拉模型列表」这条路径写入。
+/// 位掩码：某个模型出现在**哪几档**的模型列表里。
+const MASK_DOMESTIC: u8 = 1 << 0;
+const MASK_INTERNATIONAL: u8 = 1 << 1;
+
+fn edition_mask(e: Edition) -> u8 {
+    match e {
+        Edition::Domestic => MASK_DOMESTIC,
+        Edition::International => MASK_INTERNATIONAL,
+    }
+}
+
+/// 模型 id → **出现在哪几档的列表里**（位掩码），由「拉模型列表」这条路径**累加**写入。
 ///
-/// 反代池里国内版和国际版的号是混着的，而**两版的模型列表不一样**：
-/// 拿国际版专属的 model 去打国内版网关会被拒。所以请求进来先按 model 查这张表，
-/// 命中就只在该版本的号里选；没命中（还没拉过列表）就退回原来的轮转行为。
-fn model_routes() -> &'static Mutex<HashMap<String, Edition>> {
-    static ROUTES: std::sync::OnceLock<Mutex<HashMap<String, Edition>>> =
-        std::sync::OnceLock::new();
+/// 反代池里国内版和国际版的号是混着的，而两版的模型列表不一样：拿只属于另一版的 model
+/// 去打本版网关会被上游拒（`11102 only available for authorized users`）。所以请求进来先按
+/// model 查这张表，**确实只属于另一版**时才拦。
+///
+/// 🔴 **必须是累加，不能是覆盖**：两版列表有大量重叠（`glm-5.3` / `hy3` / `lite` …），
+/// 覆盖会让重叠模型被记成「后拉的那一档」，于是**另一档的入口连自己列表里的模型都 400 掉**。
+/// 实测踩过：国际版列表后拉之后，`7863` 发 `glm-5.3` 直接报「属于国际版」。
+fn model_routes() -> &'static Mutex<HashMap<String, u8>> {
+    static ROUTES: std::sync::OnceLock<Mutex<HashMap<String, u8>>> = std::sync::OnceLock::new();
     ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 记下「这些模型属于这一档」。拉列表成功时调用。
+/// 记下「这些模型**也**出现在这一档的列表里」。拉列表成功时调用（取并集，不覆盖）。
 fn remember_model_routes(edition: Edition, ids: &[String]) {
     if let Ok(mut m) = model_routes().lock() {
+        let bit = edition_mask(edition);
         for id in ids {
-            m.insert(id.clone(), edition);
+            *m.entry(id.clone()).or_insert(0) |= bit;
         }
     }
 }
 
-/// 查某个 model 属于哪一档。
+/// 某个 model **只**属于哪一档。
+///
+/// 只在「恰好出现在一档的列表里」时返回 `Some`；**两档都有、或谁都没见过 → `None`** ——
+/// 这两种情况都不该拦，交给上游判定。（`deepseek-v4.1-flash` 这类「上游能用但没列出」的
+/// 模型，可用 [`Endpoint::extra_models`] 显式放行。）
 pub fn model_edition(model: &str) -> Option<Edition> {
-    model_routes().lock().ok().and_then(|m| m.get(model).copied())
+    let mask = model_routes()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(model).copied())
+        .unwrap_or(0);
+    match mask {
+        MASK_DOMESTIC => Some(Edition::Domestic),
+        MASK_INTERNATIONAL => Some(Edition::International),
+        _ => None,
+    }
 }
 
 /// 解析版本标识（前端传 `domestic` / `international`）。
@@ -569,6 +615,17 @@ fn sanitize_messages(messages: &Value, degraded: &mut Vec<String>) -> Value {
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let mut m = item.clone();
+        // system 消息先过一遍「环境注入」净化，见 strip_env_injection 的说明。
+        if m.get("role").and_then(Value::as_str) == Some("system") {
+            if let Some(cleaned) = m
+                .get("content")
+                .and_then(Value::as_str)
+                .and_then(strip_env_injection)
+            {
+                degraded.push("system-env".to_string());
+                m["content"] = Value::String(cleaned);
+            }
+        }
         let Some(parts) = m.get("content").and_then(Value::as_array) else {
             // content 是字符串（最常见）或压根没有：原样放行。
             out.push(m);
@@ -588,6 +645,47 @@ fn sanitize_messages(messages: &Value, degraded: &mut Vec<String>) -> Value {
         out.push(m);
     }
     Value::Array(out)
+}
+
+/// 摘掉 system prompt 末尾的**环境上下文注入块**。
+///
+/// 上游在 2026-10-09 起上线了一道**渠道校验**：它会识别 system prompt 里模仿
+/// Claude Code 的环境注入（`gitStatus:` / `Current branch:` / `Main branch` /
+/// `Git user:` / `Recent commits:` …），命中就把整条请求判成「非官方客户端」：
+///
+/// ```text
+/// {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+///  "displayMsg":{"zh":"请求被拦截，请重新发送"},
+///  "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。"}}
+/// ```
+///
+/// 🔴 这**不是**出站请求头伪装不够——同一套头、同一个号，只去掉这段就能过。
+/// 也**不是**单个关键词：把这段单独拎出来测是通过的，「长前缀 + 这段」的组合
+/// 才必然命中，说明上游认的是累积出来的整体模式。
+///
+/// 实测（**假 model 名，零额度消耗**，靠返回码区分）：
+///
+/// | 请求 | 结果 |
+/// |---|---|
+/// | 前 10132 字 | `11102` 过了渠道校验，只是 model 不存在 |
+/// | 前 10132 字 + `"x"*39`（同长度换内容） | `11102` 仍通过 |
+/// | 前 10132 字 + 真实触发段 | `11128` 命中 |
+/// | 去掉 `gitStatus:` 之后整块 | `11102` 恢复 |
+/// | 把 system 改成 user | `11102` 恢复 |
+///
+/// 处理方式：从**最后一个** `gitStatus:` 起截断。ZCode 把这段环境快照追加在
+/// system prompt 末尾，丢掉它只是让模型看不到 git 状态——而 ZCode 每轮都会重新
+/// 注入，代价远小于整条请求被打回重试。
+///
+/// 返回 `None` = 没有可摘的块（原样透传，例如没注入过的短 system prompt）。
+fn strip_env_injection(text: &str) -> Option<String> {
+    let idx = text.rfind("gitStatus:")?;
+    let cleaned = text[..idx].trim_end();
+    // 摘完什么都不剩就别动，免得把 system prompt 整条清空。
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.to_string())
 }
 
 /// 单个内容块：`None` = 原样保留，`Some(text)` = 降级成文本块。
@@ -716,16 +814,18 @@ fn with_degraded_header(mut resp: Response, degraded: &[String]) -> Response {
 }
 
 /// 把 OpenAI 入站体改写成上游形态（强制流式、去掉上游不认识的字段）。
-fn build_upstream_body(incoming: &Value, degraded: &mut Vec<String>) -> Value {
+fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<String>) -> Value {
     let model = incoming
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("deepseek-v4-flash")
         .to_string();
     let messages = incoming.get("messages").cloned().unwrap_or_else(|| json!([]));
+    let mut sanitized = sanitize_messages(&messages, degraded);
+    ensure_leading_system(edition, &mut sanitized, degraded);
     let mut body = json!({
         "model": model,
-        "messages": sanitize_messages(&messages, degraded),
+        "messages": sanitized,
         "stream": true,
     });
     if let Some(t) = incoming.get("temperature") {
@@ -741,6 +841,39 @@ fn build_upstream_body(incoming: &Value, degraded: &mut Vec<String>) -> Value {
         body["tools"] = t.clone();
     }
     body
+}
+
+/// 国际版上游要求**第一条消息必须是 `system`**，否则整条请求被拦。
+///
+/// 实测（2026-10-11，7864 → www.workbuddy.ai）：
+/// - 首条是 `user` → `HTTP 400 {"code":11128,"msg":"first message is not system prompt"}`
+/// - 同一个请求前面补一条 system → **200 正常返回**
+///
+/// 国内版没有这个要求（7863 上只发一条 user 是通的），所以只在国际版兜。
+///
+/// 客户端不一定带 system（探针、简单脚本、部分 OpenAI 兼容客户端都不带），
+/// 兜一条默认的即可 —— 不带会被**整个**拦掉，比「多一句无害的 system」糟糕得多。
+fn ensure_leading_system(edition: Edition, messages: &mut Value, degraded: &mut Vec<String>) {
+    if edition != Edition::International {
+        return;
+    }
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    let already = arr
+        .first()
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        .map(|r| r == "system")
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    arr.insert(
+        0,
+        json!({"role": "system", "content": "You are a helpful assistant."}),
+    );
+    degraded.push("leading-system".to_string());
 }
 
 // ---------------------------------------------------------------- 处理
@@ -844,7 +977,8 @@ fn cut_text(s: &str, max: usize) -> String {
 async fn list_models(State(st): State<AppState>) -> Response {
     match fetch_edition_models(&st.cfg, st.edition).await {
         Ok((ids, _, _)) => {
-            let data: Vec<Value> = ids
+            let all = merge_extra_models(ids, &st.endpoint.extra_models);
+            let data: Vec<Value> = all
                 .iter()
                 .map(|id| {
                     json!({
@@ -866,6 +1000,20 @@ async fn list_models(State(st): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `/v1/models` 的最终清单 = **上游列表 + 本入口声明的 `extra_models`**。
+///
+/// 上游在前、额外的按声明顺序追加，去重（上游已经列过的不再重复）。
+/// 为什么要这份补充，见 [`Endpoint::extra_models`] 的说明 —— 上游那个列表不完整。
+fn merge_extra_models(mut upstream: Vec<String>, extra: &[String]) -> Vec<String> {
+    for m in extra {
+        let m = m.trim();
+        if !m.is_empty() && !upstream.iter().any(|x| x == m) {
+            upstream.push(m.to_string());
+        }
+    }
+    upstream
 }
 
 // ---------------------------------------------------------------- 取模型列表（桌面端按钮用）
@@ -976,6 +1124,10 @@ pub async fn fetch_models(edition: Option<String>) -> Result<Value, String> {
     for (e, res) in list.iter().zip(results) {
         match res {
             Ok((ids, source, url)) => {
+                // 和 `GET /v1/models` 保持同一口径：并上本入口声明的 `extra_models`。
+                // 少了这一步，界面上「获取模型ID」显示的集合会和客户端实际拿到的不一致
+                // （上游那个列表不完整，见 `Endpoint::extra_models`）。
+                let ids = merge_extra_models(ids, &cfg.endpoint(*e).extra_models);
                 if flat_models.is_empty() {
                     flat_models = ids.clone();
                     flat_source = source.clone();
@@ -1510,25 +1662,33 @@ async fn chat_completions(
         .unwrap_or("deepseek-v4-flash")
         .to_string();
 
-    // 🔴 版本防火墙：本入口只服务一个版本。模型名能唯一确定版本时（拉过一次模型
-    // 列表就会记住映射），直接拦下跨版本的请求并说清楚该连哪个端口 —— 放它过去
-    // 只会拿错版本的号去打上游，换回来一个看不懂的 4xx。
-    // 映射表里没有的模型（新模型、还没拉过列表）不拦，交给上游判定。
-    if let Some(want) = model_edition(&model) {
-        if want != st.edition {
-            let msg = format!(
-                "模型 `{model}` 属于{}，而当前入口是{}（{}）。请改用{}入口（{}）访问。",
-                want.label(),
-                st.edition.label(),
-                st.endpoint.listen,
-                want.label(),
-                st.cfg.endpoint(want).listen,
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": {"message": msg}})),
-            )
-                .into_response();
+    // 🔴 版本防火墙：本入口只服务一个版本。模型名能**唯一确定**属于另一版时，直接拦下并
+    // 说清楚该连哪个端口 —— 放它过去只会拿错版本的号去打上游，换回来一句
+    // `11102 only available for authorized users`（实测）。
+    //
+    // 三种情况**不拦**，交给上游判定：
+    // ① 谁都没见过的模型（新模型、还没拉过列表）；
+    // ② 两版列表里**都**有的模型 —— 那说明两版都能用（`glm-5.3` / `hy3` / `lite` …）；
+    // ③ 用户在本入口 `extra_models` 里**显式声明**的 —— 上游那个列表不完整，
+    //    「没列出」≠「不能用」（`deepseek-v4.1-flash` 正是如此）。显式声明优先于自动推断。
+    let declared_here = st.endpoint.extra_models.iter().any(|m| m.trim() == model);
+    if !declared_here {
+        if let Some(want) = model_edition(&model) {
+            if want != st.edition {
+                let msg = format!(
+                    "模型 `{model}` 属于{}，而当前入口是{}（{}）。请改用{}入口（{}）访问。",
+                    want.label(),
+                    st.edition.label(),
+                    st.endpoint.listen,
+                    want.label(),
+                    st.cfg.endpoint(want).listen,
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": msg}})),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -1575,7 +1735,7 @@ async fn chat_completions(
     // 上游不认识的内容块（zcode 等客户端发的 file / document）在这里降级成文本，
     // 否则整条请求会被上游 400：`unsupported content type at index 0: file`。
     let mut degraded: Vec<String> = Vec::new();
-    let upstream_body = build_upstream_body(&incoming, &mut degraded);
+    let upstream_body = build_upstream_body(&incoming, st.edition, &mut degraded);
     if !degraded.is_empty() {
         eprintln!(
             "[反代] 内容块降级 {} (model={model})",
@@ -2034,6 +2194,44 @@ pub fn restart_proxy_server() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// system prompt 末尾的环境注入块会被摘掉——上游的渠道校验（11128）正是靠
+    /// 识别这段判定「非官方客户端」。见 `strip_env_injection`。
+    #[test]
+    fn strips_git_env_injection_from_system_prompt() {
+        let raw = "You are ZCode.\n\n# Rules\nBe brief.\n\n\
+                   gitStatus: clean\n\nCurrent branch: main\n\nGit user: someone\n";
+        let cleaned = strip_env_injection(raw).expect("应当能摘出环境块");
+        assert_eq!(cleaned, "You are ZCode.\n\n# Rules\nBe brief.");
+        assert!(!cleaned.contains("gitStatus:"), "gitStatus 块必须整块消失");
+        assert!(!cleaned.contains("Git user:"), "紧跟其后的环境行要一起摘掉");
+    }
+
+    /// 没有环境块时原样放行；整条都是环境块时也不动（不能把 system 清空）。
+    #[test]
+    fn env_strip_is_noop_when_nothing_to_strip() {
+        assert!(strip_env_injection("You are WorkBuddy. Be helpful.").is_none());
+        assert!(
+            strip_env_injection("gitStatus: clean").is_none(),
+            "全是要摘的内容就干脆别动，免得 system 变空"
+        );
+    }
+
+    /// 净化只作用于 system 消息，user / assistant 的内容一个字都不能少。
+    #[test]
+    fn env_strip_only_touches_system_role() {
+        let mut degraded = Vec::new();
+        let msgs = json!([
+            { "role": "system", "content": "Rules.\n\ngitStatus: clean\n\nGit user: x\n" },
+            { "role": "user", "content": "gitStatus: 用户自己写的，必须原样保留" },
+            { "role": "assistant", "content": "ok" },
+        ]);
+        let out = sanitize_messages(&msgs, &mut degraded);
+        assert_eq!(out[0]["content"], "Rules.");
+        assert_eq!(out[1]["content"], "gitStatus: 用户自己写的，必须原样保留");
+        assert_eq!(out[2]["content"], "ok");
+        assert_eq!(degraded, vec!["system-env".to_string()]);
+    }
+
     /// v1 的扁平配置能自动迁移成双入口：旧的 `listen` / `api_key` / `enabled`
     /// 归国内版，国际版保持默认关闭 —— 不擅自替用户开一个以前不存在的监听端口。
     #[test]
@@ -2151,18 +2349,50 @@ mod tests {
         assert_eq!(owner_tag(Edition::International), "workbuddy-intl");
     }
 
-    /// 只有一档有号时，另一档的模型不该被路由过去。
+    /// 只有一档有的模型 → 判给那一档；**两档都有 → 两类都不判**（否则会互相误拦）。
     #[test]
-    fn model_routes_record_and_lookup() {
-        remember_model_routes(
-            Edition::International,
-            &["intl-only-model".to_string()],
-        );
+    fn model_routes_union_not_overwrite() {
+        remember_model_routes(Edition::International, &["intl-only-model".to_string()]);
         assert_eq!(
             model_edition("intl-only-model"),
             Some(Edition::International)
         );
         assert_eq!(model_edition("never-seen-model"), None);
+
+        // 🔴 同名模型被两档各记一次后，必须变成「都能用」，而不是被后写的那档覆盖。
+        // 实测踩过：国际版列表后拉之后，7863 发 `glm-5.3` 会被误报「属于国际版」。
+        remember_model_routes(Edition::Domestic, &["shared-model".to_string()]);
+        remember_model_routes(Edition::International, &["shared-model".to_string()]);
+        assert_eq!(
+            model_edition("shared-model"),
+            None,
+            "两档都列出过的模型不该被判成某一档，否则另一档的入口会被误拦"
+        );
+        // 顺序反过来也必须一样
+        remember_model_routes(Edition::International, &["shared2".to_string()]);
+        remember_model_routes(Edition::Domestic, &["shared2".to_string()]);
+        assert_eq!(model_edition("shared2"), None);
+    }
+
+    /// `extra_models` 并入 `/v1/models`：追加在末尾、去重、去空白、忽略空项。
+    #[test]
+    fn extra_models_merge_into_model_list() {
+        let up = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(merge_extra_models(up.clone(), &[]), up, "没声明时原样返回");
+
+        let out = merge_extra_models(
+            up,
+            &[
+                " deepseek-v4.1-flash ".to_string(),
+                "a".to_string(),
+                "   ".to_string(),
+            ],
+        );
+        assert_eq!(
+            out,
+            vec!["a", "b", "deepseek-v4.1-flash"],
+            "上游在前；`a` 已存在不重复；空白/空项忽略"
+        );
     }
 
     /// 账号池按版本取号：只要国内版时不该给出国际版的号。
@@ -2276,7 +2506,8 @@ mod tests {
             }]
         });
         let mut degraded = Vec::new();
-        let body = build_upstream_body(&incoming, &mut degraded);
+        // 用国内版：国际版会额外兜一条 system（见下面的专门测试），断言就对不上了。
+        let body = build_upstream_body(&incoming, Edition::Domestic, &mut degraded);
         assert_eq!(body["model"], "glm-5.3-flash");
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.3);
@@ -2285,6 +2516,40 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("f_123"));
+    }
+
+    /// 国际版必须给「首条不是 system」的请求补一条 —— 不补会被上游整个拦掉
+    /// （实测 `11128 first message is not system prompt`）。国内版不补、也不该补。
+    #[test]
+    fn international_gets_leading_system() {
+        let incoming = json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let mut degraded = Vec::new();
+        let intl = build_upstream_body(&incoming, Edition::International, &mut degraded);
+        assert_eq!(intl["messages"][0]["role"], "system", "国际版要兜一条 system");
+        assert_eq!(intl["messages"][1]["role"], "user", "原来的消息要原样跟在后头");
+        assert_eq!(intl["messages"].as_array().unwrap().len(), 2);
+        assert!(degraded.contains(&"leading-system".to_string()), "要留痕");
+
+        // 已经有 system 就不要再插
+        let with_sys = json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                { "role": "system", "content": "s" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let body2 = build_upstream_body(&with_sys, Edition::International, &mut Vec::new());
+        assert_eq!(body2["messages"].as_array().unwrap().len(), 2, "不该重复插");
+        assert_eq!(body2["messages"][0]["content"], "s", "原有的 system 要保留");
+
+        // 国内版：一行都不许改
+        let dom = build_upstream_body(&incoming, Edition::Domestic, &mut Vec::new());
+        assert_eq!(dom["messages"][0]["role"], "user");
+        assert_eq!(dom["messages"].as_array().unwrap().len(), 1);
     }
 
     /// 上游 `data.agents[].models[]` 形态。

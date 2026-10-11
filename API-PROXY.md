@@ -106,20 +106,37 @@ api_key  = （没设置就随便填，例如 sk-anything）
 
 ## 配置
 
-`~/.wb-switch/proxy.json`：
+`~/.wb-switch/proxy.json` —— 国内版与国际版**各一个入口**，开关 / 监听地址 / key / 账号名单各自独立：
 
 ```json
 {
-  "enabled": true,
-  "listen": "127.0.0.1:7863",
-  "api_key": "",
-  "accounts": []
+  "domestic": {
+    "enabled": true,
+    "listen": "127.0.0.1:7863",
+    "api_key": "",
+    "accounts": [],
+    "extra_models": []
+  },
+  "international": {
+    "enabled": false,
+    "listen": "127.0.0.1:7864",
+    "api_key": "",
+    "accounts": [],
+    "extra_models": []
+  }
 }
 ```
 
 - `listen` —— 想让局域网其它机器访问才改成 `0.0.0.0:7863`（**务必同时设 api_key**）
-- `api_key` —— 留空 = 不鉴权；设了之后客户端必须带 `Authorization: Bearer <key>`
-- `accounts` —— 参与轮转的 uid 列表；**留空 = 全部账号**
+- `api_key` —— 留空 = 不鉴权；设了之后客户端必须带 `Authorization: Bearer <key>`。**两个入口各一把**
+- `accounts` —— 参与轮转的 uid；**留空 = 该版本的全部账号**。两个入口各存一份
+- `extra_models` —— 🔴 **额外放行**的模型（**上游列表里没有、但本入口实测可用的**）。
+  会并入本入口的 `GET /v1/models`，并**跳过版本校验**。典型例子：`deepseek-v4.1-flash`
+  在国际版上游能正常返回，却没出现在国际版列表里（原因见「已知限制」）。
+  界面上每张供应商卡片都有这一栏，逗号分隔。
+
+> v1 的扁平格式（顶层 `enabled` / `listen` / `api_key` / `accounts`）会被自动迁移到
+> **国内版**入口，国际版保持关闭；迁移结果就地落盘，不会每次重迁。
 
 ## 设计要点（和别的实现的关键差别）
 
@@ -174,12 +191,115 @@ x-wb-switch-degraded: file=1
 好处是客户端不再因为一个附件块被整条打回 —— 长会话的自动 compact 最容易踩到，
 因为它会把历史里所有附件块原样重发一遍。
 
+## 上游渠道校验 11128（system prompt 净化）
+
+2026-10-09 起上游多了一道**渠道校验**：它会识别 system prompt 里模仿 Claude Code 的
+**环境上下文注入块**（`gitStatus:` / `Current branch:` / `Main branch:` / `Git user:` /
+`Recent commits:` …），命中就把整条请求判成「非官方客户端」：
+
+```
+{"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+ "displayMsg":{"zh":"请求被拦截，请重新发送"},
+ "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。"}}
+```
+
+这个报错很容易被误判成「账号被封」或「出站请求头伪装不够」，其实两者都不是：
+
+- **同一个号、同一套出站头**，只把那段环境块去掉就能过；
+- 也**不是**单个关键词 —— 把那段单独拎出来测是**通过**的，**「长前缀 + 那段」的组合**
+  才必然命中，说明上游认的是累积出来的整体模式；
+- 只影响**长会话**（system prompt 上到 ~10k 字、环境块完整时）；新会话几乎踩不到，
+  所以表现成「时好时坏、重发有时能过」。
+
+反代现在的处理：`sanitize_messages` 对 `role == "system"` 的消息调
+`strip_env_injection`，从**最后一个** `gitStatus:` 起截断。被摘时响应头带：
+
+```
+x-wb-switch-degraded: system-env
+```
+
+代价是模型这一轮看不到 git 状态（ZCode 每轮都会重新注入），远小于整条请求被 400 打回。
+
+> **复现手法（零额度消耗）**：把 `model` 换成一个不存在的名字。上游先做渠道校验、
+> 再做模型校验，于是返回码就能区分这两件事 —— `11102`（model 不存在）＝**过了**渠道校验，
+> `11128` ＝**被**渠道校验拦下。用真 model 去试会实打实消耗额度，没必要。
+
+### 11128 的第二种触发：首条不是 system（仅国际版）
+
+`11128` 是**渠道校验的通用错误码**，不同触发有不同文案。2026-10-11 在国际版入口上
+实测到第二种：
+
+```
+{"code":11128,"msg":"first message is not system prompt"}
+```
+
+对照实验（7864 / 国际版，同一个号、同一套出站头）：
+
+| 入站 `messages` 首条 role | 结果 |
+|---|---|
+| `user` | ❌ `HTTP 400 {"code":11128,"msg":"first message is not system prompt"}` |
+| `system`（同一请求前补一条） | ✅ **200 正常返回** |
+
+**影响面**：Codex++ 保存连接时的**探针**只发一条 `user`，于是它把整个连接判成失败，
+界面上就是一个红叉 —— 但真实对话（带 system）其实能通。国内版没有这条约束
+（7863 上只发一条 `user` 是通的），所以**只在国际版兜**。
+
+**反代处理**：`build_upstream_body` 增加 `edition` 入参，对国际版调
+`ensure_leading_system` —— 若 `messages` 为空、或首条不是 `system`，在最前插一条
+`{"role":"system","content":"You are a helpful assistant."}`，并把 `leading-system`
+记进 `degraded`（响应头 `x-wb-switch-degraded: leading-system`）。
+
+> 取舍：客户端不保证带 system（探针、简单脚本、部分 OpenAI 兼容客户端都不带）。
+> 多一句无害的 system，远好过整条请求被 400 打回。
+
+## 客户端接入（Codex / Codex++）
+
+外部客户端把本反代当上游时，**协议必须选 Chat Completions** —— 我们只实现了
+`/v1/chat/completions`，**没有 Responses API**；选 Responses 会直接 404。
+
+### Codex / Codex++
+
+Codex 的供应商写在 `~/.codex/config.toml`：
+
+```toml
+model = "glm-5.3-flash"
+model_provider = "wbrelay"
+
+[model_providers.wbrelay]
+name = "wb-switch 国内版反代"
+base_url = "http://127.0.0.1:7863/v1"
+wire_api = "chat"            # 🔴 不是 "responses"
+requires_openai_auth = true  # 取 ~/.codex/auth.json 的 OPENAI_API_KEY 当 Bearer
+```
+
+`auth.json` 里的 `OPENAI_API_KEY` 必须等于本反代该入口的 `api_key`
+（见 `~/.wb-switch/proxy.json`）。只列本入口那一版的模型（国内版 7863 / 国际版 7864，别连错端口）。
+
+⚠️ **Codex++（第三方管理器）的坑**：它的「切换供应商」会**先回填当前供应商**，
+而回填要求 `config.toml` 里**已经存在** `model_provider` + `[model_providers.*]`（得有 base_url）。
+实时配置为空时它会直接中止并报「实时配置缺少有效的供应商 endpoint」——
+于是**怎么写都过不去**（鸡生蛋）。**先手写一段上面的 bootstrap 配置即可解锁。**
+
+另外两点别误判：它的 API Key 是用 Windows **DPAPI 加密**存在自己库里的，
+**在磁盘上 grep 不到明文属正常**，不代表没保存；改完必须**从 Codex++ 入口启动**并重启它才生效
+（直接开官方应用，Codex++ 不在链路上）。
+
 ## 已知限制
 
 - 只做了 `/v1/chat/completions`，没有 embeddings / images / audio
 - 工具调用（function calling）会透传给上游，但没有做额外的 schema 校验
 - `/v1/models` 是从上游 `data.agents[].models[]` 里提取的，拉不到时回退到一个内置列表
 - 上游只认 text / image_url，其它内容块会被降级成文本（见上）
+
+- 🔴 **上游的模型列表不完整 —— 版本防火墙会因此误拦**（2026-10-11 实测）。
+  `www.workbuddy.ai/v2/enterprises/personal/models` 返回的 29 KB JSON 里 **"deepseek" 出现 0 次**，
+  列表里含 `deep` 的只有 `deep-model`（一个 UI 用的模式名）；但直发 `/v2/chat/completions`
+  用 **`deepseek-v4.1-flash` 是 200 成功的**，而列表里的 `deep-model` 反而返回 11102。
+  ⇒ 也就是说这些列表是**给客户端 UI 的展示列表（很多是模式名）**，**不等于可用模型全集**。
+  而 `model_edition()` / 版本防火墙正是按这个列表学习归属的 → 会把「国际版实际可用但未列出」的
+  模型误判成国内版专属，直接 400 掉（报「请改用国内版入口」）。
+  ⚠️ 防火墙本身的前提是对的（跨版本确实会被上游拒：`codebuddy.cn ← gpt-5.6-sol` → `11102 only available
+  for authorized users`），**错的是判据来源**。
 
 ## 源码位置
 

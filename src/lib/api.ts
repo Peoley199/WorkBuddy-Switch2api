@@ -201,6 +201,86 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
   return data as T;
 }
 
+// ---------------------------------------------------------------------------
+// 读命令的内存缓存（stale-while-revalidate）
+//
+// 为什么要有这层：**每个页面在挂载时都会重新向后端要一遍数据**（切页 = 卸载 + 重新挂载），
+// 而其中几个读命令本身很贵 —— `get_token_statistics` 要遍历 `~/.workbuddy/projects` 下的
+// 会话文件、`get_credit_statistics` 要解析 700+ KB 的快照、`cache_move_plan` 要扫整个缓存
+// 目录。于是**每次切页都要重新付一遍这个成本**，表现就是「切一下卡一会儿」。
+//
+// 策略：
+//   - 命中且新鲜（≤ FRESH_MS）  → 直接返回缓存，**完全不打扰后端**；
+//   - 命中但已旧（≤ STALE_MS）  → **先返回缓存（页面立刻渲染）**，同时后台重拉一次刷新缓存，
+//                                 让下次更快、数据也不至于太旧；
+//   - 更旧或没有                → 老实等后端（首次访问，避不开）；
+//   - 🔴 任何**写命令**都会清空整个缓存 ⇒ 「改完再看」永远是新的。
+const FRESH_MS = 60_000;
+const STALE_MS = 5 * 60_000;
+
+/**
+ * 只缓存这些「贵、且不常变」的读命令。
+ *
+ * ⚠️ 白名单要保守：往里加之前先问「它变了会不会让人做错决定」。
+ */
+const CACHEABLE_READS = new Set([
+  "get_accounts",
+  "get_auto_checkin_config",
+  "get_auto_travel_config",
+  "get_auto_rotate_config",
+  "get_github_config",
+  "get_checkin_logs",
+  "get_rotate_logs",
+  "get_proxy_config",
+  "get_proxy_status",
+  "get_proxy_usage",
+  "get_credit_statistics",
+  "get_token_statistics",
+  "list_sessions",
+  "transfer_scan",
+  "cache_move_plan",
+  "cache_move_verify",
+  "update_guard_status",
+]);
+
+/**
+ * 便宜又实时的读命令：**既不缓存、也不清缓存**。
+ *
+ * 为什么需要这一档：账号页挂载时会逐个账号调 `get_checkin_status` / `get_travel_status`
+ * 这类「短平快但每次都要新」的命令。如果把它们当成写命令去清缓存，就会把同一次挂载里
+ * 刚缓存的 `get_accounts` 白刷掉 —— 缓存等于没有。
+ */
+const LIVE_READS = new Set([
+  "get_status",
+  "get_editions",
+  "get_checkin_status",
+  "get_travel_status",
+  "get_credit_expiry",
+  "get_codebuddy_cli_status",
+  "get_codebuddy_cn_ide_status",
+  "detect_codebuddy_cn_ide_account",
+  "get_proxy_models",
+  "oauth_status",
+  "check_auth_permission",
+  "get_launch_at_login_enabled",
+]);
+
+type ReadCacheEntry = { at: number; value: unknown };
+const readCache = new Map<string, ReadCacheEntry>();
+
+function readCacheKey(cmd: string, args?: Record<string, unknown>): string {
+  return args && Object.keys(args).length > 0 ? `${cmd}::${JSON.stringify(args)}` : cmd;
+}
+
+/** 手动让读缓存失效（一般不需要 —— 写命令会自动清）。 */
+export function invalidateApiCache(): void {
+  readCache.clear();
+}
+
+function dispatch<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  return isWebui() ? httpCall<T>(cmd, args) : invoke<T>(cmd, args);
+}
+
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (demoModeEnabled) {
     if (cmd === "get_credit_statistics" && args?.refresh === true) {
@@ -209,8 +289,33 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     if (!DEMO_READ_COMMANDS.has(cmd)) throw new Error(DEMO_UNAVAILABLE_MESSAGE);
     return screenshotDemoResponse(cmd, args) as T;
   }
-  if (!isWebui()) return invoke<T>(cmd, args);
-  return httpCall<T>(cmd, args);
+
+  // 不在两个名单里的命令一律当成**写操作** → 清空缓存。
+  // 🔴 方向只敢选这一边：多清一次只是损失缓存收益，少清一次会让人看到旧数据。
+  if (!CACHEABLE_READS.has(cmd)) {
+    if (!LIVE_READS.has(cmd)) readCache.clear();
+    return dispatch<T>(cmd, args);
+  }
+
+  const key = readCacheKey(cmd, args);
+  const hit = readCache.get(key);
+  const age = hit ? Date.now() - hit.at : Number.POSITIVE_INFINITY;
+  // 带 refresh:true 的是用户**显式点刷新**，必须真的去后端问一次 —— 否则「点了没反应」。
+  const forceFresh = args?.refresh === true;
+
+  if (!forceFresh && hit && age <= FRESH_MS) return hit.value as T;
+
+  if (!forceFresh && hit && age <= STALE_MS) {
+    // 先给页面旧数据（立刻渲染），后台刷新留给下一次。
+    void dispatch<T>(cmd, args)
+      .then((value) => readCache.set(key, { at: Date.now(), value }))
+      .catch(() => {});
+    return hit.value as T;
+  }
+
+  const value = await dispatch<T>(cmd, args);
+  readCache.set(key, { at: Date.now(), value });
+  return value;
 }
 
 // ---------------------------------------------------------------------------

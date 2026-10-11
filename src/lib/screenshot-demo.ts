@@ -368,12 +368,15 @@ function proxyConfig(): ProxyConfig {
       listen: "127.0.0.1:7863",
       api_key: "",
       accounts: uidsOf("domestic"),
+      extra_models: [],
     },
     international: {
       enabled: true,
       listen: "127.0.0.1:7864",
       api_key: "sk-intl-demo",
       accounts: uidsOf("international"),
+      // 演示「上游列表里没有、但本入口实测可用」的模型怎么声明。
+      extra_models: ["deepseek-v4.1-flash"],
     },
   };
 }

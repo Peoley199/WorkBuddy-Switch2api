@@ -174,8 +174,35 @@ function EndpointSection({
           placeholder="留空 = 不鉴权"
         />
       </div>
+
+      <div className="mx-4 flex flex-col items-stretch justify-between gap-2 border-b border-border/50 py-3 sm:mx-5 sm:flex-row sm:items-center">
+        <div className="min-w-0 flex-1">
+          <Label htmlFor={`proxy-extra-${edition}`} className="text-[13px] leading-4">
+            额外放行模型
+          </Label>
+          <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
+            上游列表里没有、但本入口实际可用的模型（逗号分隔）。填进来的会出现在
+            /v1/models 里，并跳过「模型属于另一版」的拦截
+          </p>
+        </div>
+        <Input
+          id={`proxy-extra-${edition}`}
+          value={endpoint.extra_models.join(", ")}
+          onChange={(e) => onChange({ ...endpoint, extra_models: parseModels(e.target.value) })}
+          className="h-8 w-full sm:w-56"
+          placeholder="如 deepseek-v4.1-flash"
+        />
+      </div>
     </>
   );
+}
+
+/** 把输入框里的一串模型名拆成数组：逗号 / 顿号 / 空白 / 换行都算分隔符。 */
+function parseModels(s: string): string[] {
+  return s
+    .split(/[,，、\s]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
 
 function editionLabelOf(a: AccountMeta): string {
