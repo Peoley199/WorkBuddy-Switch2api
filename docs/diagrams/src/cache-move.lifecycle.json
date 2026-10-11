@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "家目录缓存迁移生命周期",
+    "output": "cache-move.html",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1040, 630],
+    "views": [
+      {
+        "id": "main-migration",
+        "label": "迁移主路径",
+        "focus": ["plain_dir", "full_copy", "verify", "rename_backup", "build_link", "linked"],
+        "note": "从普通目录到已是联接：整份复制、逐项核对、改名留底、mklink /J 建联接。"
+      },
+      {
+        "id": "recopy-loop",
+        "label": "增量重拷",
+        "focus": ["full_copy", "verify", "recopy"],
+        "note": "复制期间源目录被写入时自动增量重拷，最多三轮。"
+      },
+      {
+        "id": "rollback",
+        "label": "失败与回滚",
+        "focus": ["verify", "aborted", "rename_backup", "build_link", "failed", "plain_dir"],
+        "note": "三轮仍不收敛则中止；改名或建联接失败自动回滚回普通目录。"
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "main", "label": "迁移主轨" },
+    { "id": "retry", "label": "复制重试" },
+    { "id": "failure", "label": "失败分支" },
+    { "id": "terminal", "label": "完成" }
+  ],
+  "states": [
+    { "id": "plain_dir", "type": "start", "label": "普通目录", "sublabel": "家目录下的本地文件夹", "lane": "main", "col": 0, "step": "01", "tag": "起点" },
+    { "id": "full_copy", "type": "active", "label": "整份复制", "sublabel": "robocopy /E 全量拷到目标盘", "lane": "main", "col": 1, "step": "02", "tag": "robocopy" },
+    { "id": "verify", "type": "decision", "label": "逐项核对", "sublabel": "预演待复制文件数 = 0？", "lane": "main", "col": 2, "step": "03", "tag": "校验" },
+    { "id": "rename_backup", "type": "active", "label": "改名留底", "sublabel": "改为 .moved-* 备份", "lane": "main", "col": 3, "step": "04", "tag": "保留备份" },
+    { "id": "build_link", "type": "active", "label": "建立联接", "sublabel": "mklink /J 建目录联接", "lane": "main", "col": 4, "step": "05", "tag": "mklink" },
+    { "id": "recopy", "type": "waiting", "label": "增量重拷", "sublabel": "自动增量补齐，最多三轮", "lane": "retry", "col": 0, "tag": "自动重试" },
+    { "id": "aborted", "type": "failure", "label": "迁移中止", "sublabel": "源被写入或文件被独占", "lane": "failure", "col": 1, "tag": "三轮不收敛" },
+    { "id": "failed", "type": "failure", "label": "迁移失败", "sublabel": "改名或建联接出错", "lane": "failure", "col": 2, "tag": "可回滚" },
+    { "id": "linked", "type": "success", "label": "已是联接", "sublabel": "原路径指向目标盘，零感知", "lane": "terminal", "col": 2, "tag": "完成" }
+  ],
+  "transitions": [
+    { "id": "start-copy", "from": "plain_dir", "to": "full_copy", "route": "straight", "labelDy": -44, "label": "确认本次目录清单后开迁" },
+    { "id": "copy-verify", "from": "full_copy", "to": "verify", "route": "straight", "labelDy": -44, "label": "整份复制完成" },
+    { "id": "verify-rename", "from": "verify", "to": "rename_backup", "route": "straight", "labelDy": -44, "label": "一个文件都不缺" },
+    { "id": "verify-recopy", "from": "verify", "to": "recopy", "labelAt": [402, 203], "label": "复制期间源被写入" },
+    { "id": "recopy-copy", "from": "recopy", "to": "full_copy", "label": "增量补齐后重拷" },
+    { "id": "verify-abort", "from": "verify", "to": "aborted", "label": "三轮仍不收敛" },
+    { "id": "rename-link", "from": "rename_backup", "to": "build_link", "route": "straight", "labelDy": -44, "label": "同盘改名完成（瞬时）" },
+    { "id": "link-done", "from": "build_link", "to": "linked", "route": "right-channel", "labelAt": [860, 320], "label": "验证重解析点可读" },
+    { "id": "rename-fail", "from": "rename_backup", "to": "failed", "label": "改名或建联接失败" },
+    { "id": "fail-rollback", "from": "failed", "to": "plain_dir", "route": "bottom-channel", "label": "自动回滚：删联接、改名还原" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "迁移主路径",
+      "items": [
+        "robocopy 整份复制 → 逐项核对 → 改名留底 → mklink /J 建联接",
+        "只迁勾选的目录，没勾的一个字节都不碰；国内外版可分放不同盘",
+        "核对以「预演待复制文件数为 0」为准，目标里的残留不参与判定"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "失败与重试",
+      "items": [
+        "复制期间源目录被写入会增量重拷，最多三轮",
+        "三轮仍不收敛才中止，源目录未改动",
+        "改名或建联接失败自动回滚，源数据不会被删"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "善后：清理备份",
+      "items": [
+        "确认客户端正常后再删 .moved-* 备份",
+        "整份移入回收站，清空回收站后空间才真正释放"
+      ]
+    }
+  ]
+}

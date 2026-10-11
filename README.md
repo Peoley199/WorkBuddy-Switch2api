@@ -89,9 +89,11 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 | **账号分组** | 给账号标注「桌面端 / 反代API / 未分组」，账号卡片直接显示标签；反代页按分组挑选出站账号 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
 | **国内版 / 国际版** | 账号按客户端档位分开管理。国内版 = `WorkBuddy` + `workbuddy-desktop.info` + `www.codebuddy.cn`；国际版 = `WorkBuddyAI` + `workbuddy-desktop-ai.info` + `www.workbuddy.ai`。扫码登录、从本机导入、切换、Token 刷新、积分查询都按档位走对应域名与进程；账号页用「国内版 / 国际版」标签页分开显示。会话共享 / 复制按档位作用于各自的 `workbuddy.db`；国际版暂不支持每日签到与成长中心 |
-| **API 反代** | 内置 OpenAI 兼容网关：账号池轮转与失败冷却、按分组挑号、流式与非流式、`/v1/chat/completions`、`/v1/models`、`/healthz`、`/usage-stats` |
-| **反代取模型 ID** | 反代页有「获取模型ID」按钮：一键拉出可用模型列表并弹窗展示，逐个或整体复制 —— 不用再查文档猜客户端里 `model` 填什么。反代开着就问本机 7863（零消耗），没开则直连上游 |
-| **反代分版本** | 国内版和国际版是两套上游、**模型列表不一样**，反代侧按版本分流：账号拆成「反代API · 国内版 / 国际版」两组；「获取模型ID」两档各拉一次、分栏展示；请求按 `model` 自动挑对应版本的账号（不再让国际版专属模型落到国内版）。`/v1/models` 返回并集，`owned_by` 标出 `workbuddy-cn` / `workbuddy-intl` |
+| **API 反代** | 内置 OpenAI 兼容网关：账号池轮转与失败冷却、按分组挑号、流式与非流式、`/v1/chat/completions`、`/v1/models`、`/healthz`、`/usage-stats`。**国内版与国际版各占一个独立入口**，同时开着互不影响 |
+| **反代取模型 ID** | 反代页有「获取模型ID」按钮：一键拉出可用模型列表并弹窗展示，逐个或整体复制 —— 不用再查文档猜客户端里 `model` 填什么。反代开着就问本机端口（零消耗），没开则直连上游；结果与 `/v1/models`、版本校验放行**同一口径** |
+| **反代分版本** | 国内版和国际版是两套上游、**模型列表不一样**，反代侧按版本分流：账号拆成「反代API · 国内版 / 国际版」两组；请求按 `model` 自动挑对应版本的账号（不再让国际版专属模型落到国内版）。`/v1/models` 返回并集，`owned_by` 标出 `workbuddy-cn` / `workbuddy-intl` |
+| **额外放行模型** | 上游给的模型列表**是不完整的**：有的模型实测能调通、却根本不在列表里（例如国际版的 `deepseek-v4.1-flash`）。每个入口都能填「额外放行模型」，填进去的会进 `/v1/models`、也跳过版本校验，不再被误判成「属于另一版」 |
+| **反代出站适配** | 发往上游前自动处理两件会被上游拦下的事：① 摘掉 system prompt 里 Claude-Code 式的环境注入块（长会话必踩）；② 国际版要求首条消息必须是 `system`，客户端没带就补一条。任一改动生效时，响应头会带 `x-wb-switch-degraded` |
 | **反代用量统计** | 经过反代的每一次请求都记录请求数、输入/输出 Token 与 credit，按账号、按模型汇总，并可查看最近请求明细 |
 | 会话复制 / 共享 | **两个档位都支持**。复制：把勾选的会话以新 id 复制给目标账号（jsonl 正文 + 工具输出目录 / 产物索引 / 历史任务 / 文件改动历史 + `workbuddy.db` 索引 + edge-sync 注册）；共享：把 `user_id` 置空，任何账号登录都能看到同一份，不产生副本 |
 | **跨机器迁移** | 把选中的项目会话 + 全部配置（技能 / MCP 连接器 / 记忆 / 定时任务 / 自定义模型）打成一个 zip，在另一台机器上**增量合并**进来。导入前先给差异预览（几个新会话、本地缺多少附件、配置会新增什么），可逐项勾选。目标已有的数据默认不动、导入前自动备份、附件按 SHA256 去重、账号凭证默认不带。**仅桌面端**（webui 没有系统文件对话框，选不了包的位置） |
@@ -105,8 +107,45 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 | CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，但默认账号独立；macOS/Linux 通过 `apiKeyHelper`，Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置后续会话使用的账号；任何平台都不会修改正在运行的当前会话 |
 | CodeBuddy CN IDE | 复用同一账号库，向 `CodeBuddy CN` 桌面客户端注入 Safe Storage 凭证（`state.vscdb` / `planning-genie.new.accessTokencn`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 无关 |
 | 自动轮换 | 后台定时把 CodeBuddy CLI 的后续启动账号设为积分最紧迫（最早到期）的账号；当前会话保持原账号，重新加载会话或重启 CLI 后使用新的账号 |
-| 更新提示 | 启动时检查公开 GitHub Releases 是否有新版本并提示；当前发布包未附带签名更新清单，升级需到 Release 页面手动下载 |
+| 应用内更新 | 发布产物带 Tauri updater 签名与清单（`latest.json`），装过一次之后可以在应用内直接升级；启动时也会检查 Releases 并提示新版本 |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
+
+## 架构
+
+下面四张图说明这东西是怎么搭起来的。**图为交互版** —— 可切浅色 / 深色、缩放、按关系追踪、搜索节点、导出 SVG / PNG；源文件在 [`docs/diagrams/`](./docs/diagrams/)（每张图一份 `.html` 成品 + 一份 `.json` 规格），克隆仓库后本地打开 `.html` 即可。下面嵌的是等价的静态快照。
+
+| 图 | 覆盖内容 |
+| --- | --- |
+| 整体架构 | 客户端、本地反代、账号池与两版上游的关系，以及「界面 → 命令层 → 认证文件 → 客户端」这条管理路径 |
+| 反代请求生命周期 | 一次 `/v1/chat/completions` 从进来、挑号、出站适配到流式回传的全过程 |
+| 账号切换流程 | 备份认证 → 关客户端 → 写认证 → 重启，含 macOS 授权失败那条异常路径 |
+| 家目录缓存迁移 | 从「普通目录」走到「已是联接」的状态迁移，含失败回滚与增量重拷 |
+
+### 整体架构
+
+一个进程，一份账号库。反代和账号管理跑在**同一个进程**里，共用同一套刷新逻辑 —— 不存在两个进程各自刷新同一个 refresh token 的冲突。
+
+![Switch 整体架构：兼容客户端 → 本地反代 → 账号池 → 国内版 / 国际版上游；界面 → 命令层 → 认证与配置 → 桌面客户端](docs/images/diagrams/architecture-overview.png)
+
+- 外部客户端只认一个本地地址（国内版 `7863` / 国际版 `7864`），选版本、挑号、冷却全在进程内完成，客户端不用改配置
+- 界面只下发命令；真正写认证文件、重启客户端的是命令层
+- 两个版本**各有一份**认证文件，切换与查询都按档位取
+
+### 反代请求生命周期
+
+![反代请求生命周期：挑版本与挑号 → 出站适配 → SSE 流式透传 → 落用量](docs/images/diagrams/proxy-request.png)
+
+出站前会做两件事，都是被上游逼出来的：摘掉 system prompt 里 Claude-Code 式的环境注入块；国际版首条不是 `system` 就补一条（否则整条请求被 400 打回）。失败的号进冷却，120 秒后自动回池。
+
+### 账号切换流程
+
+![账号切换流程：备份认证文件 → 关闭客户端 → 写入目标账号 → 重启；含共享 / 复制会话与 macOS 授权异常分支](docs/images/diagrams/account-switch.png)
+
+### 家目录缓存迁移
+
+![家目录缓存迁移：普通目录 → 复制 → 校验 → 留底 → 已是联接，失败回滚，源被写入时增量重拷最多三轮](docs/images/diagrams/cache-move.png)
+
+> 顺带一提：界面在 IPC 层做了一层读缓存 —— 60 秒内直接命中，5 分钟内先给缓存让页面立刻渲染、再后台刷新，所以**切回看过的页面是秒开的**；点「刷新」始终绕过缓存直连后端。
 
 ## 使用
 
@@ -120,33 +159,46 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 7. **CodeBuddy CN IDE**：账号卡片可一键切换国内版桌面客户端（www.codebuddy.cn）。切换会关闭并重启 CodeBuddy CN，把所选账号写入本机 `~/Library/Application Support/CodeBuddy CN` 的登录态；首次使用前请先手动打开并登录一次以生成 Keychain Safe Storage。与下方 CLI 切换相互独立。
 8. **CodeBuddy CLI**：账号页可一键接入/更新认证。macOS/Linux 使用 `apiKeyHelper`，Windows 使用 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（保留其他配置，不依赖 `.cmd` 跳板）。「切换 CodeBuddy」只更新后续加载会话使用的默认账号，当前运行会话不会切换；请由 ACP 重新加载会话，或重启 CodeBuddy CLI 后生效。普通 CLI 在同一进程中执行 `/resume` 不保证重新读取认证配置。
 9. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后后台按间隔检查，并把积分最紧迫的账号设为后续会话的默认账号（策略见下）；正在运行的当前会话不会被自动切换。Windows 会同步最新 Token 到 settings，但仍需重新加载会话或重启 CLI。
-10. **API 反代**：侧栏进入「API 反代」，开启并保存后即可把 `http://127.0.0.1:7863/v1` 当作 OpenAI 基址使用；同页可按分组挑选参与轮转的账号，并查看请求用量；不知道 `model` 该填什么时点旁边的「获取模型ID」。详见 [API 反代](#api-反代)。
-11. **更新**：应用启动时会检查公开 GitHub Releases，发现新版本在左下角提示；点击后打开对应 Release 页面手动下载安装。当前发布包未附带 tauri-updater 签名清单，因此暂不支持应用内一键升级。
+10. **API 反代**：侧栏进入「API 反代」或「国际版 API 反代」，开启并保存后即可把 `http://127.0.0.1:7863/v1`（国内版）/ `http://127.0.0.1:7864/v1`（国际版）当作 OpenAI 基址使用；同页可按分组挑选参与轮转的账号、填写「额外放行模型」，并查看请求用量；不知道 `model` 该填什么时点旁边的「获取模型ID」。详见 [API 反代](#api-反代)。
+11. **更新**：发布包带签名更新清单，装过一次后可以在应用内一键升级；启动时也会检查 Releases 并在左下角提示新版本。签名密钥的维护须知见 [应用内自动更新](#应用内自动更新windows--macos--linux)。
 
 ## API 反代
 
-侧边栏的 **「API 反代」** 页把当前账号库包装成一个 OpenAI 兼容接口，任何支持 OpenAI SDK 的客户端都能直接用：
+侧边栏的 **「API 反代」** 页把当前账号库包装成 OpenAI 兼容接口，任何支持 OpenAI SDK 的客户端都能直接用。**国内版与国际版是两个独立入口**，各有自己的开关、监听地址、API Key 与账号名单 —— 可以只开一个，也可以同时开：
 
 ```
-base_url = http://127.0.0.1:7863/v1
-api_key  = 随便填（未设置鉴权时）
+国内版  base_url = http://127.0.0.1:7863/v1     # 走 www.codebuddy.cn
+国际版  base_url = http://127.0.0.1:7864/v1     # 走 www.workbuddy.ai
+api_key = 随便填（未设置鉴权时）
 ```
 
-1. 打开 Switch →「API 反代」→ 打开「启用 OpenAI 兼容接口」→ **保存**（保存即生效，无需重启）
+1. 打开 Switch →「API 反代」/「国际版 API 反代」→ 打开「启用接口」→ **保存**（保存即生效，无需重启）
 2. 之后每次启动 Switch 都会自动拉起（配置存在 `~/.wb-switch/proxy.json`）
 
 | 接口 | 说明 |
 | --- | --- |
 | `POST /v1/chat/completions` | 对话补全，支持 `stream: true` 流式 |
-| `GET /v1/models` | 可用模型列表 |
+| `GET /v1/models` | 可用模型列表（上游列表 + 本入口的「额外放行模型」） |
 | `GET /healthz` | 健康检查与可用账号数 |
 | `GET /usage-stats` | 反代用量统计（JSON） |
 
 **账号池**：健康账号轮转使用，失败的号冷却 120 秒后自动回到池子；标记了 `needs_relogin` 的账号不参与。
 **按分组挑号**：关掉「使用全部账号」后可按「反代API / 桌面端 / 未分组」分区勾选，或用「只选反代API 分组」一键把标记过的号全部选入。
+**额外放行模型**：上游给的模型列表**是不完整的** —— 有模型实测能调通却没列出来（如国际版的 `deepseek-v4.1-flash`）。填进这一栏就会进 `/v1/models`，并跳过版本校验，不再被判成「属于另一版」。
+
+![API 反代页：接口开关、监听地址、API Key、额外放行模型](docs/images/api-proxy-extra-models.png)
 
 推荐用法：给日常聊天的 1~2 个号标「桌面端」，其余标「反代API」，反代页点「只选反代API 分组」——
 这样桌面端和 API 出站互不抢号。
+
+### 出站前会自动处理的两件事
+
+客户端的消息不会原样发给上游，中途会被按需改写 —— 这两条都是实测被拦之后加上的：
+
+1. **摘掉 Claude-Code 式环境注入块** —— system prompt 里 `gitStatus:` / `Current branch:` 那一整段会被上游的渠道校验认成「非官方客户端发来的」。反代从最后一个 `gitStatus:` 起截断。只影响长会话（环境块累积到完整形态时），所以表现为「时好时坏」。
+2. **国际版补首条 `system`** —— 国际版上游要求第一条消息必须是 `system`，否则整条请求被 400 打回：`{"code":11128,"msg":"first message is not system prompt"}`。客户端没带时补一条最小的。这条约束**只有国际版有**，国内版不带也照常。
+
+任一改动生效时，响应头会带上 `x-wb-switch-degraded`（值为 `system-env` 或 `leading-system`），方便排查「为什么这轮模型看不到 git 状态」。
 
 > 如果本机开着系统代理（梯子），部分客户端会把 `127.0.0.1` 也送去走代理而连不上，
 > 这时设置 `no_proxy=127.0.0.1,localhost`，或用 `curl --noproxy '*'` 验证。
@@ -187,6 +239,10 @@ api_key  = 随便填（未设置鉴权时）
 Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、CodeBuddy CLI 与 CodeBuddy IDE：输入、输出、缓存读写使用 K/M/B 紧凑单位，趋势图用堆叠柱表示每日 Token 总量与构成，用虚线表示调用次数；同时提供 Token 构成占比、活跃热力图、项目/模型 Top 10 和会话排行，帮助快速定位主要消耗来源。
 
 <img src="docs/images/token-statistics-light.png" alt="Token 统计页面：总览指标、每日 Token 构成与调用次数趋势" />
+
+再往下是活跃热力图和用量分布 —— 按项目（或按模型）排出消耗榜，直接看出钱花在哪：
+
+<img src="docs/images/token-activity-light.png" alt="Token 统计页面下半：近一年活跃热力图与按项目的用量分布 Top 10" />
 
 ### 积分统计
 
@@ -264,6 +320,8 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 
 **迁移完成后，应用自己的「设置 → 系统缓存目录」仍会显示原来的家目录路径**，用资源管理器打开也是那个路径 —— 这是正常的，目录联接对程序完全透明，应用压根不知道数据换盘了。判断有没有真的搬走看两处：本页的状态变成「已是联接」并指向目标盘；应用设置页里那条「磁盘」容量变成目标盘的容量。每行右侧的「打开」按钮可以直接跳到数据真正所在的位置。
 
+<img src="docs/images/cache-move-status.png" alt="缓存迁移页：当前占用、每个目录的联接状态、要迁的目录与目标位置、被占用提示" />
+
 <img src="docs/images/cache-move-pick.png" alt="缓存迁移页：勾选要迁移的目录，可给单个目录单独指定位置" />
 
 <img src="docs/images/cache-move-linked.png" alt="缓存迁移页：已迁移的目录显示为「已是联接」，可直接打开真实位置" />
@@ -286,6 +344,8 @@ WorkBuddy 的更新缓存是**按用户放的、不分产品**：
 ⚠️ 环境变量是**用户级**的，两个版本读的是同一个变量名，所以这是**一个总开关**：开了就是两个版本都不更新。风险本来就来自两者共用缓存，一起关掉才是对的。改完要**重启应用**才生效；若仍不生效，注销重新登录一次（资源管理器要重新读环境变量）。
 
 页面下半部分是**安装目录身份**清单：身份由目录里的 `resources/app.asar.unpacked/cli/product.json` 决定，和目录名、和 exe 叫什么名字都无关。当**两个启动器 exe 同时存在但身份只有一个**时（被覆盖后的典型样子），这里会直接标黄提醒 —— 点「国内版」的快捷方式，跑起来的其实是国际版。
+
+<img src="docs/images/update-guard-light.png" alt="更新防护页：防护状态、更新源黑洞、已隔离的安装包列表与安装目录身份清单" />
 
 ### 跨机器迁移
 

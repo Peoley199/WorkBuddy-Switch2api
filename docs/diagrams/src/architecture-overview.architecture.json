@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Switch 本地工具整体架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "request-path",
+        "label": "反代请求路径",
+        "focus": ["client", "proxy", "pool", "upcn", "upintl"],
+        "note": "外部客户端只认本地端口，版本分流与挑号全部在进程内完成。"
+      },
+      {
+        "id": "account-mgmt",
+        "label": "账号管理路径",
+        "focus": ["ui", "cmd", "cred", "pool", "desktop"],
+        "note": "界面只下发命令，写入认证与重启客户端由命令层执行。"
+      }
+    ]
+  },
+  "components": [
+    { "id": "ui", "type": "frontend", "label": "Switch 界面", "sublabel": "Tauri + React", "brand": "react", "pos": [290, 60], "size": [150, 70] },
+    { "id": "cmd", "type": "backend", "label": "命令层", "sublabel": "invoke + webui HTTP", "brand": "rust", "pos": [530, 60], "size": [160, 70] },
+    { "id": "cred", "type": "database", "label": "认证与配置", "sublabel": "~/.wb-switch + auth", "pos": [780, 60], "size": [160, 70] },
+    { "id": "client", "type": "external", "label": "兼容客户端", "sublabel": "Codex · Cline · SDK", "pos": [40, 300], "size": [160, 70] },
+    { "id": "proxy", "type": "backend", "label": "本地反代", "sublabel": ":7863 国内 / :7864 国际", "brand": "rust", "pos": [290, 300], "size": [160, 70] },
+    { "id": "pool", "type": "backend", "label": "账号池", "sublabel": "挑号 · 轮转 · 冷却", "pos": [540, 300], "size": [160, 70] },
+    { "id": "upcn", "type": "external", "label": "国内版上游", "sublabel": "www.codebuddy.cn", "pos": [1040, 220], "size": [160, 70] },
+    { "id": "upintl", "type": "external", "label": "国际版上游", "sublabel": "www.workbuddy.ai", "pos": [1040, 400], "size": [160, 70] },
+    { "id": "desktop", "type": "external", "label": "桌面客户端", "sublabel": "国内版 / 国际版", "pos": [1040, 60], "size": [160, 70] }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "同一个进程内的 Switch",
+      "wraps": ["ui", "cmd", "cred", "proxy", "pool"]
+    }
+  ],
+  "connections": [
+    { "id": "client-to-proxy", "from": "client", "to": "proxy", "label": "HTTP · /v1", "variant": "emphasis" },
+    { "id": "proxy-to-pool", "from": "proxy", "to": "pool", "label": "按 model 挑号" },
+    { "id": "pool-to-cn", "from": "pool", "to": "upcn", "label": "国内版出站" },
+    { "id": "pool-to-intl", "from": "pool", "to": "upintl", "label": "国际版出站" },
+    { "id": "ui-to-cmd", "from": "ui", "to": "cmd", "label": "invoke / HTTP" },
+    { "id": "cmd-to-cred", "from": "cmd", "to": "cred", "label": "写账号与配置" },
+    { "id": "pool-to-cred", "from": "pool", "to": "cred", "label": "共用账号库" },
+    { "id": "cred-to-desktop", "from": "cred", "to": "desktop", "label": "客户端读取登录态" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "接入", "items": ["客户端只把 base_url 指向 127.0.0.1:7863（国内版）或 :7864（国际版）", "反代与账号切换在同一个进程里，不存在两个进程抢同一个 refresh token"] },
+    { "dot": "emerald", "title": "账号与上游", "items": ["账号按 model 归属自动分流到对应版本，国际版专属模型不会落到国内版", "健康号轮转，失败冷却 120 秒后回池", "国际版上游要求首条消息为 system，反代自动兜底"] },
+    { "dot": "amber", "title": "本地管理", "items": ["界面只下发命令，真正的写入由命令层完成", "两个版本各有一份认证文件，切换与查询都按档位取"] }
+  ]
+}

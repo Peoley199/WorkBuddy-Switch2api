@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "反代请求生命周期",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1000, 660],
+    "views": [
+      {
+        "id": "pick-account",
+        "label": "挑号与分流",
+        "focus": ["client", "proxy", "pool"],
+        "note": "按 model 归属决定走哪一版，再从该版本的健康号里取一个。"
+      },
+      {
+        "id": "forward-and-stream",
+        "label": "转发与透传",
+        "focus": ["proxy", "upstream", "client"],
+        "note": "出站前清洗消息；国际版会补一条 system，否则整条请求会被拦。"
+      },
+      {
+        "id": "meter-and-cooldown",
+        "label": "计量与冷却",
+        "focus": ["proxy", "stats", "pool"],
+        "note": "每次请求都落用量；失败的号进冷却，120 秒后自己回池。"
+      }
+    ]
+  },
+  "participants": [
+    { "id": "client", "type": "external", "label": "OpenAI 兼容客户端", "sublabel": "Codex · Cline · 任意 SDK" },
+    { "id": "proxy", "type": "backend", "label": "本地反代", "sublabel": "axum · /v1/chat/completions", "brand": "rust" },
+    { "id": "pool", "type": "database", "label": "账号池", "sublabel": "分组挑号 · 失败冷却" },
+    { "id": "upstream", "type": "external", "label": "上游网关", "sublabel": "国内版 / 国际版" },
+    { "id": "stats", "type": "database", "label": "用量记录", "sublabel": "按账号 / 按模型" }
+  ],
+  "segments": [
+    { "from": 150, "to": 288, "label": "接入与挑号" },
+    { "from": 306, "to": 420, "label": "转发与流式透传" },
+    { "from": 436, "to": 512, "label": "计量与冷却" }
+  ],
+  "messages": [
+    { "from": "client", "to": "proxy", "y": 180, "label": "POST /v1/chat/completions（stream）", "variant": "emphasis" },
+    { "from": "proxy", "to": "pool", "y": 222, "label": "按 model 归属选版本，再取健康账号", "variant": "emphasis" },
+    { "from": "pool", "to": "proxy", "y": 264, "label": "账号 / 冷却中则换下一个", "variant": "return" },
+    { "from": "proxy", "to": "upstream", "y": 318, "label": "转发：摘掉环境注入块", "variant": "emphasis" },
+    { "from": "proxy", "to": "upstream", "y": 360, "label": "国际版：首条补一条 system", "variant": "dashed" },
+    { "from": "upstream", "to": "proxy", "y": 402, "label": "SSE 流式分片", "variant": "return" },
+    { "from": "proxy", "to": "client", "y": 444, "label": "原样透传 SSE", "variant": "return" },
+    { "from": "proxy", "to": "stats", "y": 486, "label": "记请求数 / 输入输出 Token", "variant": "default" }
+  ],
+  "activations": [
+    { "participant": "proxy", "from": 174, "to": 500, "type": "backend" },
+    { "participant": "pool", "from": 216, "to": 280, "type": "database" },
+    { "participant": "upstream", "from": 312, "to": 408, "type": "external" },
+    { "participant": "stats", "from": 480, "to": 500, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "客户端只认一个地址", "items": ["base_url 指向 127.0.0.1:7863（国内版）或 :7864（国际版）", "选版本、挑号、冷却全部在本地完成，客户端不用改配置"] },
+    { "dot": "emerald", "title": "出站前会做两件事", "items": ["摘掉 system prompt 里的 Claude-Code 式环境注入块（上游渠道校验会拦）", "国际版首条不是 system 时补一条，否则整条请求被 400 打回", "被改动时响应头带 x-wb-switch-degraded"] },
+    { "dot": "amber", "title": "失败不拖垮请求", "items": ["健康号轮转，失败的号冷却 120 秒后自动回池", "标记 needs_relogin 的账号不参与挑号", "每次请求都落用量，可按账号与模型汇总"] }
+  ]
+}

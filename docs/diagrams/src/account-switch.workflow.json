@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "WorkBuddy 账号切换流程",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-switch",
+        "label": "切换主路径",
+        "focus": ["select", "backup", "close", "sessions", "write_auth", "launch"],
+        "note": "备份 → 关闭 → 处理会话 → 写认证 → 重启，全过程有实时进度反馈。"
+      },
+      {
+        "id": "permission-denial",
+        "label": "macOS 权限异常",
+        "focus": ["write_auth", "denied", "grant"],
+        "note": "写入认证被系统拦截时先授权，再重启应用重试。"
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "ui", "label": "操作入口" },
+    { "id": "core", "label": "切换执行" },
+    { "id": "client", "label": "WorkBuddy 客户端" },
+    { "id": "session", "label": "会话库" },
+    { "id": "macos", "label": "macOS 权限", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "prepare", "label": "准备", "fromCol": 0, "toCol": 1 },
+    { "id": "switch", "label": "关闭并处理会话", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "apply", "label": "写入并生效", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "groups": [],
+  "mainPath": ["select", "backup", "close", "sessions", "write_auth", "launch"],
+  "semanticChecks": {
+    "allowedRoots": ["select"],
+    "allowedTerminals": ["launch", "grant"],
+    "requiredEdges": [
+      { "from": "write_auth", "to": "denied" }
+    ]
+  },
+  "nodes": [
+    { "id": "select", "lane": "ui", "col": 0, "type": "frontend", "label": "选择目标账号", "sublabel": "账号卡片 → 切换" },
+    { "id": "backup", "lane": "core", "col": 1, "type": "backend", "label": "备份认证文件", "sublabel": "写入前留底" },
+    { "id": "close", "lane": "client", "col": 2, "type": "external", "label": "关闭 WorkBuddy", "sublabel": "按当前档位" },
+    { "id": "sessions", "lane": "session", "col": 3, "width": 112, "type": "database", "label": "会话复制 / 共享", "sublabel": "复制或共享", "tag": "可选" },
+    { "id": "write_auth", "lane": "core", "col": 4, "width": 112, "type": "backend", "label": "写入目标账号认证", "sublabel": "按档位写入" },
+    { "id": "launch", "lane": "client", "col": 5, "type": "external", "label": "重启客户端", "sublabel": "切换完成" },
+    { "id": "denied", "lane": "macos", "col": 4, "type": "security", "label": "报「无权限」", "sublabel": "认证目录不可写" },
+    { "id": "grant", "lane": "macos", "col": 5, "type": "security", "label": "授权并重启", "sublabel": "App 管理 / 磁盘访问" }
+  ],
+  "edges": [
+    { "from": "select", "to": "backup", "label": "发起切换", "variant": "emphasis", "role": "main" },
+    { "from": "backup", "to": "close", "role": "main" },
+    { "from": "close", "to": "sessions", "label": "可选", "variant": "dashed", "role": "branch" },
+    { "from": "sessions", "to": "write_auth", "role": "main" },
+    { "from": "write_auth", "to": "launch", "role": "main" },
+    { "from": "write_auth", "to": "denied", "label": "无权限", "variant": "security", "role": "error" },
+    { "from": "denied", "to": "grant", "label": "打开系统设置", "variant": "security" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "切换主路径", "items": ["备份 → 关闭 → 处理会话 → 写认证 → 重启，切换过程实时进度反馈", "账号自带版本标记，不能跨档位切换", "国内版与国际版各有一份认证文件，写入按档位取"] },
+    { "dot": "violet", "title": "会话复制 / 共享", "items": ["复制：把勾选会话以新 id 复制给目标账号，源数据不动", "共享：把 user_id 置空，任何账号登录看到同一份，不产生副本", "两个档位各自作用于自己的 workbuddy.db"] },
+    { "dot": "amber", "title": "macOS 权限", "items": ["写入认证文件需要「App 管理」或「完全磁盘访问」授权", "未授权时写探针文件失败，提示「无权限」", "授权后需重启应用生效，设置页可随时自检"] }
+  ]
+}
