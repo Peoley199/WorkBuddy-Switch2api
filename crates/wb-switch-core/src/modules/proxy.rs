@@ -39,6 +39,21 @@ const DEFAULT_CLI_VERSION: &str = "2.137.1";
 const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
+
+/// 入站「思考强度」相关字段名，原样透传给上游。
+///
+/// 🔴 上游真正认的是 `reasoning_effort`（实测：加它之后 `deepseek-v4-pro` /
+/// `deepseek-v4.1-flash` 立即开始返回 `reasoning_content` 与非零 `reasoning_tokens`；
+/// 而 `thinking`（含 `budget_tokens`）与 `enable_thinking` 上游一律忽略）。
+/// 其余几个是 pi-ai 按 `compat.thinkingFormat` 可能发出的其它拼写，一并透传，
+/// 免得换个客户端又踩一遍「参数被吃掉」。
+const REASONING_PASSTHROUGH: &[&str] = &[
+    "reasoning_effort",
+    "thinking",
+    "reasoning",
+    "enable_thinking",
+    "chat_template_kwargs",
+];
 /// 单次请求体上限。
 ///
 /// axum 默认只给 2 MB（`DEFAULT_LIMIT`），长上下文会话（几十万 token）序列化后
@@ -839,6 +854,21 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
     }
     if let Some(t) = incoming.get("tools") {
         body["tools"] = t.clone();
+    }
+    // 🔴 思考强度：以前这里只转 model/messages/stream/temperature/top_p/max_tokens/tools，
+    // 思考类字段**全被丢掉**，表现为「客户端调了推理等级、上游毫无反应、思考内容为空」。
+    //
+    // 各客户端拼写不同，反代不做翻译、原样透传（只有客户端真的发了才转，
+    // 所以对不发这些字段的客户端零影响）：
+    // - `reasoning_effort`（字符串）—— 上游真正认的就是它，实测见 API-PROXY.md
+    // - `thinking`（对象或字符串，pi-ai 的 deepseek / string-thinking 格式都用它）
+    // - `reasoning`（对象，openrouter / together / ant-ling 格式）
+    // - `enable_thinking`（布尔，qwen 格式）
+    // - `chat_template_kwargs`（对象，chat-template 格式）
+    for key in REASONING_PASSTHROUGH {
+        if let Some(v) = incoming.get(*key) {
+            body[*key] = v.clone();
+        }
     }
     body
 }
@@ -2516,6 +2546,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("f_123"));
+    }
+
+    /// 思考强度类字段必须原样透传 —— 以前被整段丢掉，表现为「客户端调了推理等级、
+    /// 上游毫无反应」。同时确认：客户端没发时反代**不臆造**任何思考字段。
+    #[test]
+    fn upstream_body_passes_through_reasoning_fields() {
+        let base = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let body = build_upstream_body(&base, Edition::Domestic, &mut Vec::new());
+        for key in REASONING_PASSTHROUGH {
+            assert!(
+                body.get(*key).is_none(),
+                "客户端没发 {key}，反代不该补：{body}"
+            );
+        }
+
+        let incoming = json!({
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+            "thinking": { "type": "enabled" },
+            "enable_thinking": true,
+            "chat_template_kwargs": { "enable_thinking": true },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let body = build_upstream_body(&incoming, Edition::Domestic, &mut Vec::new());
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
     }
 
     /// 国际版必须给「首条不是 system」的请求补一条 —— 不补会被上游整个拦掉

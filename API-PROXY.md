@@ -252,6 +252,80 @@ x-wb-switch-degraded: system-env
 > 取舍：客户端不保证带 system（探针、简单脚本、部分 OpenAI 兼容客户端都不带）。
 > 多一句无害的 system，远好过整条请求被 400 打回。
 
+## 思考强度（`reasoning_effort`）
+
+**反代以前把这些参数整个丢掉** —— `build_upstream_body` 只转
+`model / messages / stream / temperature / top_p / max_tokens / tools`，于是表现为
+「客户端调了推理等级、上游毫无反应、`reasoning_content` 一直是空」。
+v1.6.7 起**原样透传** `reasoning_effort` / `thinking` / `reasoning` / `enable_thinking` /
+`chat_template_kwargs`（只转客户端真的发了的字段，对不发这些的客户端零影响）。
+之所以不翻译、直接透传：不同客户端拼写差得远，上游只认其中一种，转发比猜测安全。
+
+### 上游只认 `reasoning_effort`
+
+2026-10-11 直连上游实测（绕过本地反代，`deepseek-v4.1-flash`，同一账号同一套头）：
+
+| 出站体里带的字段 | `reasoning_tokens` | 有 `reasoning_content` |
+|---|---|---|
+| （不发） | 0 | ❌ |
+| `reasoning_effort: "high"` | **32** | ✅ |
+| `thinking: {type:"enabled"}` + `reasoning_effort: "high"` | 38 | ✅ |
+| `thinking: {type:"enabled"}` 单独 | 0 | ❌ |
+| `thinking: {type:"enabled", budget_tokens: 8192}` | 0 | ❌ |
+| `enable_thinking: true` | 0 | ❌ |
+
+⇒ **`thinking`（含 `budget_tokens`）和 `enable_thinking` 上游一律忽略**，只有
+`reasoning_effort` 真的起作用。虽然带上 `thinking` 不会报错，但也没用。
+
+**取值**：`minimal / low / medium / high / max / xhigh / none` 全部 200；
+🔴 **`off` 会 400** —— `{"code":11150,"msg":"the reasoning effort value is not supported by the current model"}`。
+要「不思考」就**别发这个字段**，永远不要发 `off`。
+
+**哪些模型有效**：国内版 `deepseek-v4-pro`（0 → 34）、`deepseek-v4.1-flash`（0 → 32）、
+`space-bunny`（0 → 13）效果最明显；`glm-5.3` 小幅。国际版 `deepseek-v4.1-flash` 同样生效（0 → 17）。
+`hy4-preview`、`glm-5.3-flash`、`gemini-3.5-flash` 本来就会思考，加了只是微调。
+
+### 客户端（DSH / pi-ai）侧还得配一次
+
+只改反代不够。DSH 的 `dsh-llm-pi-ai` 对**手工声明的路由**不去查 pi-ai 内置目录，
+`resolveModelReasoning` 直接回落到 `base?.reasoning ?? false` → 模型 `reasoning: false`
+→ UI **根本不显示**「推理等级」选择器。必须显式声明：
+
+```yaml
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      wb-in:
+        apiKeyEnv: WB_IN_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:7863/v1
+        compat:
+          supportsReasoningEffort: true    # ← 缺这行，pi-ai 只会发 thinking，而上游不认 thinking
+        models:
+          - id: deepseek-v4-pro
+            name: deepseek-v4-pro
+            reasoningEfforts:              # ← 缺这行，UI 里没有「推理等级」
+              off:                         # 空值 = 关思考时不发该字段（⚠️ 不是空字符串）
+              low: low
+              medium: medium
+              high: high
+              max: max
+```
+
+三条都是源码里的硬校验，写错会让 profile 加载失败：
+
+1. 键只能是 `off / minimal / low / medium / high / xhigh / max`；
+2. 除 `off` 外每档都必须给值（空字符串会报 `must not be an empty string`）；
+3. 至少要有一档不是 `off`；纯非推理模型写 `reasoningEfforts: false`。
+
+> ⚠️ 只写 `thinkingFormat` 是不够的：`deepseek` 格式会发
+> `thinking: {type:"enabled"}`，而 `reasoning_effort` **只有 `compat.supportsReasoningEffort`
+> 为真时才会发**。上游恰好只认后者 —— 少了这一行，等于白配。
+>
+> ⚠️ 用 PyYAML 校验这类文件会误报：YAML 1.1 把裸键 `off` 读成布尔 `false`。
+> DSH 用的 js-yaml（4.x）保留字符串 `off`，以它为准。
+
 ## 客户端接入（Codex / Codex++）
 
 外部客户端把本反代当上游时，**协议必须选 Chat Completions** —— 我们只实现了
