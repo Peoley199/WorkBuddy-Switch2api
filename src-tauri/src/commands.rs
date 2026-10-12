@@ -739,16 +739,26 @@ pub fn set_account_group(account_id: String, group: String) -> Result<Value, Str
 }
 
 /// 反代用量统计（即使服务没在跑也能读历史数据）。
+///
+/// 🔴 **必须按版本分开**：国内版入口只统计国内版的量，国际版入口只统计国际版的量。
+/// 不传 `edition` 时返回国内版（保持旧调用方可用），前端两个页面各自传自己的档位。
 #[tauri::command]
-pub fn get_proxy_usage() -> Value {
-    proxy::load_usage()
+pub fn get_proxy_usage(edition: Option<String>) -> Value {
+    proxy::load_usage_for(parse_edition(edition.as_deref()))
 }
 
-/// 清空反代用量统计。
+/// 清空反代用量统计。不传 `edition` 时**两版都清**。
 #[tauri::command]
-pub fn reset_proxy_usage() -> Result<Value, String> {
-    proxy::reset_usage()?;
+pub fn reset_proxy_usage(edition: Option<String>) -> Result<Value, String> {
+    proxy::reset_usage(edition.as_deref().map(parse_lenient))?;
     Ok(json!({ "ok": true }))
+}
+
+/// `"international"` / `"intl"` / `"ai"` → 国际版，其余（含 `None`、无法识别）→ 国内版。
+///
+/// 直接复用 `Edition::parse_lenient`，与反代其它地方同口径 —— 未知值一律回落国内版。
+fn parse_edition(edition: Option<&str>) -> Edition {
+    edition.map(parse_lenient).unwrap_or(Edition::Domestic)
 }
 
 /// 「获取模型ID」：先问本机反代（同一份数据、不额外占号），拿不到再直连上游。

@@ -62,6 +62,26 @@ webui 界面与桌面 App 一致：WorkBuddy / CodeBuddy CLI / CodeBuddy IDE 账
 
 <img src="docs/images/webui-accounts.png" alt="webui：浏览器里的账号管理页，与桌面 App 同一套界面" />
 
+### Docker（常驻部署）
+
+想让「API 反代 + 自动签到 + 自动轮换」常年挂着、不占用一台有图形界面的机器，用容器最省事：
+
+```bash
+export WB_SWITCH_TOKEN=$(openssl rand -hex 16)   # 访问口令，必填
+
+# 用现成镜像（CI 每次发版推到 GHCR）
+docker compose -f docker-compose.ghcr.yml up -d
+
+# 或者本地构建（首次 Rust 全量编译，约 10~20 分钟）
+docker compose up -d --build
+
+# 浏览器打开： http://<这台机器的IP>:57890/?token=$WB_SWITCH_TOKEN
+```
+
+数据全在命名卷 `wb-switch-data` 里，容器重建不丢。镜像只跑 webui + API 反代这条常驻通道。
+
+细节（环境变量、端口、反代怎么对外、容器里哪些功能用不了、安全说明）见 **[docs/DOCKER.md](docs/DOCKER.md)**。
+
 ### 桌面 App
 
 前往 [GitHub Releases](https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest) 下载对应平台的安装包：

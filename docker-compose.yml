@@ -1,0 +1,48 @@
+# wb-switch 常驻部署（容器）
+#
+# 用法：
+#   1. 生成一个访问口令（必须，服务端对非回环监听强制要求）：
+#        export WB_SWITCH_TOKEN=$(openssl rand -hex 16)      # 或自己随便编一串长的
+#   2. 起服务：
+#        docker compose up -d --build
+#   3. 浏览器打开（地址栏带一次口令，之后前端会自己记住并从地址栏抹掉）：
+#        http://<这台机器的IP>:57890/?token=$WB_SWITCH_TOKEN
+#
+# 数据（账号库 / 反代配置 / 用量统计）都在命名卷 wb-switch-data 里，容器重建不丢。
+
+services:
+  wb-switch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: workbuddy-switch:latest
+    container_name: wb-switch
+    restart: unless-stopped
+    ports:
+      # webui
+      - "57890:57890"
+      # 国内版 / 国际版 API 反代
+      # ⚠️ 这两个只有在 webui 里把监听地址从 127.0.0.1:786X 改成 0.0.0.0:786X
+      #    之后才通（见 docs/DOCKER.md「反代怎么对外」）
+      - "7863:7863"
+      - "7864:7864"
+    environment:
+      # 🔴 必填。没设这个变量时 compose 会直接报错退出，不会把裸奔的服务起起来。
+      WB_SWITCH_TOKEN: "${WB_SWITCH_TOKEN:?请先设置 WB_SWITCH_TOKEN（例如 export WB_SWITCH_TOKEN=$(openssl rand -hex 16)）}"
+      # 签到 / 自动轮换按本地时间算
+      TZ: "${TZ:-Asia/Shanghai}"
+      # 想换监听端口就改这两个（记得同步改上面的 ports）
+      # WB_SWITCH_PORT: "57890"
+    volumes:
+      - wb-switch-data:/data
+    # 容器里跑的是 CLI 形态：切客户端账号 / 缓存迁移 / 更新防护这些
+    # 依赖本机 WorkBuddy 客户端的功能用不了，webui 上会报错，属预期。
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/57890"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  wb-switch-data:

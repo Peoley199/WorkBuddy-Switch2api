@@ -70,10 +70,57 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = (() => {
   if (typeof window !== "undefined") {
     const { protocol, hostname, origin } = window.location;
-    const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
-    if (protocol === "http:" && loopback) return origin.replace(/\/$/, "");
+    const host = hostname.toLowerCase();
+    // Tauri 宿主的页面源是 http://tauri.localhost —— 那条通道走 invoke，用不到本常量，
+    // 这里显式排除，免得万一被用到时指向 WebView 自己。
+    const tauriHost =
+      protocol === "tauri:" || host === "tauri.localhost" || host.endsWith(".tauri.localhost");
+    if (!tauriHost && (protocol === "http:" || protocol === "https:")) {
+      // 🔴 浏览器里跑（本机 webui / 容器部署）⇒ **一律同源**。
+      //
+      // 以前这里限定「必须回环」，于是容器部署时（从别的机器用 LAN IP 访问）
+      // API_BASE 会退回写死的 http://127.0.0.1:57890 —— 指的是**访问者自己**的本机，
+      // 于是页面能打开、所有接口都报「无法连接服务」。
+      // GitHub Pages 的演示站不受影响：它有独立的 demoMode 拦截，压根走不到 httpCall。
+      return origin.replace(/\/$/, "");
+    }
   }
   return "http://127.0.0.1:57890";
+})();
+
+/**
+ * 访问口令（容器 / 反向代理部署时用）。
+ *
+ * 服务端设了 `WB_SWITCH_TOKEN` 后，所有 `/api/*` 都要求带口令。
+ * 第一次用带 `?token=…` 的地址打开页面，这里把它收进 localStorage，
+ * 并**立刻从地址栏抹掉** —— 免得口令留在浏览器历史、截图、或被分享出去的链接里。
+ * 之后每次请求自动带 `Authorization: Bearer`。
+ */
+const ACCESS_TOKEN = (() => {
+  if (typeof window === "undefined") return "";
+  let stored = "";
+  try {
+    stored = window.localStorage.getItem("wb-switch-token") ?? "";
+  } catch {
+    /* 隐私模式 / 禁用存储：退化成「只认地址栏里那一次」 */
+  }
+  try {
+    const url = new URL(window.location.href);
+    const fromUrl = url.searchParams.get("token");
+    if (fromUrl) {
+      stored = fromUrl;
+      try {
+        window.localStorage.setItem("wb-switch-token", fromUrl);
+      } catch {
+        /* ignore */
+      }
+      url.searchParams.delete("token");
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+  } catch {
+    /* ignore */
+  }
+  return stored;
 })();
 
 const DEMO_READ_COMMANDS = new Set([
@@ -164,6 +211,16 @@ const ROUTES: Record<string, Route> = {
   update_guard_set: { method: "POST", path: "/api/update-guard/set" },
   update_guard_clear_cache: { method: "POST", path: "/api/update-guard/clear-cache" },
   update_guard_set_frozen: { method: "POST", path: "/api/update-guard/set-frozen" },
+  // API 反代。🔴 以前这几个**一条都没有** —— 浏览器里打开反代页只会看到
+  // 「webui 模式暂不支持该操作」。本机用还能靠桌面端，但**容器部署没有桌面端**，
+  // 缺了这条就等于常驻反代配不起来。
+  get_proxy_config: { method: "GET", path: "/api/proxy/config" },
+  save_proxy_config: { method: "POST", path: "/api/proxy/config" },
+  get_proxy_status: { method: "GET", path: "/api/proxy/status" },
+  get_proxy_usage: { method: "GET", path: "/api/proxy/usage" },
+  reset_proxy_usage: { method: "POST", path: "/api/proxy/usage/reset" },
+  get_proxy_models: { method: "GET", path: "/api/proxy/models" },
+  restart_proxy: { method: "POST", path: "/api/proxy/restart" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -186,9 +243,12 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       route.method === "GET"
         ? `${API_BASE}${route.path}${queryString(args)}`
         : `${API_BASE}${route.path}`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // 服务端设了口令就必须带 —— 不带会被 401（见 wb-switch-server 的 auth_guard）。
+    if (ACCESS_TOKEN) headers.Authorization = `Bearer ${ACCESS_TOKEN}`;
     res = await fetch(url, {
       method: route.method,
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
@@ -196,6 +256,11 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401) {
+      throw new Error(
+        data.message || "访问口令不对或缺失：请用带 ?token=… 的地址重新打开一次页面。",
+      );
+    }
     throw new Error(data.message || data.error || `请求失败 (${res.status})`);
   }
   return data as T;
@@ -233,7 +298,6 @@ const CACHEABLE_READS = new Set([
   "get_rotate_logs",
   "get_proxy_config",
   "get_proxy_status",
-  "get_proxy_usage",
   "get_credit_statistics",
   "get_token_statistics",
   "list_sessions",
@@ -260,6 +324,10 @@ const LIVE_READS = new Set([
   "get_codebuddy_cn_ide_status",
   "detect_codebuddy_cn_ide_account",
   "get_proxy_models",
+  // 🔴 反代用量**必须实时**：它每个请求都在变。放进可缓存名单会让「进页面看到的
+  // 还是 60 秒前的旧值」，用户得手点刷新 —— 这正是要修的症状。
+  // 放这里 = 既不缓存、也不清缓存（不会把同一次挂载里其它的缓存白刷掉）。
+  "get_proxy_usage",
   "oauth_status",
   "check_auth_permission",
   "get_launch_at_login_enabled",
@@ -625,12 +693,19 @@ export function getProxyStatus(): Promise<ProxyStatus> {
 }
 
 /** 反代用量统计（服务没跑也能读历史）。 */
-export function getProxyUsage(): Promise<ProxyUsage> {
-  return call("get_proxy_usage");
+/**
+ * 反代用量统计。
+ *
+ * 🔴 **必须按版本分开**：国内版入口只统计经 7863 的请求，国际版只统计经 7864 的。
+ * 两个页面各传自己的 `edition`（缓存键含参数，两页不会互相串数据）。
+ */
+export function getProxyUsage(edition?: "domestic" | "international"): Promise<ProxyUsage> {
+  return call("get_proxy_usage", { edition });
 }
 
-export function resetProxyUsage(): Promise<{ ok: boolean }> {
-  return call("reset_proxy_usage");
+/** 清空反代用量统计。传 `edition` 只清那一版；不传则两版都清。 */
+export function resetProxyUsage(edition?: "domestic" | "international"): Promise<{ ok: boolean }> {
+  return call("reset_proxy_usage", { edition });
 }
 
 /** 「获取模型ID」：拉一次可用模型列表，客户端 model 字段照着填。 */

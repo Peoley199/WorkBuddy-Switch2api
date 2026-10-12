@@ -40,6 +40,25 @@ const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
 
+/// 上游「渠道校验」软拦截（`11128`）的最大重试次数。
+///
+/// 🔴 这个码**不是请求内容的问题，也不是账号的问题**：同一个 payload、同一个号、
+/// 同一套出站头，实测连发 12 次全部通过（假 model）／连发 6 次全部 200（真 model）。
+/// 上游是**间歇**拦的，而且它自己的文案就在邀请重发
+/// （`displayMsg.zh = "请求被拦截，请重新发送"`）。
+/// 所以遇到它**先重试**，重试仍失败才当账号故障处理。
+const MAX_CHANNEL_RETRY: usize = 2;
+
+/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
+///
+/// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
+/// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
+/// 国际版只有 3 个号，几下就冻空 ⇒ 客户端收到
+/// `503 国际版的账号当前都不可用（冷却中，或需要重新登录）`，过两分钟又好了，
+/// 然后网络再抖 → 再冻 —— 表现为「一会儿报错停下来、一会儿又能用」反复横跳。
+/// （2026-10-11 与 `refresh.rs` 里 `code=-1` 那个坑同源。）
+const MAX_TRANSPORT_RETRY: usize = 1;
+
 /// 入站「思考强度」相关字段名，原样透传给上游。
 ///
 /// 🔴 上游真正认的是 `reasoning_effort`（实测：加它之后 `deepseek-v4-pro` /
@@ -630,6 +649,25 @@ fn sanitize_messages(messages: &Value, degraded: &mut Vec<String>) -> Value {
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let mut m = item.clone();
+        // 🔴 `role: "developer"` 必须先改写成 `system`。
+        //
+        // 上游两道网关（国内 `codebuddy.cn` / 国际 `workbuddy.ai`）都把 `developer`
+        // 判成「非官方渠道」，整条请求被 **400 `11128 Illegal API invocation from an
+        // unapproved channel`** 打回。实测单变量对照（两版各 3/3 稳定复现）：
+        //
+        // | messages | 结果 |
+        // |---|---|
+        // | `[system, developer(长正文), user]` | `11128` |
+        // | `[system, system(同一正文), user]` | `200` |
+        // | `[system, user(同一正文), user]` | `200` |
+        //
+        // DSH 这类客户端会把 system prompt 用 `developer` 角色发出去（OpenAI 自 o1 起
+        // 引入的 system 别名，语义等价）。改写它**不丢任何内容**，只是换回上游认的角色。
+        // ⚠️ 必须在下面「system 环境注入净化」**之前**做，这样开发者消息也能吃到净化。
+        if m.get("role").and_then(Value::as_str) == Some("developer") {
+            m["role"] = Value::String("system".to_string());
+            degraded.push("developer-role".to_string());
+        }
         // system 消息先过一遍「环境注入」净化，见 strip_env_injection 的说明。
         if m.get("role").and_then(Value::as_str) == Some("system") {
             if let Some(cleaned) = m
@@ -701,6 +739,39 @@ fn strip_env_injection(text: &str) -> Option<String> {
         return None;
     }
     Some(cleaned.to_string())
+}
+
+/// 上游的失败响应体是不是「渠道校验软拦截」（`11128`）。
+///
+/// 只看响应体里有没有这个码 / 这句 msg —— 上游把它包在 `message` 字符串里再套一层
+/// JSON，所以不能按结构化字段取，直接做子串匹配最稳。
+///
+/// 视为**可重试**的理由见 [`MAX_CHANNEL_RETRY`]：它是间歇性的，且文案本身在让客户端重发。
+/// 判定成它之后**不要立刻冷却账号** —— 号是好的，冻它只会把整个账号池拖空。
+fn is_channel_block(text: &str) -> bool {
+    text.contains("11128") || text.contains("unapproved channel")
+}
+
+/// 调试落盘开关：`~/.wb-switch/DEBUG_DUMP` **存在**时，把发往上游的真实请求体
+/// 与失败响应写到 `~/.wb-switch/dump/`。
+///
+/// 🔴 用「开关文件」而不是环境变量：这样**不必改启动方式**（照常双击即可，
+/// 免得从终端启动时继承到 `HTTP_PROXY` 之类变量），排查完删掉开关文件就停。
+/// 关掉时这里只做一次 `Path::exists()`，开销可忽略。
+///
+/// 用途：某些 11128 只在真实客户端（DSH 等）的完整报文下复现，
+/// 而我们无法从会话存储里看到实际发出的字段 —— 只能把它拦下来看。
+fn debug_dump_enabled() -> bool {
+    home_dir().join(".wb-switch").join("DEBUG_DUMP").exists()
+}
+
+fn debug_dump(name: &str, payload: &str) {
+    if !debug_dump_enabled() {
+        return;
+    }
+    let dir = home_dir().join(".wb-switch").join("dump");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(name), payload);
 }
 
 /// 单个内容块：`None` = 原样保留，`Some(text)` = 降级成文本块。
@@ -1209,10 +1280,13 @@ struct UsageMeta {
     nickname: String,
     model: String,
     stream: bool,
+    /// 🔴 统计必须**按版本分开**：国内版入口只算国内版的量，国际版只算国际版的。
+    /// 之前没有这个字段，两版混在同一个 `total` 里，界面上国际版页会显示国内号的用量。
+    edition: Edition,
 }
 
 const USAGE_FILE: &str = "proxy-usage.json";
-/// recent 列表最多保留多少条。
+/// recent 列表最多保留多少条（**每版各一份**）。
 const USAGE_RECENT_MAX: usize = 100;
 
 fn usage_path() -> std::path::PathBuf {
@@ -1221,9 +1295,17 @@ fn usage_path() -> std::path::PathBuf {
 
 static USAGE_LOCK: Mutex<()> = Mutex::new(());
 
-fn empty_usage() -> Value {
+/// `Edition` → 存储里的键名。
+fn edition_key(e: Edition) -> &'static str {
+    match e {
+        Edition::Domestic => "domestic",
+        Edition::International => "international",
+    }
+}
+
+/// 单个版本的用量文档（旧格式的扁平结构原样保留，前端不用大改）。
+fn empty_edition_usage() -> Value {
     json!({
-        "updatedAt": 0,
         "total": {"requests": 0, "errors": 0, "promptTokens": 0,
                   "completionTokens": 0, "credit": 0},
         "byAccount": {},
@@ -1232,7 +1314,105 @@ fn empty_usage() -> Value {
     })
 }
 
-/// 读统计文件；损坏或不存在就返回空结构。
+fn empty_usage() -> Value {
+    json!({
+        "updatedAt": 0,
+        "byEdition": {
+            "domestic": empty_edition_usage(),
+            "international": empty_edition_usage(),
+        },
+    })
+}
+
+/// 把**旧格式**（两版混在一起）迁移成按版本分开。
+///
+/// 旧文件把两版混在一个 `total` / `byAccount` / `byModel` / `recent` 里，能拆的都拆：
+///
+/// - `byAccount` 的**键就是 uid** ⇒ 按账号档位精确归位；
+/// - `recent` 每条也带 `uid` ⇒ 同样精确归位；
+/// - `total` 不猜，直接由**该档的 byAccount 求和**得出（比估算准）；
+/// - ⚠️ `byModel` 不含账号信息、**拆不开** ⇒ 只能丢弃（纯展示项，之后重新累积）。
+///
+/// 之后每次 `record_usage` 只往自己那一档写，`byEdition` 已存在时本函数直接返回。
+fn migrate_legacy_usage(doc: Value) -> Value {
+    if doc.get("byEdition").is_some() {
+        return doc;
+    }
+    if doc.get("total").is_none() && doc.get("byAccount").is_none() {
+        return empty_usage();
+    }
+
+    // uid → 档位（按当前账号库判定）
+    let mut ed_of: HashMap<String, Edition> = HashMap::new();
+    for a in load_accounts() {
+        if let Some(uid) = a.get("uid").and_then(Value::as_str) {
+            ed_of.insert(uid.to_string(), edition_of(&a));
+        }
+    }
+    migrate_legacy_usage_with(doc, &ed_of)
+}
+
+/// [`migrate_legacy_usage`] 的实现体：`uid → 档位` 由调用方给，便于单测。
+fn migrate_legacy_usage_with(doc: Value, ed_of: &HashMap<String, Edition>) -> Value {
+    if doc.get("byEdition").is_some() {
+        return doc;
+    }
+    if doc.get("total").is_none() && doc.get("byAccount").is_none() {
+        return empty_usage();
+    }
+
+    let mut out = empty_usage();
+    if let Some(t) = doc.get("updatedAt") {
+        out["updatedAt"] = t.clone();
+    }
+
+    // ① byAccount 精确拆分
+    if let Some(m) = doc.get("byAccount").and_then(Value::as_object) {
+        for (uid, bucket) in m {
+            let key = edition_key(ed_of.get(uid).copied().unwrap_or(Edition::Domestic));
+            if let Some(dst) = out["byEdition"][key]["byAccount"].as_object_mut() {
+                dst.insert(uid.clone(), bucket.clone());
+            }
+        }
+    }
+
+    // ② 每档 total = 该档 byAccount 求和
+    for edition in Edition::ALL {
+        let key = edition_key(edition);
+        let mut acc = json!({"requests": 0i64, "errors": 0i64, "promptTokens": 0i64,
+                             "completionTokens": 0i64, "credit": 0.0f64});
+        if let Some(m) = out["byEdition"][key]["byAccount"].as_object() {
+            for bucket in m.values() {
+                for k in ["requests", "errors", "promptTokens", "completionTokens"] {
+                    let v = acc[k].as_i64().unwrap_or(0)
+                        + bucket.get(k).and_then(Value::as_i64).unwrap_or(0);
+                    acc[k] = json!(v);
+                }
+                let c = acc["credit"].as_f64().unwrap_or(0.0)
+                    + bucket.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+                acc["credit"] = json!(c);
+            }
+        }
+        out["byEdition"][key]["total"] = acc;
+    }
+
+    // ③ recent 按 uid 拆分（各自截断）
+    if let Some(arr) = doc.get("recent").and_then(Value::as_array) {
+        for item in arr {
+            let uid = item.get("uid").and_then(Value::as_str).unwrap_or("");
+            let key = edition_key(ed_of.get(uid).copied().unwrap_or(Edition::Domestic));
+            if let Some(dst) = out["byEdition"][key]["recent"].as_array_mut() {
+                if dst.len() < USAGE_RECENT_MAX {
+                    dst.push(item.clone());
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// 读统计文件；损坏或不存在就返回空结构。旧格式会被就地迁移。
 pub fn load_usage() -> Value {
     let p = usage_path();
     if !p.is_file() {
@@ -1242,15 +1422,36 @@ pub fn load_usage() -> Value {
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
     {
-        Some(v) if v.get("total").is_some() => v,
-        _ => empty_usage(),
+        Some(v) => migrate_legacy_usage(v),
+        None => empty_usage(),
     }
 }
 
-/// 清空统计。
-pub fn reset_usage() -> Result<(), String> {
+/// 取**某一版**的用量，形状与旧格式一致（`total` / `byAccount` / `byModel` / `recent`）。
+pub fn load_usage_for(edition: Edition) -> Value {
+    let doc = load_usage();
+    let key = edition_key(edition);
+    let mut out = doc
+        .get("byEdition")
+        .and_then(|v| v.get(key))
+        .cloned()
+        .unwrap_or_else(empty_edition_usage);
+    out["updatedAt"] = doc.get("updatedAt").cloned().unwrap_or(json!(0));
+    out
+}
+
+/// 清空统计。`edition` 为 `None` 时清**全部**（两版都清）。
+pub fn reset_usage(edition: Option<Edition>) -> Result<(), String> {
     let _g = USAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut doc = empty_usage();
+    let mut doc = match edition {
+        None => empty_usage(),
+        Some(e) => {
+            let mut d = load_usage();
+            let key = edition_key(e);
+            d["byEdition"][key] = empty_edition_usage();
+            d
+        }
+    };
     doc["updatedAt"] = json!(now_ms());
     std::fs::write(
         usage_path(),
@@ -1304,6 +1505,11 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
 
     let _g = USAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut doc = load_usage();
+    // 🔴 只写自己那一档：国内版入口的量不会跑到国际版页面上（反之亦然）。
+    let key = edition_key(meta.edition);
+    if doc["byEdition"].get(key).is_none() {
+        doc["byEdition"][key] = empty_edition_usage();
+    }
 
     let bump = |obj: &mut Value, prompt: i64, completion: i64, credit: f64, ok: bool| {
         if !obj.is_object() {
@@ -1324,9 +1530,9 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
             json!(o.get("credit").and_then(Value::as_f64).unwrap_or(0.0) + credit);
     };
 
-    bump(&mut doc["total"], prompt, completion, credit, ok);
+    bump(&mut doc["byEdition"][key]["total"], prompt, completion, credit, ok);
 
-    if let Some(m) = doc["byAccount"].as_object_mut() {
+    if let Some(m) = doc["byEdition"][key]["byAccount"].as_object_mut() {
         let e = m.entry(meta.uid.clone()).or_insert_with(|| {
             json!({"nickname": meta.nickname, "requests": 0, "errors": 0,
                    "promptTokens": 0, "completionTokens": 0, "credit": 0})
@@ -1334,7 +1540,7 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
         e["nickname"] = json!(meta.nickname);
         bump(e, prompt, completion, credit, ok);
     }
-    if let Some(m) = doc["byModel"].as_object_mut() {
+    if let Some(m) = doc["byEdition"][key]["byModel"].as_object_mut() {
         let e = m
             .entry(meta.model.clone())
             .or_insert_with(|| {
@@ -1344,7 +1550,7 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
         bump(e, prompt, completion, credit, ok);
     }
 
-    if let Some(arr) = doc["recent"].as_array_mut() {
+    if let Some(arr) = doc["byEdition"][key]["recent"].as_array_mut() {
         arr.insert(
             0,
             json!({
@@ -1752,16 +1958,13 @@ async fn chat_completions(
         nickname,
         model: model.clone(),
         stream: want_stream,
+        edition: st.edition,
     };
 
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let mut req = client.post(chat_url(&acc));
-    for (k, v) in chat_headers(&acc) {
-        req = req.header(k, v);
-    }
     // 上游不认识的内容块（zcode 等客户端发的 file / document）在这里降级成文本，
     // 否则整条请求会被上游 400：`unsupported content type at index 0: file`。
     let mut degraded: Vec<String> = Vec::new();
@@ -1772,25 +1975,104 @@ async fn chat_completions(
             degraded_summary(&degraded)
         );
     }
-    let resp = match req.json(&upstream_body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            st.pool.mark_failed(&uid);
-            return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+    // 调试落盘（开关文件控制）：真实客户端报文与我们的复现差在哪，看这个。
+    debug_dump(
+        "last-request.json",
+        &serde_json::to_string_pretty(&json!({
+            "edition": st.edition.label(),
+            "uid": &uid,
+            "model": model,
+            "degraded": degraded,
+            "body": upstream_body,
+        }))
+        .unwrap_or_else(|_| "{}".to_string()),
+    );
+
+    // 🔴 发请求 + 「渠道校验软拦截」重试，见 MAX_CHANNEL_RETRY。
+    // 重试时**重新生成**会话头族（chat_headers 里的 id 是每次调用现算的），
+    // 免得同一个 request id 被上游当成重复包直接判掉。
+    let mut channel_retry = 0usize;
+    let mut transport_retry = 0usize;
+    let resp = loop {
+        let mut req = client.post(chat_url(&acc));
+        for (k, v) in chat_headers(&acc) {
+            req = req.header(k, v);
         }
-    };
-    if !resp.status().is_success() {
-        st.pool.mark_failed(&uid);
+        let r = match req.json(&upstream_body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // 🔴 连接层失败：**不冷却账号**（原因见 MAX_TRANSPORT_RETRY）。
+                // 只重试一次应对瞬时抖动；仍失败就把 502 如实回给客户端，
+                // 由客户端自己决定要不要再发 —— 号本身没坏，别把它冻掉。
+                if transport_retry < MAX_TRANSPORT_RETRY {
+                    transport_retry += 1;
+                    eprintln!(
+                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试 \
+                         (model={model}, uid={uid}): {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+                debug_dump(
+                    "last-failure.txt",
+                    &format!(
+                        "transport-error\nuid={uid}\nmodel={model}\nedition={}\nretries={transport_retry}\n\n{e}",
+                        st.edition.label(),
+                    ),
+                );
+                record_usage(&meta, None, false);
+                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+            }
+        };
+        if r.status().is_success() {
+            break r;
+        }
+        let raw_status = r.status();
+        let text = r.text().await.unwrap_or_default();
+        if is_channel_block(&text) && channel_retry < MAX_CHANNEL_RETRY {
+            channel_retry += 1;
+            // 退避：按次数递增，给上游的间歇判定留出恢复窗口。
+            tokio::time::sleep(Duration::from_millis(300 * channel_retry as u64)).await;
+            eprintln!(
+                "[反代] 上游渠道校验拦下，第 {channel_retry}/{MAX_CHANNEL_RETRY} 次重试 \
+                 (model={model}, uid={uid})"
+            );
+            continue;
+        }
+        // 重试仍被拦、或本来就不是渠道校验的失败 → 才当账号/上游故障处理。
+        debug_dump(
+            "last-failure.txt",
+            &format!(
+                "status={}\nuid={uid}\nmodel={model}\nedition={}\nretries={channel_retry}\n\n{text}",
+                raw_status.as_u16(),
+                st.edition.label(),
+            ),
+        );
+        // 🔴 只对**账号级**失败冷却号（4xx：鉴权 / 额度 / 渠道校验）。
+        // 5xx 是上游自己的问题（502 / 503 / 504 …），拿它去冻号只会把好号冻光 ——
+        // 与连接层失败是同一类误判，会让整池无谓地空掉。
+        let status = StatusCode::from_u16(raw_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        if raw_status.is_client_error() {
+            st.pool.mark_failed(&uid);
+            if is_channel_block(&text) {
+                eprintln!(
+                    "[反代] 渠道校验重试 {channel_retry} 次后仍被拦，冷却该账号 \
+                     (model={model}, uid={uid})"
+                );
+            }
+        } else {
+            eprintln!(
+                "[反代] 上游 {} 失败（上游侧问题，不冷却账号）(model={model}, uid={uid})",
+                raw_status.as_u16()
+            );
+        }
         record_usage(&meta, None, false);
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
-        let text = resp.text().await.unwrap_or_default();
         return (
             status,
             Json(json!({"error": {"message": text, "type": "upstream_error"}})),
         )
             .into_response();
-    }
+    };
 
     if want_stream {
         // 不再原样透传：先过一层 SSE 重组器（见 sse_pump 的说明），
@@ -1929,8 +2211,9 @@ async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn usage_stats() -> Response {
-    Json(load_usage()).into_response()
+/// 本入口自己的用量统计（**只含本版**，不会把另一版的量混进来）。
+async fn usage_stats(State(st): State<AppState>) -> Response {
+    Json(load_usage_for(st.edition)).into_response()
 }
 
 // ---------------------------------------------------------------- 启动
@@ -2246,6 +2529,104 @@ mod tests {
         );
     }
 
+    /// 渠道校验软拦截（11128）要能被认出来 —— 它是**可重试**的，认错就会白冻一个号。
+    ///
+    /// 真实响应体长这样（上游把内层 JSON 当字符串塞进 `message`）：
+    /// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an
+    /// unapproved channel\",...}","type":"upstream_error"}`
+    #[test]
+    /// 旧格式（两版混在一起）迁移后必须**按版本分开**：
+    /// byAccount / recent 按 uid 精确归位，每档 total 由该档 byAccount 求和。
+    #[test]
+    fn legacy_usage_splits_by_edition() {
+        let mut ed_of = HashMap::new();
+        ed_of.insert("u-cn".to_string(), Edition::Domestic);
+        ed_of.insert("u-ai".to_string(), Edition::International);
+
+        let legacy = json!({
+            "updatedAt": 111,
+            // 旧字段（混合），迁移时应被丢弃/不用
+            "total": {"requests": 999, "errors": 9, "promptTokens": 9, "completionTokens": 9, "credit": 9.0},
+            "byAccount": {
+                "u-cn": {"nickname": "国内号", "requests": 3, "errors": 1,
+                         "promptTokens": 100, "completionTokens": 10, "credit": 1.5},
+                "u-ai": {"nickname": "国际号", "requests": 7, "errors": 2,
+                         "promptTokens": 200, "completionTokens": 20, "credit": 2.5},
+            },
+            "byModel": {"m": {"requests": 10}},
+            "recent": [
+                {"ts": 2, "uid": "u-ai", "model": "m", "ok": true},
+                {"ts": 1, "uid": "u-cn", "model": "m", "ok": false},
+            ],
+        });
+
+        let out = migrate_legacy_usage_with(legacy, &ed_of);
+        assert_eq!(out["updatedAt"], 111);
+
+        let cn = &out["byEdition"]["domestic"];
+        let ai = &out["byEdition"]["international"];
+
+        // byAccount 精确归位
+        assert_eq!(cn["byAccount"]["u-cn"]["requests"], 3);
+        assert!(cn["byAccount"].get("u-ai").is_none(), "国际号不能落到国内档");
+        assert_eq!(ai["byAccount"]["u-ai"]["requests"], 7);
+
+        // total 由各自 byAccount 求和，而不是照抄旧的混合 total
+        assert_eq!(cn["total"]["requests"], 3);
+        assert_eq!(cn["total"]["promptTokens"], 100);
+        assert_eq!(cn["total"]["credit"], 1.5);
+        assert_eq!(ai["total"]["requests"], 7);
+        assert_eq!(ai["total"]["promptTokens"], 200);
+        assert_eq!(ai["total"]["credit"], 2.5);
+
+        // recent 按 uid 拆开
+        assert_eq!(cn["recent"].as_array().unwrap().len(), 1);
+        assert_eq!(cn["recent"][0]["uid"], "u-cn");
+        assert_eq!(ai["recent"].as_array().unwrap().len(), 1);
+        assert_eq!(ai["recent"][0]["uid"], "u-ai");
+
+        // 拆不开的 byModel 不保留（纯展示项）
+        assert!(cn["byModel"].as_object().unwrap().is_empty());
+        assert!(ai["byModel"].as_object().unwrap().is_empty());
+    }
+
+    /// 已经是新格式时迁移必须是空操作（幂等），且不误判损坏文件。
+    #[test]
+    fn usage_migration_is_idempotent_and_safe() {
+        let mut ed_of = HashMap::new();
+        ed_of.insert("u-cn".to_string(), Edition::Domestic);
+
+        let already = json!({
+            "updatedAt": 5,
+            "byEdition": {
+                "domestic": {"total": {"requests": 1}, "byAccount": {}, "byModel": {}, "recent": []},
+                "international": {"total": {"requests": 2}, "byAccount": {}, "byModel": {}, "recent": []},
+            },
+        });
+        let out = migrate_legacy_usage_with(already, &ed_of);
+        assert_eq!(out["byEdition"]["international"]["total"]["requests"], 2);
+
+        // 空文件 / 损坏文件 → 空结构，不 panic
+        let empty = migrate_legacy_usage_with(json!({}), &ed_of);
+        assert_eq!(empty["byEdition"]["domestic"]["total"]["requests"], 0);
+    }
+
+    /// 渠道校验软拦截（11128）要能被认出来 —— 它是**可重试**的，认错就会白冻一个号。
+    #[test]
+    fn detects_channel_block_from_upstream_body() {
+        let real = r#"400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"000000000000000046302613c7e69e4d\"}","type":"upstream_error"}"#;
+        assert!(is_channel_block(real), "真实响应体必须命中");
+
+        // 只带码、或只带 msg 的变体也要认。
+        assert!(is_channel_block(r#"{"code":11128}"#));
+        assert!(is_channel_block("Illegal API invocation from an unapproved channel"));
+
+        // 🔴 不能误伤：别的错误码（含恰好包含 11128 之外的数字串）都算普通失败。
+        assert!(!is_channel_block(r#"{"code":11102,"msg":"service info not found"}"#));
+        assert!(!is_channel_block(r#"{"code":11101,"msg":"unsupported content type"}"#));
+        assert!(!is_channel_block(""));
+    }
+
     /// 净化只作用于 system 消息，user / assistant 的内容一个字都不能少。
     #[test]
     fn env_strip_only_touches_system_role() {
@@ -2260,6 +2641,43 @@ mod tests {
         assert_eq!(out[1]["content"], "gitStatus: 用户自己写的，必须原样保留");
         assert_eq!(out[2]["content"], "ok");
         assert_eq!(degraded, vec!["system-env".to_string()]);
+    }
+
+    /// 🔴 `role: "developer"` 必须改写成 `system`，否则上游整条 400
+    /// `11128 Illegal API invocation from an unapproved channel`。
+    ///
+    /// 实测单变量对照（国内版 / 国际版各 3/3 稳定）：
+    /// `[system, developer, user]` → 11128；把 developer 换成 system → 200。
+    /// DSH 这类客户端就是这么发 system prompt 的。
+    #[test]
+    fn developer_role_is_rewritten_to_system() {
+        let mut degraded = Vec::new();
+        let msgs = json!([
+            { "role": "developer", "content": "You are an AI agent powered by DeepSeek Harness." },
+            { "role": "user", "content": "hi" },
+        ]);
+        let out = sanitize_messages(&msgs, &mut degraded);
+        assert_eq!(out[0]["role"], "system", "developer 必须被改成 system");
+        assert_eq!(out[0]["content"], "You are an AI agent powered by DeepSeek Harness.",
+                   "内容一个字都不能动");
+        assert_eq!(out[1]["role"], "user", "user 消息不受影响");
+        assert_eq!(degraded, vec!["developer-role".to_string()]);
+
+        // 改写后还要能吃到 system 的环境注入净化（顺序：先改 role 再净化）。
+        let mut d2 = Vec::new();
+        let msgs2 = json!([
+            { "role": "developer", "content": "Rules.\n\ngitStatus: clean\n\nGit user: x\n" },
+            { "role": "user", "content": "hi" },
+        ]);
+        let out2 = sanitize_messages(&msgs2, &mut d2);
+        assert_eq!(out2[0]["role"], "system");
+        assert_eq!(out2[0]["content"], "Rules.");
+        assert_eq!(d2, vec!["developer-role".to_string(), "system-env".to_string()]);
+
+        // 没有 developer 时不能凭空加标记。
+        let mut d3 = Vec::new();
+        sanitize_messages(&json!([{ "role": "system", "content": "ok" }]), &mut d3);
+        assert!(d3.is_empty());
     }
 
     /// v1 的扁平配置能自动迁移成双入口：旧的 `listen` / `api_key` / `enabled`

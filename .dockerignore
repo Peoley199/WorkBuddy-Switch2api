@@ -1,0 +1,45 @@
+# 构建上下文里不需要的东西。目标是「够小、且不含任何本机数据」。
+#
+# ⚠️ `dist` 也排除掉：镜像里的 dist 一律在 Dockerfile 里现构建，
+# 免得把本机某次构建的残留打进去（rust-embed 会把 dist 编进二进制）。
+#
+# ⚠️ 别用 `*.png` / `*.svg` 这种全局排除 —— 前端图标（src/assets、public）就是这些后缀，
+# 排掉会让 vite 构建直接失败。
+
+node_modules
+**/node_modules
+
+# Rust 构建产物（很大）
+target
+**/target
+
+# 前端产物（在镜像里重新构建）
+dist
+dist.bak-*
+dist-ssr
+
+# 本机运行数据 —— 绝对不能进镜像（里面有账号 token）
+.wb-switch
+**/.workbuddy
+**/.dsh
+npm/bin/wb-switch-*
+
+# 版本控制 / CI
+.git
+.github
+
+# 编辑器 / 系统垃圾
+.vscode
+.idea
+*.log
+logs
+*.local
+.DS_Store
+Thumbs.db
+
+# 临时 / 归档文件（根目录级别的）
+*.tmp
+*.bak
+*.zip
+dist.bak-*
+*.exe

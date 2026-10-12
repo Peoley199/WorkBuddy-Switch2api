@@ -44,9 +44,31 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
         variant.api_endpoint(),
         variant.api_prefix()
     );
-    let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
+    let mut resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
+
+    // 🔴🔴 `code == -1` 是 **HTTP 层的网络失败**（DNS 解析不了 / 超时 / 连接被拒），
+    // 不是「refresh token 失效」。`http_request` 对网络错误一律返回 `{"code": -1, ...}`
+    // （见 `config.rs` 的 `Err(e) => json!({"code": -1, ...})`）。
+    //
+    // 之前的写法把两者一视同仁 —— 网络抖一下就给号盖上 `needs_relogin`、**永久踢出反代池**
+    // （`eligible_accounts` 会跳过这种号），于是「网络一抖 → 整池罢工」。
+    // 2026-10-11 一晚踩了两次：国内版 19:18 / 20:09、国际版 21:53 / 22:05，都是这个原因。
+    //
+    // 这里先重试一次（网络抖动多为瞬时），仍失败就**原样返回、不落盘**：
+    // 旧的 access token 可能还有效，后续请求会再试；瞬时失败交给反代的失败冷却去兜，
+    // 而不是给账号判死刑。
+    if resp.get("code").and_then(Value::as_i64) == Some(-1) {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
+        if resp.get("code").and_then(Value::as_i64) == Some(-1) {
+            return account;
+        }
+    }
+
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
+        // 走到这里说明**上游真的拒绝了**（401 / refresh token 失效 / 参数不对），
+        // 这种才是需要重新登录的，照旧标记。
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!(format!(
             "刷新失败(code={code}): {}",

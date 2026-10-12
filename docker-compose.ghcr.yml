@@ -1,0 +1,36 @@
+# wb-switch 常驻部署（容器）· 用 GHCR 现成镜像
+#
+# 与 docker-compose.yml 的区别：这个文件**不构建**，直接拉 CI 推上来的镜像。
+# 适合不想在本机编译 15 分钟的机器（NAS / 小主机）。
+#
+# 用法：
+#   export WB_SWITCH_TOKEN=$(openssl rand -hex 16)
+#   docker compose -f docker-compose.ghcr.yml up -d
+#   # 浏览器打开 http://<这台机器的IP>:57890/?token=$WB_SWITCH_TOKEN
+#
+# 想固定版本而不是跟 latest：把 image 换成
+#   ghcr.io/cv-superding/workbuddy-switch2api:1.7.0
+
+services:
+  wb-switch:
+    image: ghcr.io/cv-superding/workbuddy-switch2api:latest
+    container_name: wb-switch
+    restart: unless-stopped
+    ports:
+      - "57890:57890"   # webui
+      - "7863:7863"     # 国内版 API 反代（监听地址要在 webui 里改成 0.0.0.0:7863）
+      - "7864:7864"     # 国际版 API 反代（同上，改成 0.0.0.0:7864）
+    environment:
+      WB_SWITCH_TOKEN: "${WB_SWITCH_TOKEN:?请先设置 WB_SWITCH_TOKEN（例如 export WB_SWITCH_TOKEN=$(openssl rand -hex 16)）}"
+      TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - wb-switch-data:/data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/57890"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  wb-switch-data:

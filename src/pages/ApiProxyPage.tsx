@@ -221,12 +221,28 @@ function num3(v?: number): string {
   }).format(v ?? 0);
 }
 
+/**
+ * 一张统计卡片。
+ *
+ * 🔴 **字号写死，不做任何「按长度分档」** —— 分档就会一排里出现「一张大一张小」，
+ * 这个坑踩过两次（先按各卡片自己长度分，改成按整行最长分，都还是会被看成不齐）。
+ * 四张统一 18px（`text-lg`）；个别超长的数字靠 `truncate` + `title` 兜底。
+ */
 function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
-    <div className="rounded-xl border border-border bg-muted/25 px-4 py-3">
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 text-xl font-semibold tabular-nums tracking-tight">{value}</div>
-      {hint ? <div className="mt-0.5 text-[11px] text-muted-foreground/70">{hint}</div> : null}
+    <div className="min-w-0 rounded-xl border border-border bg-muted/25 px-3 py-3 sm:px-4">
+      <div className="truncate text-xs text-muted-foreground">{label}</div>
+      <div
+        className="mt-1 truncate text-lg font-semibold tabular-nums tracking-tight"
+        title={value}
+      >
+        {value}
+      </div>
+      {hint ? (
+        <div className="mt-0.5 truncate text-[11px] text-muted-foreground/70" title={hint}>
+          {hint}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -238,7 +254,7 @@ function bucketRow(name: string, b: UsageBucket) {
       <span className="shrink-0 tabular-nums text-muted-foreground">
         {num(b.requests)} 次
       </span>
-      <span className="w-24 shrink-0 text-right tabular-nums text-muted-foreground">
+      <span className="w-28 shrink-0 text-right tabular-nums leading-tight text-muted-foreground">
         {num(b.promptTokens)} / {num(b.completionTokens)}
       </span>
     </div>
@@ -269,7 +285,14 @@ export default function ApiProxyPage({
     void load();
     // 截图/演示用：?models=1 直接展开模型列表（和迁移页的 ?tab=import 一个路子）
     if (params.get("models") === "1") void fetchModels();
-  }, []);
+    // 🔴 依赖 `edition`，不能是空数组。
+    //
+    // 国内版与国际版是**同一个组件**（只换 `edition` prop）挂在两个路由上：
+    // `/api-proxy/domestic` 与 `/api-proxy/international`。React 在路由切换时
+    // 会**复用同一个实例**（同类型同位置）⇒ 空依赖的 effect 不会再跑，
+    // 于是切过去看到的还是上一版的数据，必须手点「刷新」才对 —— 用户实测就是这个症状。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edition]);
 
   async function load() {
     try {
@@ -277,7 +300,7 @@ export default function ApiProxyPage({
         api.getProxyConfig(),
         api.getProxyStatus(),
         api.getAccounts(),
-        api.getProxyUsage(),
+        api.getProxyUsage(edition),
       ]);
       setCfg(c);
       setSt(s);
@@ -376,9 +399,10 @@ export default function ApiProxyPage({
   async function onResetUsage() {
     setResettingUsage(true);
     try {
-      await api.resetProxyUsage();
-      setUsage(await api.getProxyUsage());
-      setMsg({ type: "ok", text: "用量统计已清空" });
+      // 只清**本页这一版**的统计，别把另一版的也清了。
+      await api.resetProxyUsage(edition);
+      setUsage(await api.getProxyUsage(edition));
+      setMsg({ type: "ok", text: "本页的用量统计已清空" });
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
@@ -579,7 +603,11 @@ export default function ApiProxyPage({
         {usage ? (
           <>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <StatCard label="总请求" value={num(usage.total.requests)} hint={usage.total.errors ? `失败 ${num(usage.total.errors)}` : undefined} />
+              <StatCard
+                label="总请求"
+                value={num(usage.total.requests)}
+                hint={usage.total.errors ? `失败 ${num(usage.total.errors)}` : undefined}
+              />
               <StatCard label="输入 tokens" value={num(usage.total.promptTokens)} />
               <StatCard label="输出 tokens" value={num(usage.total.completionTokens)} />
               <StatCard label="累计消耗" value={num3(usage.total.credit)} hint="上游返回的 credit" />

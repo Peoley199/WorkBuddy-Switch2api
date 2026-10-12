@@ -1,25 +1,104 @@
 //! HTTP API 层：把 wb-switch-core 暴露为本地 REST 接口，供 webui（浏览器）调用。
 //!
-//! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。仅绑定 127.0.0.1，
-//! token 不出本机。
+//! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。
+//!
+//! 安全姿态：
+//! - **默认**只绑 `127.0.0.1`、不校验口令 —— token 不出本机，与以前一致；
+//! - 一旦把监听地址改成非回环（Docker / 反代），**入口会强制要求设置访问口令**
+//!   （见 `main.rs` 的 `resolve_bind`），中间件 [`auth_guard`] 校验 `/api/*`。
+//!   这两道是配套的：只改地址不设口令，等于把账号库挂到网上。
 
 use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::RawQuery;
+use axum::extract::{RawQuery, Request};
 use axum::http::{header, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
+/// 访问口令。`None` = 不校验（本机默认行为，与以前完全一致）。
+///
+/// Docker / 反向代理场景下必须设：本服务能读写账号库、能切号、能签到，
+/// 裸奔在网络上等于把账号交出去。
+static ACCESS_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// 由入口（`main.rs`）在 `router()` 之前调用，设置访问口令。
+pub fn set_access_token(token: Option<String>) {
+    let _ = ACCESS_TOKEN.set(token);
+}
+
+fn access_token() -> Option<&'static str> {
+    ACCESS_TOKEN
+        .get()
+        .and_then(|t| t.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// 极简 query 解析：只按 `&` / `=` 切，不做百分号转义。
+///
+/// 口令要求只用 `[A-Za-z0-9._~-]`（URL 里不需要转义的字符），
+/// 所以这里不引 `serde_urlencoded` 也够用。
+fn query_pairs(q: &str) -> Vec<(&str, &str)> {
+    q.split('&')
+        .filter(|s| !s.is_empty())
+        .map(|kv| kv.split_once('=').unwrap_or((kv, "")))
+        .collect()
+}
+
+/// 访问口令中间件。
+///
+/// 🔴 **只校验 `/api/*`**，静态资源（HTML / JS / CSS）一律放行：
+/// 它们不含任何用户数据，而且「打开页面时用 `?token=…` 引导一次口令」这条路径
+/// 本身就要求 index.html 能匿名取到。真正的数据接口一个都不放过。
+///
+/// 口令来源二选一：`Authorization: Bearer <token>` 或 `?token=<token>`。
+/// 前者是页面加载后前端自己带的，后者只用于第一次引导。
+async fn auth_guard(req: Request, next: Next) -> Response {
+    let Some(want) = access_token() else {
+        return next.run(req).await;
+    };
+    if !req.uri().path().starts_with("/api/") {
+        return next.run(req).await;
+    }
+    let by_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        == Some(want);
+    let by_query = req
+        .uri()
+        .query()
+        .map(query_pairs)
+        .unwrap_or_default()
+        .iter()
+        .any(|(k, v)| *k == "token" && *v == want);
+    if by_header || by_query {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "message": "未授权：请带上访问口令（首次访问用 ?token=…，之后前端会自动带 Bearer）"
+            })),
+        )
+            .into_response()
+    }
+}
+
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
     edition::Edition, export_import,
-    oauth, process, refresh, rotate, session, switch, token_stats, travel, update, update_guard,
+    oauth, process, proxy, refresh, rotate, session, switch, token_stats, travel, update,
+    update_guard,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -121,7 +200,17 @@ pub fn router() -> Router {
             "/api/update-guard/set-frozen",
             post(api_update_guard_set_frozen),
         )
+        // API 反代（容器 / CLI 形态靠这几个才配得起来）
+        .route("/api/proxy/config", get(api_proxy_config).post(api_proxy_save))
+        .route("/api/proxy/status", get(api_proxy_status))
+        .route("/api/proxy/usage", get(api_proxy_usage))
+        .route("/api/proxy/usage/reset", post(api_proxy_usage_reset))
+        .route("/api/proxy/models", get(api_proxy_models))
+        .route("/api/proxy/restart", post(api_proxy_restart))
         .fallback(static_handler)
+        // 🔴 必须在所有路由**之后**挂：layer 只对它之前注册的项生效。
+        // 没设口令时这层是空操作，本机行为与以前一模一样。
+        .layer(axum::middleware::from_fn(auth_guard))
 }
 
 fn json_ok(v: Value) -> Response {
@@ -575,6 +664,133 @@ async fn api_refresh_token(Json(body): Json<Value>) -> Response {
         return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
     json_ok(refresh::refresh_account_token(acc).await)
+}
+
+// ---------------------------------------------------------------------------
+// API 反代
+//
+// 🔴 这段是「容器 / CLI 形态能不能用」的关键。以前 webui **完全没有**反代相关路由，
+// 于是浏览器里打开反代页只能看到「webui 模式暂不支持该操作」——
+// 本机 webui 影响不大（可以用桌面端），但**容器部署没有桌面端**，
+// 缺了这条就等于「常驻反代」这个核心用途根本配不起来。
+//
+// 返回值形状刻意对齐 `src-tauri/src/commands.rs` 里的同名命令，前端 ROUTES 直接复用。
+// ---------------------------------------------------------------------------
+
+/// 反代总状态（与桌面端 `get_proxy_status` 同形状）。
+fn proxy_status_value() -> Value {
+    let cfg = proxy::load_proxy_config();
+    let endpoints: Vec<Value> = Edition::ALL
+        .iter()
+        .map(|&e| {
+            let ep = cfg.endpoint(e);
+            json!({
+                "edition": e.key(),
+                "label": e.label(),
+                "enabled": ep.enabled,
+                "listen": ep.listen,
+                "hasApiKey": !ep.api_key.trim().is_empty(),
+                // 该入口自己的账号数（0 = 该版本的全部账号都参与）
+                "accountCount": ep.accounts.len(),
+                "running": proxy::is_running(e),
+            })
+        })
+        .collect();
+    json!({ "running": proxy::proxy_running(), "endpoints": endpoints })
+}
+
+async fn api_proxy_config() -> Response {
+    match serde_json::to_value(proxy::load_proxy_config()) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// 保存配置并立即生效。与桌面端一致：**逐版本**返回启动结果 ——
+/// 某一版起不来（最常见是那一版没号）不该让整个保存失败，也不该连累另一版。
+async fn api_proxy_save(Json(body): Json<Value>) -> Response {
+    // 前端传的是 `{ config: {...} }`；也容忍直接把配置平铺在 body 里。
+    let raw = body.get("config").cloned().unwrap_or(body);
+    let cfg: proxy::ProxyConfig = match serde_json::from_value(raw) {
+        Ok(c) => c,
+        Err(e) => return json_err(format!("配置格式不正确：{e}"), StatusCode::BAD_REQUEST),
+    };
+    if let Err(e) = proxy::save_proxy_config(&cfg) {
+        return json_err(e, StatusCode::BAD_REQUEST);
+    }
+    let outcomes: Vec<Value> = proxy::apply_config(&cfg)
+        .iter()
+        .map(|(edition, r)| {
+            json!({
+                "edition": edition.key(),
+                "label": edition.label(),
+                "ok": r.is_ok(),
+                "error": r.as_ref().err(),
+            })
+        })
+        .collect();
+    json_ok(json!({
+        "ok": true,
+        "running": proxy::proxy_running(),
+        "endpoints": outcomes,
+    }))
+}
+
+async fn api_proxy_status() -> Response {
+    json_ok(proxy_status_value())
+}
+
+/// 从原始 query 里取一个参数值（不做百分号转义 —— 这里的取值都是 edition 这种短标识）。
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query.unwrap_or("").split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
+}
+
+/// 取某一版的用量。不传 `edition` 时按国内版（与桌面端 `get_proxy_usage` 同口径）。
+async fn api_proxy_usage(RawQuery(query): RawQuery) -> Response {
+    let edition = query_param(query.as_deref(), "edition")
+        .as_deref()
+        .and_then(proxy::parse_edition_key)
+        .unwrap_or(Edition::Domestic);
+    json_ok(proxy::load_usage_for(edition))
+}
+
+/// 清空用量。传了 `edition` 只清那一版；不传则两版都清。
+async fn api_proxy_usage_reset(Json(body): Json<Value>) -> Response {
+    let raw = body
+        .get("edition")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let target = match raw.as_deref() {
+        Some(v) if !v.trim().is_empty() => match proxy::parse_edition_key(v) {
+            Some(e) => Some(e),
+            None => return json_err(format!("未知版本：{v}"), StatusCode::BAD_REQUEST),
+        },
+        _ => None,
+    };
+    match proxy::reset_usage(target) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// 拉可用模型列表（要打上游，可能慢）。
+async fn api_proxy_models(RawQuery(query): RawQuery) -> Response {
+    let edition = query_param(query.as_deref(), "edition");
+    match proxy::fetch_models(edition).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// 按当前配置把两个入口都重启一遍。
+async fn api_proxy_restart() -> Response {
+    match proxy::restart_proxy_server() {
+        Ok(()) => json_ok(json!({ "ok": true, "running": proxy::proxy_running() })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
 }
 
 // ---------------------------------------------------------------------------
