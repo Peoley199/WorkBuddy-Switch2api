@@ -352,10 +352,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ⚠️ 必须按 pattern 过滤，不能全量下载：
+      #    docker/build-push-action 的 GHA 缓存会额外产出一个
+      #    `<owner>~<repo>~<hash>.dockerbuild` artifact，全量下载会把它一并拉下来，
+      #    解压失败 → "Artifact download failed after 5 retries" → release job 整个挂掉。
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+          pattern: "{linux-x64,mac-arm64,mac-x64,win-x64}"
 
       - name: Merge updater manifests
         run: |
@@ -423,6 +428,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Rust 全量编译很慢，用 GHA 缓存把二次构建压下来
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Rust 全量编译很慢，用 GHA 缓存把二次构建压下来。
+          # scope 固定为 docker，避免与其它 job 的缓存条目互相干扰。
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,mode=max,scope=docker
