@@ -879,7 +879,8 @@ fn ide_source(
     collector.into_value(name, paths.len())
 }
 
-/// Return independent WorkBuddy, CodeBuddy CLI, and CodeBuddy IDE aggregates.
+/// Return independent WorkBuddy (domestic), WorkBuddyAI (international),
+/// CodeBuddy CLI, and CodeBuddy IDE aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -897,6 +898,9 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         "rangeDays": range_days,
         "sources": [
             source(home.join(".workbuddy/projects"), "workbuddy", cutoff),
+            // 国际版（WorkBuddyAI）与国内版并存：两者数据目录独立，
+            // 日志格式一致，复用同一个 source() 解析器。
+            source(home.join(".workbuddy-ai/projects"), "workbuddy-ai", cutoff),
             source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff),
             ide_source(
                 codebuddy_extension_data_dir(),
@@ -1363,13 +1367,16 @@ mod tests {
     }
 
     #[test]
-    fn get_statistics_returns_three_isolated_sources() {
+    fn get_statistics_returns_four_isolated_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(names, ["workbuddy", "codebuddy-cli", "codebuddy-ide"]);
+        assert_eq!(
+            names,
+            ["workbuddy", "workbuddy-ai", "codebuddy-cli", "codebuddy-ide"]
+        );
     }
 }

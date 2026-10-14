@@ -2529,12 +2529,6 @@ mod tests {
         );
     }
 
-    /// 渠道校验软拦截（11128）要能被认出来 —— 它是**可重试**的，认错就会白冻一个号。
-    ///
-    /// 真实响应体长这样（上游把内层 JSON 当字符串塞进 `message`）：
-    /// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an
-    /// unapproved channel\",...}","type":"upstream_error"}`
-    #[test]
     /// 旧格式（两版混在一起）迁移后必须**按版本分开**：
     /// byAccount / recent 按 uid 精确归位，每档 total 由该档 byAccount 求和。
     #[test]
@@ -2612,6 +2606,10 @@ mod tests {
     }
 
     /// 渠道校验软拦截（11128）要能被认出来 —— 它是**可重试**的，认错就会白冻一个号。
+    ///
+    /// 真实响应体长这样（上游把内层 JSON 当字符串塞进 `message`）：
+    /// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an
+    /// unapproved channel\",...}","type":"upstream_error"}`
     #[test]
     fn detects_channel_block_from_upstream_body() {
         let real = r#"400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"000000000000000046302613c7e69e4d\"}","type":"upstream_error"}"#;
