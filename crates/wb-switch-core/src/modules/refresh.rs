@@ -6,13 +6,21 @@
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 
-use crate::modules::account::{build_auth_headers, upsert_account};
+use crate::modules::account::{build_auth_headers, is_envelope, upsert_account};
 use crate::modules::config::{
     http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard,
 };
 use crate::modules::edition::edition_of;
 
 static KEEPALIVE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 凭据是否为加密信封（`{$wbEncrypted, envelope}`）。
+///
+/// 新版客户端把 token 加密存储，switch 手上只有密文 ⇒ **无法刷新、无法用于反代**，
+/// 可用范围仅限「切换账号」（密文原样写回 auth 文件，由客户端自行解密）。
+fn has_encrypted_credentials(account: &Value) -> bool {
+    is_envelope(account, "refresh_token") || is_envelope(account, "access_token")
+}
 
 /// 刷新单账号 token（POST /v2/plugin/auth/token/refresh），成功则落盘并返回新账号。
 ///
@@ -27,6 +35,19 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_default();
+    // 🔴 加密信封凭据（`{$wbEncrypted, envelope}`，新版客户端把 token 加密存储）
+    // **无法参与刷新**：switch 手上只有密文，打不了 `/auth/token/refresh`。
+    //
+    // 但它**不是**「缺少 refresh token」—— 若放任流程走到下面那条分支，从本机导入的
+    // 加密账号会在第一次自动保活 / 签到后就被标上 `needs_relogin` 并落盘，
+    // `eligible_accounts()` 随即跳过它，用户看到的是「刚导进来就坏了」。
+    // 这里提前返回、只记录真实原因，不改动 `needs_relogin` 等其它状态。
+    // 该类账号的可用范围仅限于「切换账号」（密文原样写回，客户端自行解密）。
+    if has_encrypted_credentials(&account) {
+        account["credentials_encrypted"] = json!(true);
+        return account;
+    }
+
     if rt.is_empty() {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("缺少 refresh token，无法刷新，需重新登录");
@@ -231,4 +252,39 @@ pub async fn run_keepalive_cycle() -> Value {
         }));
     }
     json!({"checked": total, "refreshed": results})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 加密信封凭据要能被识别 —— 否则导入的加密账号会被当成「缺少 refresh token」
+    /// 直接标 `needs_relogin` 并落盘，表现为「刚导进来就坏了」。
+    #[test]
+    fn detects_encrypted_credentials() {
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "x"});
+
+        assert!(has_encrypted_credentials(&json!({
+            "access_token": envelope, "refresh_token": envelope
+        })));
+        assert!(has_encrypted_credentials(&json!({
+            "access_token": "plain", "refresh_token": envelope
+        })));
+        assert!(has_encrypted_credentials(&json!({
+            "access_token": envelope, "refresh_token": "plain"
+        })));
+    }
+
+    /// 明文、缺失、以及非信封的普通对象都不算加密凭据
+    /// （判定口径与 `account::secret_value` 保持一致）。
+    #[test]
+    fn plain_and_missing_credentials_are_not_encrypted() {
+        assert!(!has_encrypted_credentials(&json!({
+            "access_token": "a", "refresh_token": "r"
+        })));
+        assert!(!has_encrypted_credentials(&json!({})));
+        assert!(!has_encrypted_credentials(&json!({
+            "access_token": {"foo": "bar"}
+        })));
+    }
 }

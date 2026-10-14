@@ -11,7 +11,7 @@
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
-use crate::modules::account::get_str;
+use crate::modules::account::{get_str, secret_value};
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
 use crate::modules::edition::{edition_of, Edition};
 
@@ -168,13 +168,19 @@ pub fn build_auth_obj(acc: &Value) -> Value {
     let expires_at = acc.get("expiresAt").and_then(|v| v.as_i64());
     let now = now_ms();
 
+    // 凭据写回：明文串或 `$wbEncrypted` 加密信封都**原样写回**。
+    //
+    // 🔴 这里原来是 `get_str(..).unwrap_or_default()`，遇到信封拿到空串，
+    // 会把上面由 `auth_raw` 铺底带进来的原始密文**覆盖掉** ⇒ 切到该账号时
+    // 写出的 auth 文件 token 为空 ⇒ 客户端视为未登录，切换静默失效。
+    // 只有在确实没有任何凭据时才写空串，保持「主动清空登录态」的原语义。
     obj.insert(
         "accessToken".to_string(),
-        get_str(acc, "access_token").unwrap_or_default().into(),
+        secret_value(acc, "access_token").unwrap_or_else(|| json!("")),
     );
     obj.insert(
         "refreshToken".to_string(),
-        get_str(acc, "refresh_token").unwrap_or_default().into(),
+        secret_value(acc, "refresh_token").unwrap_or_else(|| json!("")),
     );
     obj.insert("tokenType".to_string(), token_type.into());
     // domain 决定客户端连哪个后端（国内 www.codebuddy.cn / 国际 www.workbuddy.ai）。
@@ -394,14 +400,22 @@ fn imported_account_from_root(root: Value) -> Option<Value> {
     let email = get_str(&root, "email")
         .or_else(|| get_str(&account_obj, "email"))
         .or_else(|| get_str(&auth_obj, "email"));
-    let access_token = get_str(&auth_obj, "accessToken")
-        .or_else(|| get_str(&auth_obj, "access_token"))
-        .or_else(|| get_str(&root, "accessToken"))
-        .or_else(|| get_str(&root, "access_token"));
-    let refresh_token = get_str(&auth_obj, "refreshToken")
-        .or_else(|| get_str(&auth_obj, "refresh_token"))
-        .or_else(|| get_str(&root, "refreshToken"))
-        .or_else(|| get_str(&root, "refresh_token"));
+    // 凭据口径必须与 `account::secret_value` 对齐：**明文串或 `$wbEncrypted`
+    // 加密信封都算有效凭据**。
+    //
+    // 🔴 新版客户端（WorkBuddy 5.6+）把 `auth.accessToken` / `auth.refreshToken`
+    // 加密存储成 `{$wbEncrypted: 1, envelope: "..."}`。此前这里用 `get_str` 取值，
+    // 对着对象取字符串一律拿到 `None` ⇒ `access_token` 为空 ⇒ 整个函数返回 `None`
+    // ⇒ 界面报「未读取到本机 XX 登录信息（该版本未登录或未安装）」，
+    // 而实际上文件存在、账号也登录着。2026-10-14 实测本机国际版即为此情形。
+    let access_token = secret_value(&auth_obj, "accessToken")
+        .or_else(|| secret_value(&auth_obj, "access_token"))
+        .or_else(|| secret_value(&root, "accessToken"))
+        .or_else(|| secret_value(&root, "access_token"));
+    let refresh_token = secret_value(&auth_obj, "refreshToken")
+        .or_else(|| secret_value(&auth_obj, "refresh_token"))
+        .or_else(|| secret_value(&root, "refreshToken"))
+        .or_else(|| secret_value(&root, "refresh_token"));
     let token_type = get_str(&auth_obj, "tokenType")
         .or_else(|| get_str(&auth_obj, "token_type"))
         .unwrap_or_else(|| "Bearer".to_string());
@@ -523,5 +537,65 @@ mod tests {
         assert_eq!(account["uid"], "u-1");
         assert_eq!(account["nickname"], "同名用户");
         assert!(account["email"].is_null());
+    }
+
+    /// 🔴 加密信封凭据必须也能导入。新版客户端把 `auth.accessToken` /
+    /// `auth.refreshToken` 加密存储，只用 `get_str` 取会全部落空 ⇒
+    /// 整个函数返回 None ⇒ 界面误报「该版本未登录或未安装」。
+    #[test]
+    fn import_accepts_encrypted_envelope_credentials() {
+        let account = imported_account_from_root(json!({
+            "account": {
+                "uid": "u-env",
+                "nickname": {"$wbEncrypted": 1, "envelope": "nick-env"}
+            },
+            "auth": {
+                "accessToken": {"$wbEncrypted": 1, "envelope": "atok-env"},
+                "refreshToken": {"$wbEncrypted": 1, "envelope": "rtok-env"},
+                "domain": "www.workbuddy.ai"
+            }
+        }))
+        .expect("加密信封凭据必须能导入，不得因取不到明文而整条失败");
+
+        assert_eq!(account["uid"], "u-env");
+        assert_eq!(account["domain"], "www.workbuddy.ai");
+        // 信封原样保留：不能退化成空串，否则切换写回时账号等于未登录。
+        assert_eq!(account["access_token"]["$wbEncrypted"], 1);
+        assert_eq!(account["access_token"]["envelope"], "atok-env");
+        assert_eq!(account["refresh_token"]["$wbEncrypted"], 1);
+    }
+
+    /// 🔴 写回 auth 文件时信封必须原样保留。此前用
+    /// `get_str(..).unwrap_or_default()` 会把 `auth_raw` 铺底带进来的密文
+    /// 覆盖成空串 ⇒ 切到该账号时客户端视为未登录，切换静默失效。
+    #[test]
+    fn build_auth_obj_preserves_encrypted_envelope() {
+        let auth = build_auth_obj(&json!({
+            "id": "a1",
+            "uid": "u-env",
+            "access_token": {"$wbEncrypted": 1, "envelope": "atok-env"},
+            "refresh_token": {"$wbEncrypted": 1, "envelope": "rtok-env"},
+        }));
+
+        assert_eq!(auth["accessToken"]["$wbEncrypted"], 1, "信封不得被清成空串");
+        assert_eq!(auth["accessToken"]["envelope"], "atok-env");
+        assert_eq!(auth["refreshToken"]["$wbEncrypted"], 1);
+    }
+
+    /// 明文路径不受影响；确实没有任何凭据时仍写空串（保持「主动清空登录态」语义）。
+    #[test]
+    fn build_auth_obj_keeps_plain_token_and_empty_fallback() {
+        let plain = build_auth_obj(&json!({
+            "id": "a2",
+            "uid": "u-plain",
+            "access_token": "PLAIN-A",
+            "refresh_token": "PLAIN-R",
+        }));
+        assert_eq!(plain["accessToken"], "PLAIN-A");
+        assert_eq!(plain["refreshToken"], "PLAIN-R");
+
+        let empty = build_auth_obj(&json!({ "id": "a3", "uid": "u-none" }));
+        assert_eq!(empty["accessToken"], "");
+        assert_eq!(empty["refreshToken"], "");
     }
 }
