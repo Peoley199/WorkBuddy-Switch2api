@@ -22,6 +22,20 @@ fn has_encrypted_credentials(account: &Value) -> bool {
     is_envelope(account, "refresh_token") || is_envelope(account, "access_token")
 }
 
+/// 信封账号的自愈 + 标记（内存实现，便于单测）。返回是否清除了误标。
+///
+/// v1.6.11 时期被误标的 `needs_relogin` 在这里清掉并落盘 —— 不清的话，
+/// 升级后红标永远挂在卡片上，用户会以为修复没生效。
+fn heal_encrypted_account(acc: &mut Value) -> bool {
+    let was_misflagged = acc.get("needs_relogin").and_then(Value::as_bool) == Some(true);
+    acc["credentials_encrypted"] = json!(true);
+    if was_misflagged {
+        acc["needs_relogin"] = json!(false);
+        acc["needs_relogin_reason"] = Value::Null;
+    }
+    was_misflagged
+}
+
 /// 刷新单账号 token（POST /v2/plugin/auth/token/refresh），成功则落盘并返回新账号。
 ///
 /// 刷新失败（refresh token 失效等）时给账号标记 needs_relogin，避免无限重试。
@@ -185,11 +199,15 @@ pub async fn ensure_fresh_token(mut account: Value, cfg: &Value) -> Value {
         Some(e) => now_ms() >= e || e - now_ms() < lazy_h * 3600 * 1000,
         None => true,
     };
-    let has_rt = !account
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .is_empty();
+    // 信封凭据统一走 has_encrypted_credentials 判定：行为上等价（信封时
+    // has_rt 为 false、不会触发刷新），但语义明确 —— 以后有人改这里时不会
+    // 又把信封对象当成「有 refresh token」。
+    let has_rt = !has_encrypted_credentials(&account)
+        && !account
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty();
     if stale && has_rt {
         account = refresh_account_token(account).await;
     }
@@ -222,6 +240,24 @@ pub async fn run_keepalive_cycle() -> Value {
                 None => true,
             };
         if !stale {
+            continue;
+        }
+        // 🔴 加密信封凭据无法保活：switch 手上只有密文，打不了刷新接口。
+        // 它**不是**「缺少 refresh token」—— 不在这里拦掉的话，从本机导入的
+        // 信封账号会被打上 needs_relogin 并落盘，用户看到的是「刚导进来就坏了」。
+        // （v1.6.11 只给 refresh_account_token 加了这道防护，保活这条独立路径漏了。）
+        //
+        // 自愈：v1.6.11 时期被误标的 needs_relogin 在这里清掉并落盘。
+        // 不清的话，升级后红标永远挂在卡片上 —— 用户会以为修复没生效。
+        // `credentials_encrypted` 同时落盘，前端据此显示中性徽标而不是红色警告。
+        if has_encrypted_credentials(&acc) {
+            let healed = heal_encrypted_account(&mut acc);
+            let _ = upsert_account(&acc);
+            results.push(json!({
+                "email": crate::modules::account::account_display_name(&acc),
+                "status": "encrypted",
+                "healed": healed,
+            }));
             continue;
         }
         if acc
@@ -286,5 +322,41 @@ mod tests {
         assert!(!has_encrypted_credentials(&json!({
             "access_token": {"foo": "bar"}
         })));
+    }
+
+    /// 🔴 信封账号被 v1.6.11 误标 needs_relogin 后，自愈必须清掉红标并落
+    /// `credentials_encrypted` —— 否则升级后用户看到的还是「需重新登录」，
+    /// 会以为修复没生效（群友 issue 里「怎么重新登录都治不好」正是这个）。
+    #[test]
+    fn heal_encrypted_account_clears_misflagged_relogin() {
+        let mut acc = json!({
+            "id": "a1",
+            "uid": "u1",
+            "access_token": {"$wbEncrypted": 1, "envelope": "x"},
+            "needs_relogin": true,
+            "needs_relogin_reason": "缺少 refresh token，无法保活，需重新登录",
+        });
+
+        assert!(heal_encrypted_account(&mut acc));
+
+        assert_eq!(acc["credentials_encrypted"], json!(true));
+        assert_eq!(acc["needs_relogin"], json!(false));
+        assert!(acc["needs_relogin_reason"].is_null());
+    }
+
+    /// 没被误标过的信封账号只落密文标记，不得凭空生出 needs_relogin。
+    #[test]
+    fn heal_encrypted_account_marks_clean_account_without_side_effects() {
+        let mut acc = json!({
+            "id": "a2",
+            "uid": "u2",
+            "access_token": {"$wbEncrypted": 1, "envelope": "x"},
+        });
+
+        assert!(!heal_encrypted_account(&mut acc));
+
+        assert_eq!(acc["credentials_encrypted"], json!(true));
+        assert!(acc.get("needs_relogin").is_none());
+        assert!(acc.get("needs_relogin_reason").is_none());
     }
 }

@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::modules::account::{account_display_name, build_auth_headers, load_accounts};
+use crate::modules::account::{account_display_name, build_auth_headers, is_envelope, load_accounts};
 use crate::modules::config::{
     add_checkin_log, http_request, load_checkin_config, load_checkin_logs, now_ms, RunFlagGuard,
     CHECKIN_API_PREFIX, WORKBUDDY_API_ENDPOINT,
@@ -105,6 +105,17 @@ fn is_unauthorized(resp: &Value) -> bool {
 
 /// 发签到相关请求；遇到未授权且存在 refresh token 时刷新一次并重试。
 async fn checkin_request(path: &str, account: &Value) -> Value {
+    // 🔴 加密信封凭据无法签到与刷新：switch 手上只有密文，`build_auth_headers`
+    // 拼出来是 `Bearer `（空）⇒ 网关必然 401（HTML 错误页）。
+    // 提前返回可读原因，不发这个注定失败的请求。
+    // 这里返回的 401 不会被 `is_unauthorized` 误触刷新 —— 信封账号的
+    // `refresh_token` 同样是信封，下面的 `as_str()` 取不到值。
+    if is_envelope(account, "access_token") {
+        return json!({
+            "code": 401,
+            "message": "该账号凭据为加密存储，仅支持切换账号；签到需重新登录",
+        });
+    }
     let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
     let headers = build_auth_headers(account);
     let mut resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;

@@ -141,8 +141,14 @@ pub fn account_meta(acc: &Value) -> Value {
         "refreshExpiresAt": num_or_null(acc.get("refreshExpiresAt")),
         "refreshedAt": num_or_null(acc.get("refreshedAt")),
         "createdAt": num_or_null(acc.get("createdAt")),
+        // 上次「被设为当前账号」的时间（仅记录经由本工具发起的切换，
+        // 在客户端里手动换号不会更新）。卡片悬浮提示用它。
+        "lastSwitchedAt": num_or_null(acc.get("lastSwitchedAt")),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": str_or_null(acc.get("needs_relogin_reason")),
+        // 凭据为加密信封（只能切换客户端）。前端据此显示中性徽标，
+        // 不与「需重新登录」混用 —— 前者是能力边界，后者才是故障。
+        "credentialsEncrypted": acc.get("credentials_encrypted").and_then(|v| v.as_bool()) == Some(true),
         // 账号分组："desktop"=桌面端 / "proxy"=反代API / 缺失=未分组
         "group": str_or_null(acc.get("group")),
         // 客户端档位："domestic"=国内版（缺失时视为国内版）/ "international"=国际版
@@ -582,11 +588,79 @@ mod tests {
         assert!(load_accounts_from_path(&path).is_empty());
         std::fs::remove_dir_all(&test_dir).expect("temporary account store should clean up");
     }
+
+    #[test]
+    fn mark_switched_records_timestamp_for_matching_id() {
+        let mut accounts = vec![
+            json!({"id": "a1", "uid": "u1", "nickname": "一号"}),
+            json!({"id": "a2", "uid": "u2", "nickname": "二号"}),
+        ];
+
+        assert!(mark_switched_in(&mut accounts, "a2", 1_700_000_000_000));
+
+        assert_eq!(accounts[1]["lastSwitchedAt"], json!(1_700_000_000_000i64));
+        assert!(
+            accounts[0].get("lastSwitchedAt").is_none(),
+            "只应更新命中的那一条，不得波及别的账号"
+        );
+    }
+
+    #[test]
+    fn mark_switched_ignores_unknown_id() {
+        let mut accounts = vec![json!({"id": "a1", "uid": "u1"})];
+
+        assert!(!mark_switched_in(&mut accounts, "not-there", 1));
+        assert!(accounts[0].get("lastSwitchedAt").is_none());
+    }
+
+    /// 卡片悬浮提示直接渲染这个字段：必须是数字或 null。
+    /// 缺字段时不能漏成对象（那种值到前端就是 React #31 白屏）。
+    #[test]
+    fn account_meta_exposes_last_switched_at() {
+        let meta = account_meta(&json!({
+            "id": "a1",
+            "uid": "u1",
+            "lastSwitchedAt": 1_700_000_000_000i64
+        }));
+        assert_eq!(meta["lastSwitchedAt"], json!(1_700_000_000_000i64));
+
+        let empty = account_meta(&json!({"id": "a2", "uid": "u2"}));
+        assert!(empty["lastSwitchedAt"].is_null());
+    }
 }
 
 /// 删除账号（按 id）。
 pub fn delete_account(account_id: &str) -> Result<(), String> {
     delete_account_from_path(&accounts_file(), account_id)
+}
+
+/// 记录账号「上次被设为当前账号」的时间（毫秒时间戳）。
+///
+/// 只在切换流程里调用。返回 `Ok(false)` 表示账号库里没有这个 id（此时不写盘）。
+///
+/// ⚠️ 调用方**不应**把这里的失败当成切换失败向上传播：认证文件才是决定登录身份的
+/// 东西，时间戳只是展示用的附属信息，写不进去顶多悬浮提示显示「暂无记录」。
+pub fn mark_switched(account_id: &str, at: i64) -> std::io::Result<bool> {
+    let mut accounts = load_accounts();
+    if !mark_switched_in(&mut accounts, account_id, at) {
+        return Ok(false);
+    }
+    save_accounts(&accounts)?;
+    Ok(true)
+}
+
+/// 内存实现，便于单测。命中返回 true 并写入时间戳，未命中返回 false。
+pub(crate) fn mark_switched_in(accounts: &mut [Value], account_id: &str, at: i64) -> bool {
+    match accounts
+        .iter_mut()
+        .find(|a| get_str(a, "id").as_deref() == Some(account_id))
+    {
+        Some(acc) => {
+            acc["lastSwitchedAt"] = json!(at);
+            true
+        }
+        None => false,
+    }
 }
 
 /// 导入本机当前账号（从认证文件读取）。

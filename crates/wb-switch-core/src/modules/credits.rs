@@ -8,7 +8,7 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::modules::account::{account_display_name, build_auth_headers};
+use crate::modules::account::{account_display_name, build_auth_headers, is_envelope};
 use crate::modules::config::{http_request, load_checkin_config, now_ms, WORKBUDDY_API_ENDPOINT};
 use crate::modules::credit_usage;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
@@ -248,18 +248,36 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     })
 }
 
+/// 网关（APISIX / openresty / nginx）在凭据无效或缺失时返回的是**整页 HTML**
+/// （`<html><head><title>401 Authorization Required</title>…`）。
+/// 原样透传会在卡片上渲染出一堆标签 —— 用户实际看到的就是这种。
+fn looks_like_gateway_html(text: &str) -> bool {
+    let head = text.trim_start().to_ascii_lowercase();
+    head.starts_with("<html") || head.starts_with("<!doctype") || head.starts_with("<head")
+}
+
 fn response_error(response: &Value) -> String {
     let nested = response.get("data").filter(|value| value.is_object());
     let code = response_code(response).unwrap_or(-1);
-    response
+    let message = response
         .get("message")
         .or_else(|| response.get("msg"))
         .or_else(|| nested.and_then(|value| value.get("message")))
         .or_else(|| nested.and_then(|value| value.get("msg")))
         .and_then(|value| value.as_str())
-        .filter(|message| !message.trim().is_empty())
-        .map(|message| message.chars().take(160).collect::<String>())
-        .unwrap_or_else(|| format!("积分查询失败（code={code}）"))
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+
+    if let Some(message) = message {
+        if !looks_like_gateway_html(message) {
+            return message.chars().take(160).collect();
+        }
+    }
+    // 上游没给可读信息：要么是网关的 HTML 错误页，要么压根没有 message。
+    match code {
+        401 | 403 => format!("账号凭据无效或已过期，请重新登录（HTTP {code}）"),
+        _ => format!("积分查询失败（code={code}）"),
+    }
 }
 
 fn response_code(response: &Value) -> Option<i64> {
@@ -677,6 +695,18 @@ fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
 
 /// 查询单账号的积分资源及到期时间。
 pub async fn get_credit_expiry(account: &Value) -> Value {
+    // 🔴 加密信封凭据（`{$wbEncrypted, envelope}`）：switch 手上只有密文，
+    // `build_auth_headers` 拼出来是 `Bearer `（空）⇒ 网关必然回 401 HTML。
+    // 直接给出准确原因，不发这个注定失败的请求。该类账号只能用于切换客户端。
+    if is_envelope(account, "access_token") {
+        return json!({
+            "ok": false,
+            "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+            "accountName": account_display_name(account),
+            "error": "该账号凭据为加密存储，仅支持切换账号；查询积分需重新登录",
+        });
+    }
+
     let account_id = account.get("id").cloned().unwrap_or(Value::Null);
     let now = now_ms();
     let responses = fetch_new_resource_responses(account).await;
@@ -1044,6 +1074,43 @@ mod tests {
             "code": 10085,
             "msg": "请求不合法，如有疑问请联系客服"
         })));
+    }
+
+    /// 🔴 网关（APISIX/openresty）在凭据无效时返回**整页 HTML**，
+    /// 用户之前看到的就是它被原样渲染到卡片上。
+    #[test]
+    fn gateway_html_error_is_replaced_with_readable_text() {
+        let resp = json!({
+            "code": 401,
+            "message": "<html>\n<head><title>401 Authorization Required</title></head>\n<body>\n<center><h1>401 Authorization Required</h1></center>\n<hr><center>openresty</center>\n</body>\n</html>\n"
+        });
+        let message = response_error(&resp);
+        assert!(!message.contains('<'), "不得把 HTML 标签透出：{message}");
+        assert!(message.contains("重新登录"), "应给出可操作提示：{message}");
+
+        assert!(looks_like_gateway_html("<html><head><title>x</title>"));
+        assert!(looks_like_gateway_html("  \n<!DOCTYPE html>"));
+        assert!(!looks_like_gateway_html("请求不合法"));
+        assert!(!looks_like_gateway_html(""));
+
+        // 没有 message 的 401/403 也要给出人能读的话。
+        assert_eq!(
+            response_error(&json!({"code": 401})),
+            "账号凭据无效或已过期，请重新登录（HTTP 401）"
+        );
+    }
+
+    /// 正常 JSON 错误文案必须原样保留 —— 别把 WAF 的 10085 提示也吞掉。
+    #[test]
+    fn json_error_message_passes_through() {
+        assert_eq!(
+            response_error(&json!({"code": 10085, "msg": "请求不合法，如有疑问请联系客服"})),
+            "请求不合法，如有疑问请联系客服"
+        );
+        assert_eq!(
+            response_error(&json!({"code": 401, "message": "unauthorized"})),
+            "unauthorized"
+        );
     }
 
     #[test]

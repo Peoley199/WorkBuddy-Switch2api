@@ -59,6 +59,41 @@ function formatCreditUpdatedAt(ts: number | undefined): string {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
+/**
+ * 「上次设为当前」的时间：当天只给时分，更早的带上月日。
+ *
+ * 只记录经由本工具发起的切换（在客户端里手动换号不会被感知），
+ * 所以从未切过的账号返回「暂无记录」而不是「—」。
+ */
+function formatSwitchedAt(ts: number | null | undefined): string {
+  if (!ts) return "暂无记录";
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "暂无记录";
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  if (sameDay) return `今天 ${time}`;
+  const day = `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  if (date.getFullYear() === now.getFullYear()) return `${day} ${time}`;
+  return `${date.getFullYear()}-${day} ${time}`;
+}
+
+/**
+ * 上游偶尔会把网关的 HTML 错误页当作文案回传（例如 APISIX 的
+ * `<html><head><title>401 Authorization Required</title>…`）。
+ * 后端已做友好化，这里再兜一层，避免任何路径下把标签渲染到界面上。
+ */
+function cleanErrorMessage(message: string | null | undefined): string {
+  const text = (message ?? "").trim();
+  if (!text) return "积分查询失败";
+  if (!/^<(!doctype|html|head)/i.test(text)) return text;
+  const title = /<title>([^<]*)<\/title>/i.exec(text)?.[1]?.trim();
+  return title ? `服务端拒绝了请求：${title}` : "服务端返回了无法解析的错误响应";
+}
+
 function expiryClass(expired: boolean, expiringSoon: boolean): string {
   if (expired) return "text-destructive";
   if (expiringSoon) return "text-orange-600";
@@ -265,7 +300,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
       )}
       {travelChip(travelStatus)}
-      {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
+      {account.credentialsEncrypted ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>密文凭据 · 仅可切换</Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-72">
+            该账号凭据由客户端加密存储（信封），switch 只能用它切换客户端；查积分、签到、走反代需要重新登录。
+          </TooltipContent>
+        </Tooltip>
+      ) : (account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
       {creditPriority && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -387,7 +431,12 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                       <WorkBuddyMark size={15} />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent side="top">设为 WorkBuddy 当前账号（会重启 WorkBuddy）</TooltipContent>
+                  <TooltipContent side="top" className="space-y-0.5">
+                    <div>设为 WorkBuddy 当前账号（会重启 WorkBuddy）</div>
+                    <div className="text-muted-foreground">
+                      上次设为当前：{formatSwitchedAt(account.lastSwitchedAt)}
+                    </div>
+                  </TooltipContent>
                 </Tooltip>
               )}
               {codebuddyCnIdeActive ? (
@@ -454,9 +503,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         ) : !credit ? (
           <div className="py-3 text-sm text-muted-foreground">等待积分数据…</div>
         ) : !credit.ok ? (
-          <div className="flex min-w-0 items-center gap-2 py-3 text-sm text-destructive" title={credit.error}>
+          <div className="flex min-w-0 items-center gap-2 py-3 text-sm text-destructive" title={cleanErrorMessage(credit.error)}>
             <Coins className="size-4 shrink-0" />
-            <span className="min-w-0 truncate">{credit.error || "积分查询失败"}</span>
+            <span className="min-w-0 truncate">{cleanErrorMessage(credit.error)}</span>
           </div>
         ) : (
           <>
@@ -517,7 +566,12 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   <WorkBuddyMark size={18} /><span>设为当前</span>
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="top">设为 WorkBuddy 当前账号（会重启 WorkBuddy）</TooltipContent>
+              <TooltipContent side="top" className="space-y-0.5">
+                <div>设为 WorkBuddy 当前账号（会重启 WorkBuddy）</div>
+                <div className="text-muted-foreground">
+                  上次设为当前：{formatSwitchedAt(account.lastSwitchedAt)}
+                </div>
+              </TooltipContent>
             </Tooltip>
           )}
           {codebuddyCnIdeActive ? <ProductCurrentState product="codebuddy-cn" compact /> : (

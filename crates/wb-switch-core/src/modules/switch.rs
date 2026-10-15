@@ -124,6 +124,15 @@ pub fn switch_account_in_edition(
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file_for(edition, &acc)?;
 
+    // 记录「上次设为当前账号」的时间。放在这一步而不是流程末尾：认证文件写完就等于
+    // 切换已经生效，后面启动客户端失败也不改变「曾经设为当前」这个事实。
+    // 失败只打日志 —— 时间戳是展示用的附属信息，不该拖垮切换主流程。
+    match account::mark_switched(account_id, crate::modules::config::now_ms()) {
+        Ok(true) => {}
+        Ok(false) => eprintln!("[switch] 账号库中找不到 id={account_id}，未记录切换时间"),
+        Err(e) => eprintln!("[switch] 记录切换时间失败（不影响切换）: {e}"),
+    }
+
     // 客户端自己记的「当前账号」快照：国际版有该文件、国内版当前版本没有。
     // 失败不影响主流程（认证文件才是决定登录身份的东西）。
     let uid = account::get_str(&acc, "uid").unwrap_or_default();

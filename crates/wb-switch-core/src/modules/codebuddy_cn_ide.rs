@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::modules::account::{self, get_str};
+use crate::modules::account::{self, get_str, is_envelope};
 use crate::modules::config::{
     atomic_write, clear_codebuddy_cn_app_cache, load_codebuddy_cn_app_cache, now_ms,
     save_codebuddy_cn_app_cache, store_dir,
@@ -967,6 +967,14 @@ pub fn status() -> Value {
 pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> {
     let acc = account::find_account(account_id)
         .ok_or_else(|| format!("账号不存在: {account_id}"))?;
+    // 🔴 加密信封凭据取不到明文。绝不能拿空串往 vscdb 里写 —— 那会把 IDE
+    // 已有的登录态弄坏。下面的 `get_str` 虽然也会拦住它，但会误报成
+    // 「缺少 access_token」，这里提前给出准确原因。
+    if is_envelope(&acc, "access_token") {
+        return Err(
+            "该账号凭据为加密存储，无法注入 CodeBuddy CN；请重新登录后再试".to_string(),
+        );
+    }
     let token = get_str(&acc, "access_token")
         .ok_or_else(|| "账号缺少 access_token，无法注入 CodeBuddy CN".to_string())?;
     if token.is_empty() {

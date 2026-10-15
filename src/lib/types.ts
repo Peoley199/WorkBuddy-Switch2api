@@ -10,8 +10,12 @@ export interface AccountMeta {
   refreshExpiresAt: number | null;
   refreshedAt: number | null;
   createdAt: number | null;
+  /** 上次被设为「当前账号」的时间（仅记录经由本工具发起的切换）。 */
+  lastSwitchedAt?: number | null;
   needsRelogin: boolean;
   needsReloginReason: string | null;
+  /** 凭据为加密信封（只能切换客户端）—— 中性能力边界，不是故障。 */
+  credentialsEncrypted?: boolean;
   /** 账号分组："desktop"=桌面端 / "proxy"=反代API / 缺失=未分组 */
   group?: string | null;
   /** 客户端版本："domestic"=国内版（缺失时视为国内版）/ "international"=国际版 */
