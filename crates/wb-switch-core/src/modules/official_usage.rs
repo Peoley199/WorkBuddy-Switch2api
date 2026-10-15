@@ -15,8 +15,26 @@ use crate::modules::account::{account_display_name, get_str};
 use crate::modules::config::{atomic_write, official_usage_cache_file, store_dir};
 use crate::modules::credits::authenticated_post;
 
+/// 国内版 web 端点。历史行为：国内版 token 打这里一直成功。
+const OFFICIAL_USAGE_CN_HOST: &str = "https://www.workbuddy.cn";
+/// 国际版端点：token 由 workbuddy.ai 签发。打国内版域名会被网关以
+/// 401 HTML 拒绝（令牌域不匹配）—— 实测 2026-10-15，全部国际版账号受影响。
+const OFFICIAL_USAGE_AI_HOST: &str = "https://www.workbuddy.ai";
+pub const OFFICIAL_USAGE_PATH: &str = "/billing/meter/get-user-request-usage";
+/// 兼容保留：国内版（默认）端点的完整 URL。
 pub const OFFICIAL_USAGE_URL: &str =
     "https://www.workbuddy.cn/billing/meter/get-user-request-usage";
+
+/// 按账号版本选端点。判定与 credits.rs::new_resource_endpoint 同一套：
+/// 只认已知官方域名，不允许账号数据拼出任意主机。
+fn official_usage_url(account: &Value) -> String {
+    match get_str(account, "domain").as_deref() {
+        Some(d) if d.ends_with(".workbuddy.ai") => {
+            format!("{OFFICIAL_USAGE_AI_HOST}{OFFICIAL_USAGE_PATH}")
+        }
+        _ => format!("{OFFICIAL_USAGE_CN_HOST}{OFFICIAL_USAGE_PATH}"),
+    }
+}
 pub const OFFICIAL_USAGE_PAGE_SIZE: usize = 3_000;
 pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 100;
 const OFFICIAL_USAGE_MAX_PAGES: usize = 100;
@@ -267,12 +285,18 @@ fn error_message(response: &Value) -> String {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|message| !message.is_empty())
+        // 网关的 HTML 错误页（401 Authorization Required 整页）对用户没有任何
+        // 信息量 —— 丢弃后按状态码给可读文案，别让标签渲染进警告框。
+        .filter(|message| !crate::modules::credits::looks_like_gateway_html(message))
         .map(|message| message.chars().take(160).collect::<String>());
     match response_code(response) {
         Some(code) if code == -1 => "官方请求失败（网络或服务不可达）".to_string(),
         Some(code) => upstream_message
             .map(|message| format!("官方请求失败（code={code}）：{message}"))
-            .unwrap_or_else(|| format!("官方请求失败（code={code}）")),
+            .unwrap_or_else(|| match code {
+                401 | 403 => "账号凭据无效或已过期，请重新登录".to_string(),
+                _ => format!("官方请求失败（code={code}）"),
+            }),
         None => "官方响应格式无效".to_string(),
     }
 }
@@ -424,7 +448,7 @@ async fn fetch_account_usage(
     loop {
         let response = authenticated_post(
             account,
-            OFFICIAL_USAGE_URL,
+            &official_usage_url(account),
             json!({
                 "startTime": start_time,
                 "endTime": end_time,
@@ -882,6 +906,38 @@ mod tests {
             error_message(&json!({"code": -1, "message": "secret token"})),
             "官方请求失败（网络或服务不可达）"
         );
+    }
+
+    /// 🔴 国际版账号（workbuddy.ai 签发的 token）必须打国际版端点：
+    /// 打国内版域名会被网关以 401 HTML 拒绝 —— 全部国际版账号的官方用量
+    /// 因此失败（用户实测 8/16 全挂，恰好是国际版那一半）。
+    #[test]
+    fn usage_url_follows_account_edition() {
+        let intl = json!({"id": "a1", "domain": "www.workbuddy.ai"});
+        assert_eq!(
+            official_usage_url(&intl),
+            "https://www.workbuddy.ai/billing/meter/get-user-request-usage"
+        );
+        // 国内版（含历史遗留 domain）维持原端点，行为不变。
+        for domain in ["www.codebuddy.cn", "copilot.tencent.com", "www.workbuddy.cn"] {
+            let cn = json!({"id": "a2", "domain": domain});
+            assert_eq!(
+                official_usage_url(&cn),
+                "https://www.workbuddy.cn/billing/meter/get-user-request-usage"
+            );
+        }
+    }
+
+    /// 网关的 HTML 错误页不能进警告框 —— 用户实际看到过整页标签。
+    #[test]
+    fn gateway_html_error_becomes_readable() {
+        let resp = json!({
+            "code": 401,
+            "message": "<html> <head><title>401 Authorization Required</title></head> <body> <center><h1>401 Authorization Required</h1> </center> <hr> <center>openresty</center> <p>"
+        });
+        let msg = error_message(&resp);
+        assert!(!msg.contains('<'), "不得透出 HTML 标签：{msg}");
+        assert!(msg.contains("重新登录"), "应给出可操作提示：{msg}");
     }
 
     #[test]

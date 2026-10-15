@@ -251,7 +251,8 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
 /// 网关（APISIX / openresty / nginx）在凭据无效或缺失时返回的是**整页 HTML**
 /// （`<html><head><title>401 Authorization Required</title>…`）。
 /// 原样透传会在卡片上渲染出一堆标签 —— 用户实际看到的就是这种。
-fn looks_like_gateway_html(text: &str) -> bool {
+/// credits 与 official_usage 两处错误组装共用。
+pub(crate) fn looks_like_gateway_html(text: &str) -> bool {
     let head = text.trim_start().to_ascii_lowercase();
     head.starts_with("<html") || head.starts_with("<!doctype") || head.starts_with("<head")
 }
