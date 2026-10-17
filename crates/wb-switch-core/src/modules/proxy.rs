@@ -27,6 +27,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use chrono::{FixedOffset, Local, NaiveDateTime, TimeZone};
+
 use super::account::{load_accounts, upsert_account};
 use super::config::{home_dir, now_ms};
 use super::edition::{edition_of, Edition};
@@ -359,6 +361,9 @@ struct AccountLease {
     /// 拿国际版专属的 model 去打国内版网关会被拒，所以选号必须认版本。
     edition: Edition,
     failed_at: Option<Instant>,
+    /// 已知恢复时刻的长冷却（如 60004 频率超限的重置时间）。
+    /// 与 `failed_at` 的短冷却（COOLDOWN）取更晚者生效。
+    cooldown_until: Option<Instant>,
 }
 
 struct Pool {
@@ -376,6 +381,7 @@ impl Pool {
                         uid,
                         edition,
                         failed_at: None,
+                        cooldown_until: None,
                     })
                 })
                 .collect(),
@@ -402,11 +408,15 @@ impl Pool {
                     continue;
                 }
             }
-            if lease
+            let cooling = lease
                 .failed_at
                 .map(|t| t.elapsed() < COOLDOWN)
                 .unwrap_or(false)
-            {
+                || lease
+                    .cooldown_until
+                    .map(|t| t > Instant::now())
+                    .unwrap_or(false);
+            if cooling {
                 continue;
             }
             return Some(lease.uid.clone());
@@ -430,6 +440,44 @@ impl Pool {
                 lease.failed_at = Some(Instant::now());
             }
         }
+    }
+
+    /// 按「已知恢复时刻」冷却（如 60004 频率超限的上游重置时间）。
+    ///
+    /// 固定的 120 秒短冷却对付频率超限不够：120 秒后号回池立刻又 429，循环空转。
+    /// `until_ms` 是上游声明的重置时刻（毫秒）；已过期则视为不冷却。
+    fn mark_failed_until(&self, uid: &str, until_ms: i64) {
+        let now = now_ms_i64();
+        if until_ms <= now {
+            return;
+        }
+        let until = Instant::now() + Duration::from_millis((until_ms - now) as u64);
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.cooldown_until = Some(until);
+            }
+        }
+    }
+
+    /// 该账号剩余冷却毫秒数（短冷却与长冷却取更晚者），不在冷却中返回 None。
+    fn cooling_for(&self, uid: &str) -> Option<i64> {
+        for slot in &self.leases {
+            let Ok(lease) = slot.lock() else { continue };
+            if lease.uid != uid {
+                continue;
+            }
+            let short = lease
+                .failed_at
+                .map(|t| COOLDOWN.as_millis() as i64 - t.elapsed().as_millis() as i64)
+                .filter(|m| *m > 0);
+            let long = lease
+                .cooldown_until
+                .map(|t| (t - Instant::now()).as_millis() as i64)
+                .filter(|m| *m > 0);
+            return long.max(short);
+        }
+        None
     }
 }
 
@@ -750,6 +798,30 @@ fn strip_env_injection(text: &str) -> Option<String> {
 /// 判定成它之后**不要立刻冷却账号** —— 号是好的，冻它只会把整个账号池拖空。
 fn is_channel_block(text: &str) -> bool {
     text.contains("11128") || text.contains("unapproved channel")
+}
+
+/// 解析上游「使用频率超限」（code 60004）响应，返回重置时刻（毫秒）。
+///
+/// 上游体是双层 JSON：外层 `{"message":"{\"code\":60004,\"msg\":\"…将在
+/// 2026-10-17 11:46:56 UTC+8 重置…\"}"}`。直接在原文上抠关键字与时间串，
+/// 避免两层反序列化；时间格式固定为 `YYYY-MM-DD HH:MM:SS UTC+8`。
+/// 不是频率超限（或缺重置时间）返回 None，调用方走普通冷却。
+fn rate_limit_reset_ms(text: &str) -> Option<i64> {
+    if !(text.contains("60004") || text.contains("频率限制")) {
+        return None;
+    }
+    let idx = text.find("频率限制")?;
+    let tail = &text[idx..];
+    let at = tail.find("将在")?;
+    let tail = &tail[at + "将在".len()..];
+    let raw: String = tail
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take(19)
+        .collect();
+    let naive = NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    let offset = FixedOffset::east_opt(8 * 3600)?;
+    Some(offset.from_local_datetime(&naive).single()?.timestamp_millis())
 }
 
 /// 调试落盘开关：`~/.wb-switch/DEBUG_DUMP` **存在**时，把发往上游的真实请求体
@@ -2052,6 +2124,38 @@ async fn chat_completions(
         // 5xx 是上游自己的问题（502 / 503 / 504 …），拿它去冻号只会把好号冻光 ——
         // 与连接层失败是同一类误判，会让整池无谓地空掉。
         let status = StatusCode::from_u16(raw_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let account_name = meta.nickname.clone();
+        // 🔴 60004 频率超限：按上游声明的重置时刻把**整个账号**暂停出池 ——
+        // 120 秒的短冷却只会让它回池后立刻再 429，循环空转。同时给客户端一句
+        // 人话：哪个账号、哪个模型、什么时候恢复、怎么继续用，
+        // 替代之前那坨双层转义的原始 JSON。
+        if let Some(until_ms) = rate_limit_reset_ms(&text) {
+            st.pool.mark_failed_until(&uid, until_ms);
+            let reset_at = Local
+                .timestamp_millis_opt(until_ms)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "稍后".to_string());
+            eprintln!(
+                "[反代] 账号「{account_name}」的模型 {model} 频率超限，已暂停该账号反代至 {reset_at} (uid={uid})"
+            );
+            record_usage(&meta, None, false);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": {
+                        "message": format!(
+                            "账号「{account_name}」的模型 {model} 使用频率已超限，已自动暂停该账号的反代，将于 {reset_at} 自动恢复。如需继续使用该账号，可在反代页重新启用并切换其他模型。"
+                        ),
+                        "type": "rate_limited",
+                        "account": account_name,
+                        "model": model,
+                        "resetAt": reset_at,
+                    }
+                })),
+            )
+                .into_response();
+        }
         if raw_status.is_client_error() {
             st.pool.mark_failed(&uid);
             if is_channel_block(&text) {
@@ -2193,11 +2297,19 @@ async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
                         .unwrap_or(false))
         })
         .map(|a| {
+            let uid = a
+                .get("uid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let cooling_ms = st.pool.cooling_for(&uid);
             json!({
                 "uid": a.get("uid").and_then(Value::as_str),
                 "nickname": a.get("nickname").and_then(Value::as_str),
                 "needs_relogin": a.get("needs_relogin").and_then(Value::as_bool).unwrap_or(false),
                 "expiresAt": a.get("expiresAt").and_then(Value::as_i64),
+                // >0 表示该账号正在冷却（如频率超限被暂停），前端显示剩余时间
+                "coolingMs": cooling_ms,
             })
         })
         .collect();
@@ -2506,6 +2618,36 @@ pub fn restart_proxy_server() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 60004 的双层转义 JSON 必须能解析出重置时刻 —— 这是「按重置时间
+    /// 暂停账号」而不是「120 秒后回池再 429」的依据。
+    #[test]
+    fn parses_rate_limit_reset_from_nested_json() {
+        let body = r#"{"message":"{\"code\":60004,\"msg\":\"您的使用量已超出频率限制，将在 2026-10-17 11:46:56 UTC+8 重置，您也可以切换其他模型继续使用。\",\"requestId\":\"00000000000000463270d2d3db8ba1\"}","type":"upstream_error"}"#;
+        let until = rate_limit_reset_ms(body).expect("60004 应解析出重置时刻");
+        let expected = chrono::FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str(
+                    "2026-10-17 11:46:56",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(until, expected);
+    }
+
+    /// 非频率超限的上游体不得误判 —— 否则普通 4xx 会被错误地长时间冷却。
+    #[test]
+    fn non_rate_limit_body_returns_none() {
+        assert!(rate_limit_reset_ms(r#"{"message":"{\"code\":11128}"}"#).is_none());
+        assert!(rate_limit_reset_ms("plain text").is_none());
+        assert!(rate_limit_reset_ms("").is_none());
+        // 有 60004 关键字但缺「将在 … 重置」时间串的残缺体也要兜住。
+        assert!(rate_limit_reset_ms(r#"{"message":"{\"code\":60004,\"msg\":\"?\"}"}"#).is_none());
+    }
 
     /// system prompt 末尾的环境注入块会被摘掉——上游的渠道校验（11128）正是靠
     /// 识别这段判定「非官方客户端」。见 `strip_env_injection`。
