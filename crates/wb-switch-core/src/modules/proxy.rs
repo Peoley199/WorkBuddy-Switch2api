@@ -361,9 +361,13 @@ struct AccountLease {
     /// 拿国际版专属的 model 去打国内版网关会被拒，所以选号必须认版本。
     edition: Edition,
     failed_at: Option<Instant>,
-    /// 已知恢复时刻的长冷却（如 60004 频率超限的重置时间）。
-    /// 与 `failed_at` 的短冷却（COOLDOWN）取更晚者生效。
-    cooldown_until: Option<Instant>,
+    /// **按模型**的长冷却：`model -> 恢复时刻`。
+    ///
+    /// 60004 只代表「这个模型的额度用完了」，同一账号换模型仍可用（上游文案
+    /// 自己就写着「您也可以切换其他模型继续使用」）。账号级长冷却会把还能
+    /// 用的模型一起冻掉，所以这类失败记在模型键上；账号仍留在池子里服务
+    /// 其他模型。
+    model_cooldowns: HashMap<String, Instant>,
 }
 
 struct Pool {
@@ -381,7 +385,7 @@ impl Pool {
                         uid,
                         edition,
                         failed_at: None,
-                        cooldown_until: None,
+                        model_cooldowns: HashMap::new(),
                     })
                 })
                 .collect(),
@@ -391,9 +395,12 @@ impl Pool {
 
     /// 同上，但可以只在某一档里取号（`want = None` 表示不限版本）。
     ///
+    /// `model` 给出时，还会跳过「该模型正在长冷却」的号 —— 60004 只冻那个模型，
+    /// 同一账号的其他模型仍可服务。
+    ///
     /// 一个版本都没有可用号时**不会**悄悄换另一个版本 —— 那样只会把
     /// 「模型不存在」的 400 换个地方报出来，不如直接说清楚。
-    fn next_uid_of(&self, want: Option<Edition>) -> Option<String> {
+    fn next_uid_of(&self, want: Option<Edition>, model: Option<&str>) -> Option<String> {
         if self.leases.is_empty() {
             return None;
         }
@@ -411,13 +418,19 @@ impl Pool {
             let cooling = lease
                 .failed_at
                 .map(|t| t.elapsed() < COOLDOWN)
-                .unwrap_or(false)
-                || lease
-                    .cooldown_until
-                    .map(|t| t > Instant::now())
-                    .unwrap_or(false);
+                .unwrap_or(false);
             if cooling {
                 continue;
+            }
+            if let Some(m) = model {
+                let model_cooling = lease
+                    .model_cooldowns
+                    .get(m)
+                    .map(|t| *t > Instant::now())
+                    .unwrap_or(false);
+                if model_cooling {
+                    continue;
+                }
             }
             return Some(lease.uid.clone());
         }
@@ -442,11 +455,11 @@ impl Pool {
         }
     }
 
-    /// 按「已知恢复时刻」冷却（如 60004 频率超限的上游重置时间）。
+    /// 只冻「某账号的某个模型」到指定时刻 —— 账号的其他模型继续服务。
     ///
     /// 固定的 120 秒短冷却对付频率超限不够：120 秒后号回池立刻又 429，循环空转。
     /// `until_ms` 是上游声明的重置时刻（毫秒）；已过期则视为不冷却。
-    fn mark_failed_until(&self, uid: &str, until_ms: i64) {
+    fn mark_model_failed_until(&self, uid: &str, model: &str, until_ms: i64) {
         let now = now_ms_i64();
         if until_ms <= now {
             return;
@@ -455,13 +468,15 @@ impl Pool {
         for slot in &self.leases {
             let Ok(mut lease) = slot.lock() else { continue };
             if lease.uid == uid {
-                lease.cooldown_until = Some(until);
+                lease.model_cooldowns.insert(model.to_string(), until);
             }
         }
     }
 
-    /// 该账号剩余冷却毫秒数（短冷却与长冷却取更晚者），不在冷却中返回 None。
+    /// 该账号剩余冷却毫秒数：短冷却与**所有模型**长冷却里最晚的那个。
+    /// 不在冷却中返回 None。
     fn cooling_for(&self, uid: &str) -> Option<i64> {
+        let now = Instant::now();
         for slot in &self.leases {
             let Ok(lease) = slot.lock() else { continue };
             if lease.uid != uid {
@@ -472,9 +487,11 @@ impl Pool {
                 .map(|t| COOLDOWN.as_millis() as i64 - t.elapsed().as_millis() as i64)
                 .filter(|m| *m > 0);
             let long = lease
-                .cooldown_until
-                .map(|t| (t - Instant::now()).as_millis() as i64)
-                .filter(|m| *m > 0);
+                .model_cooldowns
+                .values()
+                .map(|t| t.saturating_duration_since(now).as_millis() as i64)
+                .filter(|m| *m > 0)
+                .max();
             return long.max(short);
         }
         None
@@ -486,8 +503,15 @@ fn now_ms_i64() -> i64 {
 }
 
 /// 取一个可用的账号（必要时先刷新 token）。
-async fn take_account(pool: &Pool, _cfg: &ProxyConfig, want: Option<Edition>) -> Option<Value> {
-    let uid = pool.next_uid_of(want)?;
+///
+/// `model` 用于跳过「该模型正在长冷却」的号 —— 60004 只冻模型，不冻账号。
+async fn take_account(
+    pool: &Pool,
+    _cfg: &ProxyConfig,
+    want: Option<Edition>,
+    model: Option<&str>,
+) -> Option<Value> {
+    let uid = pool.next_uid_of(want, model)?;
     let mut acc = load_accounts().into_iter().find(|a| {
         a.get("uid").and_then(Value::as_str) == Some(uid.as_str())
             && a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
@@ -2000,7 +2024,7 @@ async fn chat_completions(
         }
     }
 
-    let Some(acc) = take_account(&st.pool, &st.cfg, Some(st.edition)).await else {
+    let Some(acc) = take_account(&st.pool, &st.cfg, Some(st.edition), Some(model.as_str())).await else {
         let message = if st.pool.has_edition(st.edition) {
             format!(
                 "{}的账号当前都不可用（冷却中，或需要重新登录）",
@@ -2130,14 +2154,18 @@ async fn chat_completions(
         // 人话：哪个账号、哪个模型、什么时候恢复、怎么继续用，
         // 替代之前那坨双层转义的原始 JSON。
         if let Some(until_ms) = rate_limit_reset_ms(&text) {
-            st.pool.mark_failed_until(&uid, until_ms);
+            // 长冷却记在**模型**键上：账号的其他模型仍可服务（上游自己也是
+            // 这个口径 ——「您也可以切换其他模型继续使用」）。另外给一次账号级
+            // 短冷却，把并发请求从「立刻又撞同一个失败号」里拉出来。
+            st.pool.mark_model_failed_until(&uid, &model, until_ms);
+            st.pool.mark_failed(&uid);
             let reset_at = Local
                 .timestamp_millis_opt(until_ms)
                 .single()
                 .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| "稍后".to_string());
             eprintln!(
-                "[反代] 账号「{account_name}」的模型 {model} 频率超限，已暂停该账号反代至 {reset_at} (uid={uid})"
+                "[反代] 账号「{account_name}」的模型 {model} 频率超限，已停止对该账号使用该模型至 {reset_at} (uid={uid})"
             );
             record_usage(&meta, None, false);
             return (
@@ -2145,7 +2173,7 @@ async fn chat_completions(
                 Json(json!({
                     "error": {
                         "message": format!(
-                            "账号「{account_name}」的模型 {model} 使用频率已超限，已自动暂停该账号的反代，将于 {reset_at} 自动恢复。如需继续使用该账号，可在反代页重新启用并切换其他模型。"
+                            "账号「{account_name}」的模型 {model} 使用频率已超限，已自动停止对该账号使用这个模型，将于 {reset_at} 自动恢复。该账号的其他模型仍可继续使用 —— 换个模型即可，无需重新登录。"
                         ),
                         "type": "rate_limited",
                         "account": account_name,
@@ -2990,16 +3018,50 @@ mod tests {
             ("u-intl".to_string(), Edition::International),
             ("u-dom".to_string(), Edition::Domestic),
         ]);
-        assert_eq!(pool.next_uid_of(Some(Edition::Domestic)).as_deref(), Some("u-dom"));
-        assert_eq!(pool.next_uid_of(Some(Edition::International)).as_deref(), Some("u-intl"));
+        assert_eq!(pool.next_uid_of(Some(Edition::Domestic), None).as_deref(), Some("u-dom"));
+        assert_eq!(pool.next_uid_of(Some(Edition::International), None).as_deref(), Some("u-intl"));
         assert!(pool.has_edition(Edition::Domestic));
         assert!(pool.has_edition(Edition::International));
 
         let only_intl = Pool::new(vec![("u-intl".to_string(), Edition::International)]);
-        assert_eq!(only_intl.next_uid_of(Some(Edition::Domestic)), None);
+        assert_eq!(only_intl.next_uid_of(Some(Edition::Domestic), None), None);
         assert!(!only_intl.has_edition(Edition::Domestic));
         // 不限版本时照常能拿到
-        assert_eq!(only_intl.next_uid_of(None).as_deref(), Some("u-intl"));
+        assert_eq!(only_intl.next_uid_of(None, None).as_deref(), Some("u-intl"));
+    }
+
+    /// 🔴 60004 只冻**模型**：同账号的其他模型仍能被选中，冷却到期后该模型自动回归。
+    /// 账号级长冷却会把还能用的模型一起冻掉，与上游「可切换其他模型继续使用」矛盾。
+    #[test]
+    fn model_cooldown_only_blocks_that_model() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        pool.mark_model_failed_until("u1", "model-a", now_ms_i64() + 3_600_000);
+
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), Some("model-a")),
+            None,
+            "被冻的模型不应再选中该号"
+        );
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), Some("model-b")).as_deref(),
+            Some("u1"),
+            "同账号的其他模型必须照常可用"
+        );
+        // 不关心模型时（model = None）不受模型冷却限制
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), None).as_deref(),
+            Some("u1")
+        );
+
+        // 已过期的冷确不应生效（mark_model_failed_until 会直接忽略过去时刻）
+        let fresh = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        fresh.mark_model_failed_until("u1", "model-a", now_ms_i64() - 1_000);
+        assert_eq!(
+            fresh
+                .next_uid_of(Some(Edition::Domestic), Some("model-a"))
+                .as_deref(),
+            Some("u1")
+        );
     }
 
     /// 复现线上的 400：客户端把附件当 `{"type":"file"}` 发过来，
