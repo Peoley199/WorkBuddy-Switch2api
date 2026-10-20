@@ -218,7 +218,17 @@ jobs:
           BUNDLE_ROOT="target/${{ matrix.target }}/release/bundle"
           # cargo cache 会保留旧 NSIS/DMG/AppImage；不清理就会把 0.1.17 一类产物带进 Release。
           rm -rf "$BUNDLE_ROOT"
-          npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          # tauri.conf.json 里 createUpdaterArtifacts=true → tauri build 会强制要求签名密钥,
+          # 缺了直接报错退出(fork 不继承上游的 secret,四个平台会全挂在这一步)。
+          # 没密钥就显式关掉 updater 产物,只打安装包 —— 与上面 HAS_SIGNING_KEY 的降级意图一致。
+          # ⚠️ 别用 --no-sign:那跳过的是平台代码签名(Windows/macOS 签名),不是 updater 产物签名。
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY 未配置 → 本次不产出 updater 产物(.sig / latest 清单),只打安装包"
+            npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
+              --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          else
+            npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          fi
           echo "bundle after build:"
           find "$BUNDLE_ROOT" -type f | sort || true
           if [ "${{ matrix.bundles }}" = "nsis" ]; then
