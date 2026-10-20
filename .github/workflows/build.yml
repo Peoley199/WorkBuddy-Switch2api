@@ -383,10 +383,25 @@ jobs:
             echo "没有 latest-*.json（未配置 updater 签名密钥）→ 跳过合并，只发布安装包"
           fi
 
+      # release 正文取 annotated tag 的附注正文(`git tag -a -m` 写入的中文修改事项)。
+      # 用 for-each-ref 而不是 git tag -l:前者对 tag 对象存在性更宽容;
+      # 万一将来打了轻量标签,%(contents) 会退化成该提交的 message,不会是空的。
+      - name: Write release notes from tag message
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          git fetch --tags --force --quiet 2>/dev/null || true
+          git for-each-ref "refs/tags/$TAG" --format='%(contents)' > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "tag $TAG 没有附注正文 → release 正文留空,只发布安装包" > release-notes.md
+          fi
+          echo "--- release 正文预览(前 15 行)---"
+          head -15 release-notes.md
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          body_path: release-notes.md
 
   # ---------------------------------------------------------------------------
   # Docker 镜像 → GHCR：给「常驻部署」用（webui + API 反代常年挂着）。
