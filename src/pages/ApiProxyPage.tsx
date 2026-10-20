@@ -162,7 +162,7 @@ function EndpointSection({
             API Key
           </Label>
           <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">
-            留空 = 不鉴权；设置后客户端需带 Authorization: Bearer &lt;key&gt;
+            留空 = 不鉴权；OpenAI 客户端用 Authorization: Bearer &lt;key&gt;，Anthropic / Claude Code 用 x-api-key（或 Bearer）
           </p>
         </div>
         <Input
@@ -415,7 +415,7 @@ export default function ApiProxyPage({
       <header className="mb-8 sm:mb-10">
         <h1 className="text-[28px] font-semibold tracking-tight">{label} API 反代</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          把 Switch 里的{label}账号包装成本机 OpenAI 兼容接口（<code className="rounded bg-muted px-1 py-0.5">/v1/chat/completions</code>），任何支持 OpenAI SDK 的客户端都能用。
+          把 Switch 里的{label}账号包装成本机网关：OpenAI 兼容（<code className="rounded bg-muted px-1 py-0.5">/v1/chat/completions</code>）与 Anthropic 兼容（<code className="rounded bg-muted px-1 py-0.5">/v1/messages</code>），OpenAI SDK 与 Claude Code 都能直接用。
         </p>
       </header>
 
@@ -531,6 +531,10 @@ export default function ApiProxyPage({
                     <>
                       运行中 · OpenAI 基址{" "}
                       <code className="rounded bg-muted px-1 py-0.5">http://{epStatus.listen}/v1</code>
+                      <br />
+                      Anthropic 基址{" "}
+                      <code className="rounded bg-muted px-1 py-0.5">http://{epStatus.listen}</code>
+                      <span className="text-muted-foreground/60">（Claude Code 的 ANTHROPIC_BASE_URL）</span>
                     </>
                   ) : (
                     <>未运行{ep?.enabled ? "（点击保存后启动）" : ""}</>

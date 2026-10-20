@@ -1,13 +1,15 @@
-# API 反代（把 Switch 变成 OpenAI 兼容网关）
+# API 反代（把 Switch 变成 OpenAI / Anthropic 兼容网关）
 
 在 WorkBuddy Switch 里内置了一个本机 HTTP 服务，把你在 Switch 里管理的账号
-包装成标准的 OpenAI 接口，任何支持 OpenAI SDK 的客户端都能直接用。
+包装成标准的 OpenAI 接口，同时提供 Anthropic Messages 接口（Claude Code 可直接连）。
 
 ## 端点
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/v1/chat/completions` | 对话补全，支持 `stream: true/false` |
+| POST | `/v1/chat/completions` | OpenAI 对话补全，支持 `stream: true/false` |
+| POST | `/v1/messages` | Anthropic Messages API，支持流式、`tool_use` / `tool_result` |
+| POST | `/v1/messages/count_tokens` | Claude Code 的 token 估算（本地估算，不消耗额度） |
 | GET | `/v1/models` | 可用模型列表 |
 | GET | `/healthz` | 健康检查 |
 | GET | `/status` | 参与账号与运行状态 |
@@ -15,8 +17,13 @@
 默认监听 `127.0.0.1:7863`，所以在客户端里填：
 
 ```
+# OpenAI 客户端
 base_url = http://127.0.0.1:7863/v1
 api_key  = （没设置就随便填，例如 sk-anything）
+
+# Claude Code / Anthropic 客户端
+ANTHROPIC_BASE_URL = http://127.0.0.1:7863
+ANTHROPIC_AUTH_TOKEN = <api_key>          # 也接受 x-api-key
 ```
 
 > ⚠️ **如果你开了梯子（系统代理 127.0.0.1:7897）**：部分 HTTP 客户端会把
@@ -33,7 +40,8 @@ api_key  = （没设置就随便填，例如 sk-anything）
 1. 打开 Switch → **API 反代**
 2. 打开「启用 OpenAI 兼容接口」
 3. 点**保存**（保存即生效，不用重启软件）
-4. 状态行会显示 `运行中 · OpenAI 基址 http://127.0.0.1:7863/v1`
+4. 状态行会显示 `运行中 · OpenAI 基址 http://127.0.0.1:7863/v1` 与
+   `Anthropic 基址 http://127.0.0.1:7863`
 
 之后每次启动 Switch 都会自动拉起（配置存在 `~/.wb-switch/proxy.json`）。
 
@@ -51,7 +59,12 @@ api_key  = （没设置就随便填，例如 sk-anything）
    `/v2/enterprises/personal/models`，把 `data.agents[].models[]` 拆出来。
 
 弹窗底部会写清数据来源（`本机反代` / `上游`）。拉不到时退回一组内置 ID，不会给空列表。
-列表外的 ID 也能直接发（上游支持即可）。
+列表外的 ID 也能直接发（上游支持即可）；想让它出现在 `/v1/models` 里、并跳过版本防火墙，
+就填进本页的「额外放行模型」。
+
+> ⚠️ 这个列表只来自 `GET /v2/enterprises/personal/models`，**不是可用模型全集**：
+> 上游的 `GET /v3/config`（CLI User-Agent）里还有 `deepseek-v4.1-flash` 等一批能调通、却没出现在这里的模型。
+> 详见文末「已知限制 → 模型目录只取了一个来源」。
 
 ## 国内版 / 国际版是两套上游（v1.0.6）
 
@@ -212,7 +225,16 @@ x-wb-switch-degraded: file=1
   所以表现成「时好时坏、重发有时能过」。
 
 反代现在的处理：`sanitize_messages` 对 `role == "system"` 的消息调
-`strip_env_injection`，从**最后一个** `gitStatus:` 起截断。被摘时响应头带：
+`strip_claude_code_markers`，摘掉这些 Claude Code 注入标记：
+
+- 最前面的 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=...;`
+- `You are Claude Code, Anthropic's official CLI for Claude.` 身份声明
+  （CCH 的供应商测试探针会发这句，实测单独这一句就能触发 11128）
+- `# Environment` / `You have been invoked in the following environment:` 环境块
+  （非 git 目录没有 `gitStatus:`，旧逻辑会漏掉）
+- `gitStatus:` 块（从最后一个 `gitStatus:` 起截断）
+
+被摘时响应头带：
 
 ```
 x-wb-switch-degraded: system-env
@@ -326,10 +348,61 @@ v1.6.7 起**原样透传** `reasoning_effort` / `thinking` / `reasoning` / `enab
 > ⚠️ 用 PyYAML 校验这类文件会误报：YAML 1.1 把裸键 `off` 读成布尔 `false`。
 > DSH 用的 js-yaml（4.x）保留字符串 `off`，以它为准。
 
+## 客户端接入（Claude Code / CCH）
+
+Claude Code 走 Anthropic Messages，直接指到反代入口即可：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7864     # 国际版；国内版换 7863
+export ANTHROPIC_AUTH_TOKEN=<反代 API Key>          # 也接受 x-api-key
+export ANTHROPIC_MODEL=deepseek-v4.1-flash          # 必须是上游实际可用的模型 id
+claude
+```
+
+请求转换会处理：
+
+- `system`（字符串 / 文本块数组）
+- `text` / `image` 内容块
+- `tools` / `tool_choice`
+- assistant 的 `tool_use` → OpenAI `tool_calls`
+- user 的 `tool_result` → OpenAI `role:"tool"`（`is_error` 会加 `[tool_error]` 前缀）
+- `stop_sequences` → `stop`
+- `max_tokens` / `temperature` / `top_p` / `top_k`
+
+响应按 Anthropic SSE 事件序列返回（`message_start` → `content_block_*` →
+`message_delta` → `message_stop`）。只要有工具调用，`stop_reason` 一律是 `tool_use` ——
+部分上游在返回 `tool_calls` 时仍给 `finish_reason=stop`，照搬会让 Claude Code 认为
+本轮已结束、工具还没执行就收工。
+
+### 经 CCH（claude-code-hub）转发
+
+CCH 本身**不做跨格式转换**（同格式路由），所以要让它把 Claude Code 接到本入口，
+必须在 CCH 里把本入口注册成 `claude` 类型供应商：
+
+| 字段 | 值 |
+|---|---|
+| URL | `http://host.docker.internal:7864`（CCH 在容器里；国内版换 7863） |
+| Key | 本入口的 API Key |
+| 类型 | `claude` |
+| 分组 | 与 Claude Code 使用的 CCH key 的 `provider_group` 一致 |
+| 模型白名单 | `deepseek-v4.1-flash`（或留空） |
+
+⚠️ CCH 的模型白名单按**客户端原始请求的模型名**匹配，模型重定向发生在选供应商之后。
+所以要么让 Claude Code 的 `ANTHROPIC_MODEL` 与白名单一致，要么把白名单留空。
+
+### 已知限制
+
+- 上游 `reasoning_content` 不转成 Anthropic `thinking`（没有可用签名），思考内容不展示
+- 不支持 prompt caching：`cache_control` 丢弃，`cache_*` usage 字段按上游实际值给
+- `stop_sequence` 无法区分，统一映射为 `end_turn`
+- `count_tokens` 是本地估算值，不参与计费
+- 非流式 Anthropic 请求内部走流式再聚合，用量统计里的 stream 标记会是 true
+- 模型必须是 WorkBuddy 实际可用的 id（当前实测 `deepseek-v4.1-flash` 可用）
+
 ## 客户端接入（Codex / Codex++）
 
-外部客户端把本反代当上游时，**协议必须选 Chat Completions** —— 我们只实现了
-`/v1/chat/completions`，**没有 Responses API**；选 Responses 会直接 404。
+外部客户端把本反代当上游时，**OpenAI 侧协议必须选 Chat Completions** —— 我们实现了
+`/v1/chat/completions` 与 Anthropic `/v1/messages`，**没有 Responses API**；选 Responses 会直接 404。
 
 ### Codex / Codex++
 
@@ -360,9 +433,12 @@ requires_openai_auth = true  # 取 ~/.codex/auth.json 的 OPENAI_API_KEY 当 Bea
 
 ## 已知限制
 
-- 只做了 `/v1/chat/completions`，没有 embeddings / images / audio
+- OpenAI 侧只做了 `/v1/chat/completions`，没有 embeddings / images / audio；也没有 Responses API
+- Anthropic 侧只做了 `/v1/messages` 与 `/v1/messages/count_tokens`
 - 工具调用（function calling）会透传给上游，但没有做额外的 schema 校验
 - `/v1/models` 是从上游 `data.agents[].models[]` 里提取的，拉不到时回退到一个内置列表
+- 模型目录只取了 `/v2/enterprises/personal/models` 一个来源，不含 `/v3/config`（CLI UA）里的
+  `deepseek-v4.1-flash` 等可用模型 —— 不影响调用，只影响列表展示，见下方
 - 上游只认 text / image_url，其它内容块会被降级成文本（见上）
 
 - 🔴 **上游的模型列表不完整 —— 版本防火墙会因此误拦**（2026-10-11 实测）。
@@ -374,6 +450,44 @@ requires_openai_auth = true  # 取 ~/.codex/auth.json 的 OPENAI_API_KEY 当 Bea
   模型误判成国内版专属，直接 400 掉（报「请改用国内版入口」）。
   ⚠️ 防火墙本身的前提是对的（跨版本确实会被上游拒：`codebuddy.cn ← gpt-5.6-sol` → `11102 only available
   for authorized users`），**错的是判据来源**。
+
+### 模型目录只取了一个来源，`/v3/config`（CLI UA）里的模型看不到（2026-10-19 实测，暂不修）
+
+反代的 `/v1/models` 与「获取模型ID」只请求 `GET /v2/enterprises/personal/models`，
+取 `data.agents[].models[]`。但上游还有**第二个目录接口**，按 `User-Agent` 下发不同集合：
+
+| 请求 | 国际版返回 | 是否含 deepseek |
+|---|---|---|
+| `GET /v2/enterprises/personal/models`（**当前唯一来源**） | 18 个（cli agent 17 个） | ❌ 0 个 |
+| `GET /v3/config` + IDE UA `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` | 13 个 | ❌ 0 个 |
+| `GET /v3/config` + CLI UA `CLI/2.63.2 CodeBuddy/2.63.2` | 20 个 | ✅ `deepseek-v4.1-flash`、`deepseek-v4.1-flash-sg`、`deep-model` |
+
+`/v3/config` + CLI UA 响应的形态（`data.models[]`，每项带 `id` / `name` / `credits` / `maxOutputTokens` / `tags`）：
+
+```
+default-model(Auto)  fast-model(Fast)  balanced-model(Balanced)  primary-model(Primary)
+deep-model(Deep)     deepseek-v4.1-flash(Deepseek-V4.1-Flash, x0.00)  deepseek-v4.1-flash-sg(, x0.03)
+hy4-preview  hy3  kimi-k2.8-preview  gpt-5.6-terra  gpt-5.6-luna  gpt-5.5  gpt-5.4
+gemini-3.5-flash  glm-5.3-flash  glm-5.3  glm-5.2  kimi-k3  kimi-k2.6
+```
+
+另有 `data.productFeaturesConfig.ModelTrialBanner` 会放试用模型（如 `hy4-preview-f` → `hy4-preview`）。
+
+同一次探测里，国际版这 5 个「只在 CLI UA 目录出现」的模型**实测都能调通**（流式首帧 200）：
+`deepseek-v4.1-flash`、`deepseek-v4.1-flash-sg`、`glm-5.3-flash`、`kimi-k2.8-preview`、`hy4-preview-f`。
+`glm-5.3-flashx` 同样不在目录里，`max_tokens` 较小时报 `11133`，调到 64 后 200。
+
+**这不影响调用**：防火墙只按「拉到的列表」学习归属，没见过的模型一律放行交给上游判定
+（`model_edition()` 返回 `None`），所以 `deepseek-v4.1-flash` 不在列表里也能正常请求。
+
+**影响**：客户端看「获取模型ID」选模型时会漏掉这些可用模型；用户只能手动填 `extra_models`。
+国内版目录没有账号可实测，但从 panel-plus 默认编排把 `cn:deepseek-v4.1-flash` 列为国内版主模型看，
+它大概率也在国内版的 `/v3/config` 里。
+
+**待办（暂缓）**：把 `/v3/config`（CLI UA）并入模型来源，两版都拉、并集去重；
+需过滤非对话条目（`nes-*`、`completion-*`、`codewise-*`、`tags` 含 `text-to-image` 的图片/视频模型），
+否则客户端可能选中它们换来 400。参考实现：`workbuddy2api-panel-plus` 的
+`internal/upstream/client.go` `FetchModels` / `fetchV3Models`（MIT）。
 
 ## 源码位置
 

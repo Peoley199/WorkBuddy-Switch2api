@@ -16,7 +16,7 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 ## 发布新版本
 
 签名密钥（自动更新用）存放于 `~/.wb-switch/wb-switch-updater.key`，构建脚本通过
-`TAURI_SIGNING_PRIVATE_KEY` 注入。
+`TAURI_SIGNING_PRIVATE_KEY` 注入；私钥密码放在 `~/.wb-switch/wb-switch-updater.key.password`。
 
 ### 1. 改版本号（一条命令）
 

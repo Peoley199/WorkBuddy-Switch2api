@@ -26,7 +26,7 @@ OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号�
 账号页用标签页分开显示，登录、切换、积分、反代都按档位走。
 
 - **账号切换** —— 多账号共享登录态，一键切换 WorkBuddy 登录账号，支持把当前会话复制给目标账号
-- **API 反代** —— 把账号库包装成 `http://127.0.0.1:7863/v1`，任何 OpenAI SDK 客户端都能直接用
+- **API 反代** —— 把账号库包装成 `http://127.0.0.1:7863/v1`，OpenAI SDK 与 Claude Code 都能直接用
 - **账号分组** —— 给账号标「桌面端 / 反代API」，两类用途互不抢号
 - **用量统计** —— 反代请求数、输入输出 Token、按账号与按模型分布，落盘可查历史
 - **积分与签到** —— 积分到期监控、自动签到、Token 保活、CodeBuddy CLI 自动轮换
@@ -109,7 +109,7 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 | **账号分组** | 给账号标注「桌面端 / 反代API / 未分组」，账号卡片直接显示标签；反代页按分组挑选出站账号 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
 | **国内版 / 国际版** | 账号按客户端档位分开管理。国内版 = `WorkBuddy` + `workbuddy-desktop.info` + `www.codebuddy.cn`；国际版 = `WorkBuddyAI` + `workbuddy-desktop-ai.info` + `www.workbuddy.ai`。扫码登录、从本机导入、切换、Token 刷新、积分查询都按档位走对应域名与进程；账号页用「国内版 / 国际版」标签页分开显示。会话共享 / 复制按档位作用于各自的 `workbuddy.db`；国际版暂不支持每日签到与成长中心 |
-| **API 反代** | 内置 OpenAI 兼容网关：账号池轮转与失败冷却、按分组挑号、流式与非流式、`/v1/chat/completions`、`/v1/models`、`/healthz`、`/usage-stats`。**国内版与国际版各占一个独立入口**，同时开着互不影响 |
+| **API 反代** | 内置网关，同时提供 **OpenAI 兼容**（`/v1/chat/completions`）与 **Anthropic 兼容**（`/v1/messages`，Claude Code 可直接连）：账号池轮转与失败冷却、按分组挑号、流式与非流式、工具调用、`/v1/models`、`/healthz`、`/usage-stats`。**国内版与国际版各占一个独立入口**，同时开着互不影响 |
 | **反代取模型 ID** | 反代页有「获取模型ID」按钮：一键拉出可用模型列表并弹窗展示，逐个或整体复制 —— 不用再查文档猜客户端里 `model` 填什么。反代开着就问本机端口（零消耗），没开则直连上游；结果与 `/v1/models`、版本校验放行**同一口径** |
 | **反代分版本** | 国内版和国际版是两套上游、**模型列表不一样**，反代侧按版本分流：账号拆成「反代API · 国内版 / 国际版」两组；请求按 `model` 自动挑对应版本的账号（不再让国际版专属模型落到国内版）。`/v1/models` 返回并集，`owned_by` 标出 `workbuddy-cn` / `workbuddy-intl` |
 | **额外放行模型** | 上游给的模型列表**是不完整的**：有的模型实测能调通、却根本不在列表里（例如国际版的 `deepseek-v4.1-flash`）。每个入口都能填「额外放行模型」，填进去的会进 `/v1/models`、也跳过版本校验，不再被误判成「属于另一版」 |
@@ -184,11 +184,16 @@ xattr -rd com.apple.quarantine "/Applications/WorkBuddy-Switch2api.app"
 
 ## API 反代
 
-侧边栏的 **「API 反代」** 页把当前账号库包装成 OpenAI 兼容接口，任何支持 OpenAI SDK 的客户端都能直接用。**国内版与国际版是两个独立入口**，各有自己的开关、监听地址、API Key 与账号名单 —— 可以只开一个，也可以同时开：
+侧边栏的 **「API 反代」** 页把当前账号库包装成本机网关：**OpenAI 兼容**（`/v1/chat/completions`）与 **Anthropic 兼容**（`/v1/messages`）共用同一套账号池、冷却与用量统计。**国内版与国际版是两个独立入口**，各有自己的开关、监听地址、API Key 与账号名单 —— 可以只开一个，也可以同时开：
 
 ```
+OpenAI 客户端
 国内版  base_url = http://127.0.0.1:7863/v1     # 走 www.codebuddy.cn
 国际版  base_url = http://127.0.0.1:7864/v1     # 走 www.workbuddy.ai
+
+Claude Code（Anthropic 协议）
+国内版  ANTHROPIC_BASE_URL = http://127.0.0.1:7863
+国际版  ANTHROPIC_BASE_URL = http://127.0.0.1:7864
 api_key = 随便填（未设置鉴权时）
 ```
 
@@ -197,7 +202,9 @@ api_key = 随便填（未设置鉴权时）
 
 | 接口 | 说明 |
 | --- | --- |
-| `POST /v1/chat/completions` | 对话补全，支持 `stream: true` 流式 |
+| `POST /v1/chat/completions` | OpenAI 对话补全，支持 `stream: true` 流式 |
+| `POST /v1/messages` | Anthropic Messages API（Claude Code 直接可用），支持流式与工具调用 |
+| `POST /v1/messages/count_tokens` | Claude Code 上下文 token 估算（本地估算，不消耗额度） |
 | `GET /v1/models` | 可用模型列表（上游列表 + 本入口的「额外放行模型」） |
 | `GET /healthz` | 健康检查与可用账号数 |
 | `GET /usage-stats` | 反代用量统计（JSON） |
@@ -215,10 +222,26 @@ api_key = 随便填（未设置鉴权时）
 
 客户端的消息不会原样发给上游，中途会被按需改写 —— 这两条都是实测被拦之后加上的：
 
-1. **摘掉 Claude-Code 式环境注入块** —— system prompt 里 `gitStatus:` / `Current branch:` 那一整段会被上游的渠道校验认成「非官方客户端发来的」。反代从最后一个 `gitStatus:` 起截断。只影响长会话（环境块累积到完整形态时），所以表现为「时好时坏」。
+1. **摘掉 Claude-Code 式环境注入块** —— system prompt 里的 `gitStatus:` / `Current branch:` 环境快照、`x-anthropic-billing-header:`、`# Environment` 环境块，以及 `You are Claude Code, Anthropic's official CLI for Claude.` 身份声明，都会被上游的渠道校验认成「非官方客户端发来的」。反代按需截断 / 删除这些片段（Claude Code、CCH 供应商测试探针都会发）。只影响长会话（环境块累积到完整形态时），所以表现为「时好时坏」。
 2. **国际版补首条 `system`** —— 国际版上游要求第一条消息必须是 `system`，否则整条请求被 400 打回：`{"code":11128,"msg":"first message is not system prompt"}`。客户端没带时补一条最小的。这条约束**只有国际版有**，国内版不带也照常。
 
 任一改动生效时，响应头会带上 `x-wb-switch-degraded`（值为 `system-env` 或 `leading-system`），方便排查「为什么这轮模型看不到 git 状态」。
+
+### 接入 Claude Code（Anthropic 协议）
+
+Claude Code 走 Anthropic Messages，不需要任何转换工具，直接把基址指到反代入口即可（`model` 填上游实际可用的 id）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7864
+export ANTHROPIC_AUTH_TOKEN=<API Key>      # 也接受 Anthropic 习惯的 x-api-key
+export ANTHROPIC_MODEL=deepseek-v4.1-flash
+claude
+```
+
+工具调用（`tool_use` / `tool_result`）、流式 SSE、`/v1/messages/count_tokens` 都已转写。
+上游的 `reasoning_content` 不会转成 Anthropic 的 thinking 块（没有可用签名），`cache_control` 也会丢弃。
+
+**经 CCH（claude-code-hub）转发**：在 CCH 里新建一个 `claude` 类型供应商，URL 填 `http://host.docker.internal:7864`（CCH 在容器里），Key 填本入口的 API Key，模型白名单填 `deepseek-v4.1-flash`。注意 CCH 的模型白名单按**客户端原始请求的模型名**匹配，Claude Code 侧要用 `ANTHROPIC_MODEL` 让模型名与白名单一致（或把白名单留空、改用 modelRedirects）。
 
 > 如果本机开着系统代理（梯子），部分客户端会把 `127.0.0.1` 也送去走代理而连不上，
 > 这时设置 `no_proxy=127.0.0.1,localhost`，或用 `curl --noproxy '*'` 验证。
@@ -315,7 +338,8 @@ Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy、
 1. 本机生成密钥对：`npx tauri signer generate -w "$HOME/.wb-switch/wb-switch-updater.key" -p <密码>`
 2. 公钥写进 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`
 3. 私钥与密码分别写进仓库 Actions secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-4. **私钥丢了就再也签不出能被老客户端接受的更新**，注意备份
+4. 本地 `npm run build:app` / `build:app:release` 会从 `~/.wb-switch/wb-switch-updater.key.password` 读取密码，生成密钥后把密码写入该文件（权限 600）
+5. **私钥丢了就再也签不出能被老客户端接受的更新**，注意备份
 
 > 签名的私钥只放在本机 `~/.wb-switch/wb-switch-updater.key` 与仓库 secrets 里，不要提交进 git。
 

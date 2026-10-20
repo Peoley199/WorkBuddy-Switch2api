@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use chrono::{FixedOffset, Local, NaiveDateTime, TimeZone};
+use uuid::Uuid;
 
 use super::account::{load_accounts, upsert_account};
 use super::config::{home_dir, now_ms};
@@ -740,15 +741,14 @@ fn sanitize_messages(messages: &Value, degraded: &mut Vec<String>) -> Value {
             m["role"] = Value::String("system".to_string());
             degraded.push("developer-role".to_string());
         }
-        // system 消息先过一遍「环境注入」净化，见 strip_env_injection 的说明。
+        // system 消息先过一遍「Claude Code 注入标记」净化，见 strip_claude_code_markers 的说明。
         if m.get("role").and_then(Value::as_str) == Some("system") {
-            if let Some(cleaned) = m
-                .get("content")
-                .and_then(Value::as_str)
-                .and_then(strip_env_injection)
-            {
-                degraded.push("system-env".to_string());
-                m["content"] = Value::String(cleaned);
+            if let Some(text) = m.get("content").and_then(Value::as_str) {
+                let cleaned = strip_claude_code_markers(text);
+                if cleaned != text {
+                    degraded.push("system-env".to_string());
+                    m["content"] = Value::String(cleaned);
+                }
             }
         }
         let Some(parts) = m.get("content").and_then(Value::as_array) else {
@@ -811,6 +811,50 @@ fn strip_env_injection(text: &str) -> Option<String> {
         return None;
     }
     Some(cleaned.to_string())
+}
+
+/// 摘掉 Claude Code 特有的 system prompt 标记。
+///
+/// 除了 `gitStatus:` 环境块，Claude Code 还会在 system prompt 里注入：
+/// - 最前面的 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=...;`
+/// - 末尾的 `# Environment / You have been invoked in the following environment:`
+///   （工作目录、平台、日期等；非 git 目录时没有 `gitStatus:`，旧逻辑会漏掉）
+///
+/// 这两段都会被 WorkBuddy 上游的渠道校验认成「非官方客户端」，整条请求 400
+/// `11128 Illegal API invocation from an unapproved channel`。模型本身不需要它们，
+/// 直接摘掉。
+fn strip_claude_code_markers(text: &str) -> String {
+    let mut s = text.to_string();
+
+    // 1) 最前面的 billing header 行
+    if s.starts_with("x-anthropic-billing-header:") {
+        s = match s.find('\n') {
+            Some(pos) => s[pos + 1..].to_string(),
+            None => String::new(),
+        };
+    }
+
+    // 2) 「官方 Claude Code」身份声明。上游渠道校验会把它认成非官方客户端
+    //    （CCH 的供应商测试探针就发这句）。真实 Claude Code 2.1.x 已不用这句，
+    //    但第三方客户端 / 旧版本还会发。
+    s = s.replace(
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+        "",
+    );
+    s = s.replace("You are Claude Code, Anthropic's official CLI for Claude", "");
+
+    // 3) 环境块（从 `# Environment` 起截断；只认 Claude Code 的固定措辞，
+    //    避免误伤 system prompt 里正常出现的 "# Environment"）
+    if let Some(idx) = s.find("# Environment") {
+        let tail = &s[idx..];
+        if tail.contains("invoked in the following environment") {
+            s.truncate(idx);
+        }
+    }
+
+    // 4) 已有的 gitStatus 环境块
+    let cleaned = strip_env_injection(&s).unwrap_or(s);
+    cleaned.trim().to_string()
 }
 
 /// 上游的失败响应体是不是「渠道校验软拦截」（`11128`）。
@@ -1022,6 +1066,20 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
     if let Some(t) = incoming.get("tools") {
         body["tools"] = t.clone();
     }
+    // Anthropic 入口（`/v1/messages`）会把 tool_choice / stop_sequences 翻译成
+    // 这两个 OpenAI 字段；OpenAI 客户端本来也可能发它们，一并透传。
+    // 没有 tools 时 tool_choice 无意义（上游可能 400），翻译层会先把它摘掉。
+    if let Some(v) = incoming.get("tool_choice") {
+        body["tool_choice"] = v.clone();
+    }
+    if let Some(v) = incoming.get("stop") {
+        body["stop"] = v.clone();
+    }
+    // `top_k` 是 Anthropic 独有参数，OpenAI 规范没有。上游实测忽略未知字段，
+    // 透传不会报错；不支持的模型自然无效果，好过静默丢弃客户端参数。
+    if let Some(v) = incoming.get("top_k") {
+        body["top_k"] = v.clone();
+    }
     // 🔴 思考强度：以前这里只转 model/messages/stream/temperature/top_p/max_tokens/tools，
     // 思考类字段**全被丢掉**，表现为「客户端调了推理等级、上游毫无反应、思考内容为空」。
     //
@@ -1098,14 +1156,21 @@ fn check_auth(headers: &HeaderMap, api_key: &str) -> bool {
     if want.is_empty() {
         return true;
     }
-    let presented = headers
+    let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .trim()
         .trim_start_matches("Bearer ")
         .trim();
-    presented == want
+    // Anthropic SDK / Claude Code 走 `x-api-key`，OpenAI SDK / CCH 的 claude 供应商
+    // 走 `Authorization: Bearer`。两个入口共用同一把 key，这里两种头都认。
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    bearer == want || x_api_key == want
 }
 
 async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
@@ -1981,7 +2046,15 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(incoming): Json<Value>,
 ) -> Response {
-    if !check_auth(&headers, &st.endpoint.api_key) {
+    chat_completions_inner(&st, &headers, incoming).await
+}
+
+/// OpenAI 聊天入口的实际实现。
+///
+/// 单独拆出来是为了让 `/v1/messages`（Anthropic 协议）在翻译完请求后**直接复用**
+/// 选号、冷却、重试、用量统计这条链，而不是重新实现一遍或再发一次本地 HTTP。
+async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Value) -> Response {
+    if !check_auth(headers, &st.endpoint.api_key) {
         return unauthorized();
     }
     let want_stream = incoming
@@ -2310,6 +2383,1097 @@ where
     }))
 }
 
+// ---------------------------------------------------------------- Anthropic Messages
+
+/// Anthropic SSE：`event: <name>\ndata: <json>\n\n`。
+fn anthropic_event_bytes(event: &str, data: &Value) -> bytes::Bytes {
+    let raw = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+    bytes::Bytes::from(format!("event: {event}\ndata: {raw}\n\n"))
+}
+
+fn anthropic_new_id(prefix: &str) -> String {
+    format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+/// Anthropic 模型名可能带 Claude Code 的 `[1M]` 后缀（表示 1M 上下文）。
+/// 上游不认识它，交给内部 chat 前先摘掉。
+fn normalize_anthropic_model(model: &str) -> String {
+    let m = model.trim();
+    let m = m
+        .strip_suffix("[1M]")
+        .or_else(|| m.strip_suffix("[1m]"))
+        .unwrap_or(m);
+    m.trim().to_string()
+}
+
+fn anthropic_system_text(system: &Value) -> Option<String> {
+    match system {
+        Value::String(s) => {
+            let cleaned = strip_claude_code_markers(s);
+            if cleaned.trim().is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        }
+        Value::Array(blocks) => {
+            let mut out = String::new();
+            for b in blocks {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    // billing header 是独立块（Claude Code 2.x 的第一个 system block）。
+                    if t.trim_start().starts_with("x-anthropic-billing-header:") {
+                        continue;
+                    }
+                    out.push_str(t);
+                }
+            }
+            let cleaned = strip_claude_code_markers(&out);
+            if cleaned.trim().is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_image_url(block: &Value) -> Option<String> {
+    let src = block.get("source")?;
+    match src.get("type").and_then(Value::as_str).unwrap_or("") {
+        "base64" => {
+            let data = src.get("data").and_then(Value::as_str)?;
+            if data.is_empty() {
+                return None;
+            }
+            let mt = src
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            Some(format!("data:{mt};base64,{data}"))
+        }
+        "url" => src
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// tool_result.content：字符串 / 文本块数组 / 其他 → 文本。
+fn tool_result_text(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => {
+            let mut out = String::new();
+            for it in items {
+                if let Some(t) = it.get("text").and_then(Value::as_str) {
+                    out.push_str(t);
+                } else if let Some(s) = it.as_str() {
+                    out.push_str(s);
+                }
+            }
+            out
+        }
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Anthropic tool_use.input → OpenAI arguments 字符串。
+fn tool_args_json(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(Value::String(_)) => "{}".to_string(),
+        Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+    }
+}
+
+/// Anthropic user 消息 → 0~N 条 OpenAI 消息。
+///
+/// tool_result 必须**先于**同批文本输出：OpenAI 要求 tool 消息紧跟 assistant.tool_calls，
+/// 中间插一条 user 文本会断开配对（参考 panel-plus 的修复）。
+fn anthropic_user_to_openai(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"role": "user", "content": s})]
+            }
+        }
+        Value::Array(blocks) => {
+            let mut tool_msgs = Vec::new();
+            let mut texts = Vec::new();
+            let mut parts = Vec::new();
+            let mut has_image = false;
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "tool_result" => {
+                        let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if id.is_empty() {
+                            continue;
+                        }
+                        let mut txt = tool_result_text(b.get("content"));
+                        if b.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                            // OpenAI 的 role:tool 没有 is_error 字段；不标记的话模型会把
+                            // 失败结果当成正常返回，继续编造「已成功」。
+                            txt = format!("[tool_error] {txt}");
+                        }
+                        tool_msgs.push(json!({"role": "tool", "tool_call_id": id, "content": txt}));
+                    }
+                    "text" => {
+                        if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                texts.push(t.to_string());
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                        }
+                    }
+                    "image" => {
+                        if let Some(url) = anthropic_image_url(b) {
+                            has_image = true;
+                            parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                        }
+                    }
+                    // thinking / redacted_thinking / document 等：上游不认识，忽略。
+                    _ => {}
+                }
+            }
+            let mut out = tool_msgs;
+            if has_image && !parts.is_empty() {
+                out.push(json!({"role": "user", "content": parts}));
+            } else if !texts.is_empty() {
+                out.push(json!({"role": "user", "content": texts.join("\n")}));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Anthropic assistant 消息 → 0~1 条 OpenAI 消息（text + tool_calls）。
+fn anthropic_assistant_to_openai(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(s) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"role": "assistant", "content": s})]
+            }
+        }
+        Value::Array(blocks) => {
+            let mut texts = Vec::new();
+            let mut calls = Vec::new();
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text" => {
+                        if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                texts.push(t.to_string());
+                            }
+                        }
+                    }
+                    "tool_use" => {
+                        let Some(name) = b.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let id = b
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| anthropic_new_id("toolu"));
+                        calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": tool_args_json(b.get("input")),
+                            }
+                        }));
+                    }
+                    // thinking 块没有 OpenAI 对应物，丢弃。
+                    _ => {}
+                }
+            }
+            if !calls.is_empty() {
+                // 工具调用轮允许空正文；两边都接受 ""。
+                vec![json!({
+                    "role": "assistant",
+                    "content": texts.join("\n"),
+                    "tool_calls": calls,
+                })]
+            } else if !texts.is_empty() {
+                vec![json!({"role": "assistant", "content": texts.join("\n")})]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn anthropic_tools_to_openai(tools: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for t in tools {
+        let name = t
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::trim)
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let desc = t
+            .get("description")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                t.get("function")
+                    .and_then(|f| f.get("description"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("");
+        let schema = t
+            .get("input_schema")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .or_else(|| {
+                t.get("function")
+                    .and_then(|f| f.get("parameters"))
+                    .filter(|v| !v.is_null())
+                    .cloned()
+            })
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        out.push(json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": schema,
+            }
+        }));
+    }
+    out
+}
+
+fn anthropic_tool_choice(v: Option<&Value>) -> Option<Value> {
+    let v = v?;
+    match v {
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(json!("auto")),
+            "any" | "required" => Some(json!("required")),
+            "none" => Some(json!("none")),
+            _ => None,
+        },
+        Value::Object(_) => {
+            let ty = v.get("type").and_then(Value::as_str)?.to_ascii_lowercase();
+            match ty.as_str() {
+                "auto" => Some(json!("auto")),
+                "any" => Some(json!("required")),
+                "none" => Some(json!("none")),
+                "tool" | "function" => {
+                    let name = v.get("name").and_then(Value::as_str)?;
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(json!({"type": "function", "function": {"name": name}}))
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Anthropic Messages 请求 → OpenAI chat 请求。
+///
+/// 只翻译内部 chat 链路认识的字段；`thinking` / `cache_control` / `metadata` 等
+/// 上游没有对应能力的字段直接丢弃。
+fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
+    let raw_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if raw_model.is_empty() {
+        return Err("model is required".to_string());
+    }
+    let model = normalize_anthropic_model(raw_model);
+    let Some(arr) = body.get("messages").and_then(Value::as_array) else {
+        return Err("messages is required".to_string());
+    };
+    if arr.is_empty() {
+        return Err("messages is required".to_string());
+    }
+
+    let mut system_text = body
+        .get("system")
+        .and_then(anthropic_system_text)
+        .unwrap_or_default();
+    let mut msgs: Vec<Value> = Vec::with_capacity(arr.len() + 1);
+    for m in arr {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        let content = m.get("content").cloned().unwrap_or(Value::Null);
+        match role {
+            "user" => msgs.extend(anthropic_user_to_openai(&content)),
+            "assistant" => msgs.extend(anthropic_assistant_to_openai(&content)),
+            // Claude Code 会把第二段 system-reminder 以 `role:"system"` 放进 messages。
+            // OpenAI 上游没有「中途 system」这个语义，合并进首条 system 最稳。
+            "system" => {
+                if let Some(t) = anthropic_system_text(&content) {
+                    if !system_text.is_empty() {
+                        system_text.push('\n');
+                    }
+                    system_text.push_str(&t);
+                }
+            }
+            _ => return Err(format!("invalid role: {role}")),
+        }
+    }
+    if msgs.is_empty() {
+        return Err("messages is required".to_string());
+    }
+    if !system_text.trim().is_empty() {
+        msgs.insert(0, json!({"role": "system", "content": system_text}));
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("model".to_string(), Value::String(model));
+    out.insert("messages".to_string(), Value::Array(msgs));
+    for key in ["max_tokens", "temperature", "top_p", "top_k"] {
+        if let Some(v) = body.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    if let Some(stops) = body.get("stop_sequences").and_then(Value::as_array) {
+        if !stops.is_empty() {
+            out.insert("stop".to_string(), Value::Array(stops.clone()));
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let converted = anthropic_tools_to_openai(tools);
+        if !converted.is_empty() {
+            out.insert("tools".to_string(), Value::Array(converted));
+            // 没有 tools 时 tool_choice 无意义，上游可能直接 400，所以只在有 tools 时下发。
+            if let Some(tc) = anthropic_tool_choice(body.get("tool_choice")) {
+                out.insert("tool_choice".to_string(), tc);
+            }
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn count_json_chars(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.chars().count(),
+        Value::Array(a) => a.iter().map(count_json_chars).sum(),
+        Value::Object(o) => o.values().map(count_json_chars).sum(),
+        _ => 0,
+    }
+}
+
+/// `/v1/messages/count_tokens` 的粗略估算。
+///
+/// 上游没有 count_tokens 接口，这里只按字符数估一个量级（中英混合约 3 字符/token），
+/// 供 Claude Code 的上下文提示使用，不参与计费。
+fn estimate_anthropic_input_tokens(body: &Value) -> u64 {
+    let mut chars = 0usize;
+    for key in ["system", "messages", "tools"] {
+        if let Some(v) = body.get(key) {
+            chars += count_json_chars(v);
+        }
+    }
+    ((chars as f64 / 3.0).ceil() as u64).max(1)
+}
+
+/// 一个流式 tool_use 内容块的累积状态。
+#[derive(Default)]
+struct AnthropicToolState {
+    index: usize,
+    id: String,
+    name: String,
+    args: String,
+    opened: bool,
+    stopped: bool,
+}
+
+/// OpenAI chat chunk → Anthropic SSE 事件的纯状态机。
+///
+/// 工具调用分片按 OpenAI `index` 累积；name 到手后才开 `tool_use` 块，避免发出
+/// 一个没有名字的非法工具块。块下标按真实出现顺序分配。
+struct AnthropicStream {
+    message_id: String,
+    model: String,
+    started: bool,
+    next_index: usize,
+    text_index: Option<usize>,
+    text_open: bool,
+    text: String,
+    tool_order: Vec<i64>,
+    tools: HashMap<i64, AnthropicToolState>,
+    finish_reason: String,
+    usage: Option<Value>,
+    errored: bool,
+    done: bool,
+}
+
+impl AnthropicStream {
+    fn new(model: String) -> Self {
+        Self {
+            message_id: anthropic_new_id("msg"),
+            model,
+            started: false,
+            next_index: 0,
+            text_index: None,
+            text_open: false,
+            text: String::new(),
+            tool_order: Vec::new(),
+            tools: HashMap::new(),
+            finish_reason: String::new(),
+            usage: None,
+            errored: false,
+            done: false,
+        }
+    }
+
+    fn start_events(&mut self) -> Vec<(String, Value)> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        vec![
+            (
+                "message_start".to_string(),
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": self.message_id.clone(),
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model.clone(),
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    }
+                }),
+            ),
+            ("ping".to_string(), json!({"type": "ping"})),
+        ]
+    }
+
+    fn has_tool(&self) -> bool {
+        self.tools.values().any(|t| t.opened)
+    }
+
+    fn stop_reason(&self) -> &'static str {
+        // 🔴 只要有工具调用就必须是 tool_use：部分上游在返回 tool_calls 时仍给
+        // finish_reason=stop，照搬会让 Claude Code 认为「这轮已结束」直接收工。
+        if self.has_tool() {
+            return "tool_use";
+        }
+        match self.finish_reason.as_str() {
+            "length" => "max_tokens",
+            "tool_calls" | "function_call" => "tool_use",
+            "content_filter" => "refusal",
+            _ => "end_turn",
+        }
+    }
+
+    fn anthropic_usage(&self) -> Value {
+        anthropic_usage_from(self.usage.as_ref())
+    }
+
+    fn ingest_tool(&mut self, idx: i64, id: &str, name: &str, args: &str) -> Vec<(String, Value)> {
+        let mut events = Vec::new();
+        if !self.tools.contains_key(&idx) {
+            self.tools.insert(idx, AnthropicToolState::default());
+            self.tool_order.push(idx);
+        }
+        let tb = self.tools.get_mut(&idx).expect("tool state just inserted");
+        if tb.id.is_empty() && !id.is_empty() {
+            tb.id = id.to_string();
+        }
+        if tb.name.is_empty() && !name.is_empty() {
+            tb.name = name.to_string();
+        }
+        if !args.is_empty() {
+            tb.args.push_str(args);
+        }
+        if !tb.opened && !tb.name.is_empty() {
+            let index = self.next_index;
+            self.next_index += 1;
+            tb.index = index;
+            tb.opened = true;
+            if tb.id.is_empty() {
+                tb.id = anthropic_new_id("toolu");
+            }
+            events.push((
+                "content_block_start".to_string(),
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tb.id.clone(),
+                        "name": tb.name.clone(),
+                        "input": {}
+                    }
+                }),
+            ));
+            if !tb.args.is_empty() {
+                events.push((
+                    "content_block_delta".to_string(),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tb.args.clone()
+                        }
+                    }),
+                ));
+            }
+        } else if tb.opened && !args.is_empty() {
+            events.push((
+                "content_block_delta".to_string(),
+                json!({
+                    "type": "content_block_delta",
+                    "index": tb.index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": args
+                    }
+                }),
+            ));
+        }
+        events
+    }
+
+    fn feed(&mut self, frame: &Value) -> Vec<(String, Value)> {
+        let mut events = Vec::new();
+        if let Some(err) = frame.get("error") {
+            self.errored = true;
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream error");
+            events.push((
+                "error".to_string(),
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg}
+                }),
+            ));
+            return events;
+        }
+        if let Some(m) = frame.get("model").and_then(Value::as_str) {
+            if !m.is_empty() {
+                self.model = m.to_string();
+            }
+        }
+        if let Some(u) = frame.get("usage") {
+            if u.is_object() {
+                self.usage = Some(u.clone());
+            }
+        }
+        let Some(choice) = frame
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        else {
+            return events;
+        };
+
+        if let Some(delta) = choice.get("delta") {
+            if let Some(t) = delta.get("content").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    if !self.text_open {
+                        let index = self.next_index;
+                        self.next_index += 1;
+                        self.text_index = Some(index);
+                        self.text_open = true;
+                        events.push((
+                            "content_block_start".to_string(),
+                            json!({
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        ));
+                    }
+                    self.text.push_str(t);
+                    let index = self.text_index.unwrap_or(0);
+                    events.push((
+                        "content_block_delta".to_string(),
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "text_delta", "text": t}
+                        }),
+                    ));
+                }
+            }
+            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tc in tcs {
+                    let idx = tc.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    let func = tc.get("function");
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = func
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let args = func
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if id.is_empty() && name.is_empty() && args.is_empty() {
+                        continue;
+                    }
+                    events.extend(self.ingest_tool(idx, id, name, args));
+                }
+            }
+            // 旧式 function_call（没有 index）也兼容。
+            if let Some(fc) = delta.get("function_call") {
+                let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = fc.get("arguments").and_then(Value::as_str).unwrap_or("");
+                if !name.is_empty() || !args.is_empty() {
+                    events.extend(self.ingest_tool(0, "", name, args));
+                }
+            }
+        }
+        if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+            if !fr.is_empty() {
+                self.finish_reason = fr.to_string();
+            }
+        }
+        events
+    }
+
+    fn finish(&mut self) -> Vec<(String, Value)> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        if self.errored {
+            return Vec::new();
+        }
+        let mut events = self.start_events();
+        // Anthropic 的 content 不允许空数组；空响应补一个空 text 块。
+        if !self.text_open && !self.has_tool() {
+            let index = self.next_index;
+            self.next_index += 1;
+            self.text_index = Some(index);
+            self.text_open = true;
+            events.push((
+                "content_block_start".to_string(),
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ));
+        }
+        if self.text_open {
+            if let Some(index) = self.text_index {
+                events.push((
+                    "content_block_stop".to_string(),
+                    json!({"type": "content_block_stop", "index": index}),
+                ));
+            }
+            self.text_open = false;
+        }
+        for key in &self.tool_order {
+            if let Some(tb) = self.tools.get_mut(key) {
+                if tb.opened && !tb.stopped {
+                    tb.stopped = true;
+                    events.push((
+                        "content_block_stop".to_string(),
+                        json!({"type": "content_block_stop", "index": tb.index}),
+                    ));
+                }
+            }
+        }
+        events.push((
+            "message_delta".to_string(),
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": self.stop_reason(),
+                    "stop_sequence": null
+                },
+                // 上游的 input_tokens 只有流末才拿得到（message_start 已发出），
+                // 所以这里并列给出完整 usage；CCH 的解析也是 message_delta 优先。
+                "usage": self.anthropic_usage()
+            }),
+        ));
+        events.push((
+            "message_stop".to_string(),
+            json!({"type": "message_stop"}),
+        ));
+        events
+    }
+
+    /// 非流式：把累积状态渲染成一条 Anthropic message。
+    fn build_message(&self) -> Value {
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(json!({"type": "text", "text": self.text.clone()}));
+        }
+        for key in &self.tool_order {
+            let Some(tb) = self.tools.get(key) else {
+                continue;
+            };
+            if !tb.opened && tb.name.is_empty() {
+                continue;
+            }
+            let input = serde_json::from_str::<Value>(&tb.args)
+                .unwrap_or_else(|_| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tb.id.clone(),
+                "name": tb.name.clone(),
+                "input": input
+            }));
+        }
+        if content.is_empty() {
+            content.push(json!({"type": "text", "text": ""}));
+        }
+        json!({
+            "id": self.message_id.clone(),
+            "type": "message",
+            "role": "assistant",
+            "model": self.model.clone(),
+            "content": content,
+            "stop_reason": self.stop_reason(),
+            "stop_sequence": null,
+            "usage": self.anthropic_usage(),
+        })
+    }
+}
+
+fn anthropic_usage_num(v: &Value, key: &str) -> i64 {
+    v.get(key)
+        .and_then(|x| {
+            x.as_i64().or_else(|| x.as_f64().map(|f| f as i64))
+        })
+        .unwrap_or(0)
+}
+
+fn anthropic_usage_from(usage: Option<&Value>) -> Value {
+    let fallback = Value::Object(Default::default());
+    let u = usage.unwrap_or(&fallback);
+    let input = {
+        let p = anthropic_usage_num(u, "prompt_tokens");
+        if p > 0 {
+            p
+        } else {
+            anthropic_usage_num(u, "input_tokens")
+        }
+    };
+    let output = {
+        let c = anthropic_usage_num(u, "completion_tokens");
+        if c > 0 {
+            c
+        } else {
+            anthropic_usage_num(u, "output_tokens")
+        }
+    };
+    let cache_read = {
+        let direct = anthropic_usage_num(u, "cache_read_input_tokens");
+        if direct > 0 {
+            direct
+        } else {
+            let flat = anthropic_usage_num(u, "cached_tokens");
+            if flat > 0 {
+                flat
+            } else {
+                u.get("prompt_tokens_details")
+                    .map(|d| anthropic_usage_num(d, "cached_tokens"))
+                    .unwrap_or(0)
+            }
+        }
+    };
+    json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "cache_creation_input_tokens": anthropic_usage_num(u, "cache_creation_input_tokens"),
+        "cache_read_input_tokens": cache_read,
+    })
+}
+
+/// 读内部 chat 的 SSE，逐帧转成 Anthropic SSE。
+async fn anthropic_sse_pump<S, E>(
+    mut upstream: S,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    model: String,
+) where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut st = AnthropicStream::new(model);
+    for (event, data) in st.start_events() {
+        if tx
+            .send(Ok(anthropic_event_bytes(&event, &data)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let mut tail = String::new();
+    'outer: while let Some(item) = upstream.next().await {
+        let chunk = match item {
+            Ok(c) => c,
+            Err(e) => {
+                let data = json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": e.to_string()}
+                });
+                let _ = tx
+                    .send(Ok(anthropic_event_bytes("error", &data)))
+                    .await;
+                return;
+            }
+        };
+        tail.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = tail.find("\n\n") {
+            let event = tail[..idx].to_string();
+            tail.drain(..idx + 2);
+            let mut data = String::new();
+            for line in event.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data.push_str(rest.trim_start());
+                }
+            }
+            if data.is_empty() {
+                continue;
+            }
+            if data.trim() == "[DONE]" {
+                break 'outer;
+            }
+            let Ok(frame) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let events = st.feed(&frame);
+            let has_error = events.iter().any(|(name, _)| name == "error");
+            for (name, value) in events {
+                if tx
+                    .send(Ok(anthropic_event_bytes(&name, &value)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if has_error {
+                return;
+            }
+        }
+    }
+
+    for (event, data) in st.finish() {
+        let _ = tx
+            .send(Ok(anthropic_event_bytes(&event, &data)))
+            .await;
+    }
+}
+
+/// 非流式：把内部 chat 的 SSE 聚合成一条 Anthropic message。
+async fn anthropic_aggregate<S, E>(mut upstream: S, model: &str) -> Result<Value, String>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut st = AnthropicStream::new(model.to_string());
+    let mut tail = String::new();
+    while let Some(item) = upstream.next().await {
+        let chunk = item.map_err(|e| e.to_string())?;
+        tail.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = tail.find("\n\n") {
+            let event = tail[..idx].to_string();
+            tail.drain(..idx + 2);
+            let mut data = String::new();
+            for line in event.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data.push_str(rest.trim_start());
+                }
+            }
+            if data.is_empty() || data.trim() == "[DONE]" {
+                continue;
+            }
+            let Ok(frame) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let events = st.feed(&frame);
+            if let Some((_, value)) = events.iter().find(|(name, _)| name == "error") {
+                let msg = value
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream error")
+                    .to_string();
+                return Err(msg);
+            }
+        }
+    }
+    Ok(st.build_message())
+}
+
+fn anthropic_error(status: StatusCode, message: &str) -> Response {
+    let ty = match status.as_u16() {
+        401 | 403 => "authentication_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        413 => "request_too_large",
+        s if (400..500).contains(&s) => "invalid_request_error",
+        _ => "api_error",
+    };
+    (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": {"type": ty, "message": message}
+        })),
+    )
+        .into_response()
+}
+
+fn openai_error_message(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "upstream error".to_string();
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(m) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+        {
+            if !m.is_empty() {
+                return m.to_string();
+            }
+        }
+        if let Some(m) = v.get("message").and_then(Value::as_str) {
+            if !m.is_empty() {
+                return m.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn with_degraded_value(mut resp: Response, value: Option<HeaderValue>) -> Response {
+    if let Some(v) = value {
+        resp.headers_mut().insert("x-wb-switch-degraded", v);
+    }
+    resp
+}
+
+/// `POST /v1/messages` —— Anthropic Messages API 兼容入口。
+///
+/// 请求翻译成 OpenAI chat 后直接复用 [`chat_completions_inner`]，账号池、冷却、
+/// 重试、用量统计与版本防火墙全部沿用；响应再翻译回 Anthropic 形态。
+async fn anthropic_messages(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(incoming): Json<Value>,
+) -> Response {
+    if !check_auth(&headers, &st.endpoint.api_key) {
+        return anthropic_error(StatusCode::UNAUTHORIZED, "invalid api key");
+    }
+    // 调试落盘（开关文件控制）：Claude Code 的完整 system prompt 与转换结果对照。
+    debug_dump(
+        "last-anthropic-request.json",
+        &serde_json::to_string_pretty(&incoming).unwrap_or_else(|_| "{}".to_string()),
+    );
+    let want_stream = incoming
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let openai = match anthropic_to_openai(&incoming) {
+        Ok(v) => v,
+        Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e),
+    };
+    let model = openai
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("deepseek-v4-flash")
+        .to_string();
+
+    // 内部始终走流式：现有 aggregate 会丢 tool_calls 与真实 finish_reason，
+    // 非流式客户端由本函数自己聚合。
+    let mut inner_body = openai;
+    inner_body["stream"] = json!(true);
+
+    let resp = chat_completions_inner(&st, &headers, inner_body).await;
+    let status = resp.status();
+    let degraded = resp.headers().get("x-wb-switch-degraded").cloned();
+    if !status.is_success() {
+        let body = axum::body::to_bytes(resp.into_body(), MAX_REQUEST_BODY)
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&body);
+        let out = anthropic_error(status, &openai_error_message(&text));
+        return with_degraded_value(out, degraded);
+    }
+
+    let stream = Box::pin(resp.into_body().into_data_stream());
+    if want_stream {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let pump_model = model.clone();
+        tokio::spawn(async move {
+            anthropic_sse_pump(stream, tx, pump_model).await;
+        });
+        let body = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let out = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream; charset=utf-8")
+            .header("Cache-Control", "no-cache")
+            .header("X-Accel-Buffering", "no")
+            .body(axum::body::Body::from_stream(body))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        with_degraded_value(out, degraded)
+    } else {
+        let out = match anthropic_aggregate(stream, &model).await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => anthropic_error(StatusCode::BAD_GATEWAY, &e),
+        };
+        with_degraded_value(out, degraded)
+    }
+}
+
+/// `POST /v1/messages/count_tokens` —— 本地估算（上游没有该接口）。
+async fn anthropic_count_tokens(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(incoming): Json<Value>,
+) -> Response {
+    if !check_auth(&headers, &st.endpoint.api_key) {
+        return anthropic_error(StatusCode::UNAUTHORIZED, "invalid api key");
+    }
+    let tokens = estimate_anthropic_input_tokens(&incoming);
+    Json(json!({"input_tokens": tokens})).into_response()
+}
+
 /// `/status` —— 报告**本入口**的情况：它是哪一版、监听在哪、这一版有哪些号。
 async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
     let allowed = &st.endpoint.accounts;
@@ -2363,6 +3527,8 @@ fn router(st: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/status", get(proxy_status))
         .route("/usage-stats", get(usage_stats))
         // 必须在 with_state 之前挂：layer 只对「它之前注册的路由」生效。
@@ -2410,7 +3576,7 @@ async fn run_endpoint_until(
         }
     };
     println!(
-        "[反代] {} 已启动 http://{addr}  (POST /v1/chat/completions)",
+        "[反代] {} 已启动 http://{addr}  (POST /v1/chat/completions, POST /v1/messages)",
         edition.label()
     );
     let _ = ready.send(Ok(()));
@@ -3260,5 +4426,306 @@ mod tests {
     fn parse_model_ids_raw_returns_empty_when_nothing() {
         assert!(parse_model_ids_raw(&json!({})).is_empty());
         assert!(parse_model_ids_raw(&json!({"data": {"agents": []}})).is_empty());
+    }
+
+    // ------------------------------------------------------------ Anthropic 兼容层
+
+    #[test]
+    fn anthropic_request_translates_system_tools_and_tool_result() {
+        let req = json!({
+            "model": "deepseek-v4.1-flash[1M]",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "sys1"},
+                {"type": "text", "text": "sys2"}
+            ],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "let me check"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                     "input": {"city": "杭州"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": [{"type": "text", "text": "sunny"}]},
+                    {"type": "text", "text": "继续"}
+                ]}
+            ],
+            "tools": [{
+                "name": "get_weather",
+                "description": "weather",
+                "input_schema": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "stop_sequences": ["END"]
+        });
+
+        let out = anthropic_to_openai(&req).unwrap();
+        assert_eq!(out["model"], "deepseek-v4.1-flash");
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "sys1sys2");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "get_weather");
+        let args: Value =
+            serde_json::from_str(msgs[2]["tool_calls"][0]["function"]["arguments"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(args["city"], "杭州");
+        // tool 消息必须先于同批 user 文本
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "toolu_1");
+        assert_eq!(msgs[3]["content"], "sunny");
+        assert_eq!(msgs[4]["role"], "user");
+        assert_eq!(msgs[4]["content"], "继续");
+
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(out["tool_choice"]["function"]["name"], "get_weather");
+        assert_eq!(out["stop"][0], "END");
+        assert_eq!(out["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn anthropic_tool_error_is_marked_and_image_becomes_data_url() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": "boom"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "AAA"
+                }}
+            ]}]
+        });
+        let out = anthropic_to_openai(&req).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["content"], "[tool_error] boom");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(
+            msgs[1]["content"][0]["image_url"]["url"],
+            "data:image/jpeg;base64,AAA"
+        );
+    }
+
+    fn stream_frame(delta: Value, finish: &str) -> Value {
+        json!({
+            "model": "m",
+            "choices": [{"delta": delta, "finish_reason": finish}]
+        })
+    }
+
+    #[test]
+    fn anthropic_stream_emits_text_and_tool_use_and_forces_stop_reason() {
+        let frames = vec![
+            stream_frame(json!({"content": "Hello"}), ""),
+            stream_frame(
+                json!({"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":"}
+                }]}),
+                "",
+            ),
+            stream_frame(
+                json!({"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": "\"杭州\"}"}
+                }]}),
+                "",
+            ),
+            json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                          "cache_read_input_tokens": 3}
+            }),
+        ];
+
+        let mut st = AnthropicStream::new("m".to_string());
+        let mut events = st.start_events();
+        for f in &frames {
+            events.extend(st.feed(f));
+        }
+        events.extend(st.finish());
+
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"message_start"));
+        assert!(names.contains(&"content_block_start"));
+        assert!(names.contains(&"content_block_delta"));
+        assert!(names.contains(&"message_stop"));
+
+        let delta = events
+            .iter()
+            .find(|(n, _)| n == "message_delta")
+            .map(|(_, v)| v)
+            .unwrap();
+        // 上游给的是 stop，但有工具调用时必须报 tool_use。
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+        assert_eq!(delta["usage"]["input_tokens"], 10);
+        assert_eq!(delta["usage"]["output_tokens"], 5);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 3);
+
+        let msg = st.build_message();
+        assert_eq!(msg["stop_reason"], "tool_use");
+        assert_eq!(msg["content"][0]["type"], "text");
+        assert_eq!(msg["content"][0]["text"], "Hello");
+        assert_eq!(msg["content"][1]["type"], "tool_use");
+        assert_eq!(msg["content"][1]["name"], "get_weather");
+        assert_eq!(msg["content"][1]["input"]["city"], "杭州");
+    }
+
+    #[test]
+    fn anthropic_stream_empty_response_gets_empty_text_block() {
+        let mut st = AnthropicStream::new("m".to_string());
+        let _ = st.start_events();
+        let events = st.finish();
+        assert!(events.iter().any(|(n, v)| {
+            n == "content_block_start" && v["content_block"]["type"] == "text"
+        }));
+        assert!(events.iter().any(|(n, _)| n == "message_stop"));
+        let msg = st.build_message();
+        assert_eq!(msg["content"][0]["type"], "text");
+        assert_eq!(msg["content"][0]["text"], "");
+    }
+
+    #[test]
+    fn anthropic_stream_handles_legacy_function_call() {
+        let frame = stream_frame(
+            json!({"function_call": {"name": "foo", "arguments": "{\"a\":1}"}}),
+            "stop",
+        );
+        let mut st = AnthropicStream::new("m".to_string());
+        let _ = st.start_events();
+        let _ = st.feed(&frame);
+        let _ = st.finish();
+        let msg = st.build_message();
+        assert_eq!(msg["stop_reason"], "tool_use");
+        assert_eq!(msg["content"][0]["type"], "tool_use");
+        assert_eq!(msg["content"][0]["name"], "foo");
+        assert_eq!(msg["content"][0]["input"]["a"], 1);
+    }
+
+    #[test]
+    fn anthropic_stream_supports_multiple_tool_calls() {
+        let frames = vec![
+            stream_frame(
+                json!({"tool_calls": [{
+                    "index": 0, "id": "c0",
+                    "function": {"name": "first_tool", "arguments": "{}"}
+                }]}),
+                "",
+            ),
+            stream_frame(
+                json!({"tool_calls": [{
+                    "index": 1, "id": "c1",
+                    "function": {"name": "second_tool", "arguments": "{\"x\":2}"}
+                }]}),
+                "tool_calls",
+            ),
+        ];
+        let mut st = AnthropicStream::new("m".to_string());
+        let _ = st.start_events();
+        for f in &frames {
+            let _ = st.feed(f);
+        }
+        let _ = st.finish();
+        let msg = st.build_message();
+        assert_eq!(msg["stop_reason"], "tool_use");
+        let content = msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["name"], "first_tool");
+        assert_eq!(content[1]["name"], "second_tool");
+        assert_eq!(content[1]["input"]["x"], 2);
+    }
+
+    #[test]
+    fn anthropic_model_suffix_and_count_tokens() {
+        assert_eq!(
+            normalize_anthropic_model("deepseek-v4.1-flash[1M]"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            normalize_anthropic_model("deepseek-v4.1-flash[1m]"),
+            "deepseek-v4.1-flash"
+        );
+        let body = json!({
+            "system": "123456",
+            "messages": [{"role": "user", "content": "123456"}]
+        });
+        // 估算会把 role 之类的短字符串也算进去，只要求量级合理。
+        assert!(estimate_anthropic_input_tokens(&body) >= 4);
+    }
+
+    #[test]
+    fn anthropic_auth_accepts_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("sk-x"));
+        assert!(check_auth(&headers, "sk-x"));
+        assert!(!check_auth(&headers, "sk-y"));
+    }
+
+    #[test]
+    fn strips_claude_code_billing_and_env_markers() {
+        let text = "x-anthropic-billing-header: cc_version=2.1; cc_entrypoint=sdk-cli;\n\
+                    You are a Claude agent.\n\n\
+                    # Environment\nYou have been invoked in the following environment: \n\
+                    - Platform: win32\n- Shell: bash";
+        assert_eq!(
+            strip_claude_code_markers(text),
+            "You are a Claude agent."
+        );
+        assert_eq!(
+            strip_claude_code_markers("You are Claude Code, Anthropic's official CLI for Claude."),
+            ""
+        );
+        assert_eq!(
+            strip_claude_code_markers(
+                "You are Claude Code, Anthropic's official CLI for Claude. Be terse."
+            ),
+            "Be terse."
+        );
+    }
+
+    #[test]
+    fn anthropic_mid_system_is_merged_into_leading_system() {
+        let req = json!({
+            "model": "m",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc; entry=sdk;"},
+                {"type": "text", "text": "core prompt"}
+            ],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "extra reminder"},
+                {"role": "assistant", "content": "ok"}
+            ]
+        });
+        let out = anthropic_to_openai(&req).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        let sys = msgs[0]["content"].as_str().unwrap();
+        assert!(sys.contains("core prompt"));
+        assert!(sys.contains("extra reminder"));
+        assert!(!sys.contains("x-anthropic-billing-header"));
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn upstream_body_passes_tool_choice_stop_and_top_k() {
+        let incoming = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "auto",
+            "stop": ["END"],
+            "top_k": 5
+        });
+        let body = build_upstream_body(&incoming, Edition::Domestic, &mut Vec::new());
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["stop"][0], "END");
+        assert_eq!(body["top_k"], 5);
     }
 }

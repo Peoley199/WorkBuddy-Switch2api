@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-switch2api",
   "private": true,
-  "version": "1.6.16",
+  "version": "1.6.17",
   "author": "cv-superding",
   "license": "MIT",
   "homepage": "https://github.com/cv-superding/WorkBuddy-Switch2api",
@@ -22,8 +22,8 @@
     "build:demo": "tsc && VITE_DEMO_MODE=1 VITE_PAGES_DEMO=1 vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:app": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=wb-switch-dev npm run tauri build -- --debug --bundles app; sh scripts/fix-app.sh",
-    "build:app:release": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=wb-switch-dev npm run tauri build -- --bundles app; sh scripts/fix-app.sh"
+    "build:app": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key.password\")\" npm run tauri build -- --debug --bundles app; sh scripts/fix-app.sh",
+    "build:app:release": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key.password\")\" npm run tauri build -- --bundles app; sh scripts/fix-app.sh"
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.3.0",
