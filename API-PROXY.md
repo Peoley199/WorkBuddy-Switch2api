@@ -252,6 +252,122 @@ x-wb-switch-degraded: system-env
 > 取舍：客户端不保证带 system（探针、简单脚本、部分 OpenAI 兼容客户端都不带）。
 > 多一句无害的 system，远好过整条请求被 400 打回。
 
+### 11128 的第三种触发：`role: "developer"`（两版都拦）
+
+DSH 这类按较新 OpenAI 规范实现的客户端，会把系统提示放在 `developer` 角色里
+（o1 起引入的 `system` 别名）。上游**不认**这个角色：
+
+```
+{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
+```
+
+注意它和第二种的**文案不同** —— 同为 11128，含义完全不同：
+
+| `msg` | 含义 | 该改什么 |
+|---|---|---|
+| `first message is not system prompt` | 首条不是 system | 补一条 system |
+| `Illegal API invocation from an unapproved channel` | **负载**被判成非官方客户端 | 改请求体（角色/身份声明） |
+| `request illegal` | **调用方**被判成非官方客户端 | 改出站头 / 等上游放行 |
+
+2026-10-21 用假模型 oracle 做单变量对照（国内版 `codebuddy.cn` 与
+`copilot.tencent.com` 表现一致）：
+
+| `messages[0].role` | 结果 |
+|---|---|
+| `system` | ✅ `11102`（过了渠道校验） |
+| `developer`（任意位置，不只首条） | ❌ `11128 unapproved channel` |
+| `Developer` / `DEVELOPER` / `" developer"` / `"developer "` | ✅ `11102` |
+
+⇒ 上游做的是**精确字符串比对**，不是语义判断。所以只需把 `developer` 改名成
+`system` 即可，**不需要**做大小写归一。
+
+**反代处理**：`sanitize_messages` 把 `role == "developer"` 改写为 `system`
+（无损，语义等价），并把 `developer-role` 记进 `degraded`。
+必须在「system 环境注入净化」**之前**做，这样开发者消息也能吃到净化。
+
+> ⚠️ 2026-10-17 之前，上游对这条判得很死；同一套请求头、同一个号，
+> `[system, developer, user]` → 11128，`[system, system, user]` → 200。
+> 复现时务必用假模型名，避免把额度浪费在必然失败的请求上。
+
+### 2026-10-21 复测：环境注入规则已放宽
+
+上面第一节说的 `gitStatus:` 环境注入块，**2026-10-21 复测已不再触发**：
+
+| 请求 | 结果 |
+|---|---|
+| 长提示词（30 KB）+ `gitStatus: …` | ✅ `11102` 通过 |
+| 长提示词 + `Current branch:` / `Main branch:` | ✅ `11102` 通过 |
+| 长提示词 + 第三方身份词（DeepSeek Harness / Claude Code / Cursor / ZCode / Codex） | ✅ `11102` 通过 |
+| 长提示词 + `<\|im_start\|>system:` 特殊 token | ✅ `11102` 通过 |
+
+结论：**上游的渠道校验规则会随策略调整**，不要把它当静态常量。
+`strip_env_injection` 保留（对旧行为仍有效、且属无害降级），但**不能只依赖它**。
+
+### 11128 的第四种触发：system 里的第三方 agent 身份声明（社区反馈）
+
+2026-10-21 群友反馈：腾讯风控会识别系统提示词里固定的
+**`DeepSeek Harness`** 身份声明，命中即 11128 `unapproved channel`；
+DSH 自带原生开关 **`includeHarnessIdentity`**，关掉它（或把那段声明删掉）即可恢复。
+
+本地在国内版上用短/长提示词都**没能复现**这条，推测该规则只作用于**国际版**
+（而国际版当时对本机是全量 `request illegal`，无法做 A/B 对照）。
+
+**反代处理（v1.6.20）**：不擅改默认请求，只在**自愈重试**里抹（见下节）。
+
+### 自愈重试（v1.6.20）
+
+收到 `unapproved channel`（负载变体）时，先用**最大强度归一化**重造一份请求再试一次：
+
+1. 角色收敛 —— 只保留 `system` / `user` / `assistant` / `tool`，其余按 `system` 处理
+2. 摘掉 `messages[*].name` —— 部分客户端在这里写 agent 名，属身份声明
+3. `content` 数组拍平成字符串 —— 避开多块解析差异
+4. 抹掉 system 里的 `DeepSeek Harness`（大小写不敏感，含连字符写法）
+
+只做一次，避免死循环；改动记进 `degraded` 的 `aggressive-normalize`。
+`request illegal`（客户端身份变体）**不**走自愈 —— 改负载对它无效。
+
+> 设计取舍：默认路径绝不改写用户提示词内容（那是用户资产），
+> 只有在「已经被拦、反正也发不出去」的前提下才做破坏性归一化。
+
+## 标准参数透传与 `tool_choice` 归一化（v1.6.20）
+
+`build_upstream_body` 以前只转 `model` / `messages` / `stream` /
+`temperature` / `top_p` / `max_tokens` / `tools`，**其余全被静默丢弃**。
+表现为「客户端设了等于没设」，且没有任何日志。
+
+2026-10-21 用假模型 oracle 逐个验证，下面这些上游**全部接受**，已改为原样透传：
+
+```
+temperature  top_p  max_tokens  stop  frequency_penalty  presence_penalty
+response_format  parallel_tool_calls  seed  stream_options  user
+logprobs  top_logprobs
+```
+
+### `tool_choice` 必须归一化
+
+上游**只吃字符串**。OpenAI 规范允许对象形式，直接发过去会：
+
+```
+{"code":11101,"msg":"Unmarshal chat params failed with error: json: cannot unmarshal object …"}
+```
+
+注意这是 **11101**（参数解析失败），发生在渠道校验**之前** —— 用假模型 oracle 看到
+11101 时，别误以为是模型问题。
+
+而**函数名字符串 `"f"` 上游是接受的**，所以对象形式可以**无损降级**：
+
+| 入站 `tool_choice` | 发上游 |
+|---|---|
+| `{"type":"function","function":{"name":"f"}}` | `"f"` |
+| `{"type":"auto"}` / `{"type":"none"}` / `{"type":"required"}` | 同名字符串 |
+| `{"type":"any"}`（Anthropic） | `"required"` |
+| `{"type":"tool","name":"g"}`（Anthropic） | `"g"` |
+| `{"type":"allowed",…}` | `"auto"` |
+| 认不出的形态 | **丢弃**（发过去只会 400），记 `tool-choice-dropped` |
+| 字符串 | 原样透传 |
+
+`normalize_tool_choice()` 负责这件事；发生改写时 `degraded` 记 `tool-choice`。
+
 ## 思考强度（`reasoning_effort`）
 
 **反代以前把这些参数整个丢掉** —— `build_upstream_body` 只转
