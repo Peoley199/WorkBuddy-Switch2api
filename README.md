@@ -82,6 +82,10 @@ docker compose up -d --build
 
 细节（环境变量、端口、反代怎么对外、容器里哪些功能用不了、安全说明）见 **[docs/DOCKER.md](docs/DOCKER.md)**。
 
+上游怪癖与排障记录：反代侧的行为差异、`11128` 各种变体的对照表、以及「用假模型名当探针」
+的复现手法，见 **[API-PROXY.md](API-PROXY.md)**；一次性排查的完整取证过程见
+**[docs/notes/](docs/notes/)**（已脱敏）。
+
 ### 桌面 App
 
 前往 [GitHub Releases](https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest) 下载对应平台的安装包：
