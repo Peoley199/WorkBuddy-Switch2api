@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use chrono::{FixedOffset, Local, NaiveDateTime, TimeZone};
 
-use super::account::{load_accounts, upsert_account};
+use super::account::{is_envelope, load_accounts, upsert_account};
 use super::config::{home_dir, now_ms};
 use super::edition::{edition_of, Edition};
 use super::refresh::refresh_account_token;
@@ -42,13 +42,15 @@ const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
 
-/// 上游「渠道校验」软拦截（`11128`）的最大重试次数。
+/// 上游「渠道校验」（`11128`）的最大重试次数。
 ///
-/// 🔴 这个码**不是请求内容的问题，也不是账号的问题**：同一个 payload、同一个号、
-/// 同一套出站头，实测连发 12 次全部通过（假 model）／连发 6 次全部 200（真 model）。
-/// 上游是**间歇**拦的，而且它自己的文案就在邀请重发
-/// （`displayMsg.zh = "请求被拦截，请重新发送"`）。
-/// 所以遇到它**先重试**，重试仍失败才当账号故障处理。
+/// 这个码**不是账号的问题**（同号读接口 200、打 chat 端点 11128），也**不一定**是
+/// 请求内容的问题。历史上它表现为间歇软拦截 —— 上游自己的文案就在邀请重发
+/// （`displayMsg.zh = "请求被拦截，请重新发送"`），所以值得重试一两次。
+///
+/// 🔴 但 2026-10-17 起国际版实测是**持续**拦截（5/5 号、4 种 UA、合规最小请求全挂），
+/// 重试只是把延迟拉长。所以重试次数保持很小、且**重试耗尽后绝不冷却账号**
+/// （理由与判据见 4xx 分支里 `is_channel_block` 那段注释）。
 const MAX_CHANNEL_RETRY: usize = 2;
 
 /// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
@@ -75,6 +77,194 @@ const REASONING_PASSTHROUGH: &[&str] = &[
     "enable_thinking",
     "chat_template_kwargs",
 ];
+
+/// 标准采样 / 输出控制参数，**原样透传**。
+///
+/// 🔴 这些以前全被丢掉（`build_upstream_body` 只转 model/messages/stream/
+/// temperature/top_p/max_tokens/tools），后果是「客户端设了等于没设」：
+/// JSON 模式不生效、stop 序列不生效、`seed` 不可复现、Agent 无法禁止并行工具调用。
+///
+/// 实测（2026-10-21，国内版 `codebuddy.cn`，假模型 oracle：
+/// 过校验 → `11102 model not found`）：下面每一个上游都接受，无一报 11101。
+/// 所以丢弃它们没有收益，只是静默降级。
+const PASSTHROUGH_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "stop",
+    "frequency_penalty",
+    "presence_penalty",
+    "response_format",
+    "parallel_tool_calls",
+    "seed",
+    "stream_options",
+    "user",
+    "logprobs",
+    "top_logprobs",
+];
+
+/// 需要从 system prompt 里抹掉的**第三方 agent 身份声明**。
+///
+/// 社区实测（2026-10-21，群友反馈）：腾讯风控会识别系统提示词里固定的
+/// 「DeepSeek Harness」身份声明，命中就把整条请求判成 `11128 unapproved channel`；
+/// DSH 自带 `includeHarnessIdentity` 开关，关掉它（或把声明从提示词里删掉）即可恢复。
+///
+/// 🔴 只在**自愈重试**时抹（见 [`sanitize_messages_aggressive`]），默认路径不动：
+/// 用户自己写的 system prompt 内容不该被我们擅自改写。
+const IDENTITY_DECLARATIONS: &[&str] = &[
+    "DeepSeek Harness",
+    "deepseek-harness",
+    "DeepSeek-Harness",
+];
+
+/// 把 system 文本里的第三方身份声明替换成中性称呼（ASCII 大小写不敏感）。
+///
+/// 返回 `None` = 没有命中，调用方不必改动原串。
+///
+/// 实现按**字节**逐位比较、按 `char` 步进：既不破坏 UTF-8 边界，
+/// 也不需要为大小写转换预先做整串 lower（那样会改变字节偏移）。
+fn strip_identity_declarations(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut hit = false;
+    'outer: while i < bytes.len() {
+        for phrase in IDENTITY_DECLARATIONS {
+            let p = phrase.as_bytes();
+            if i + p.len() <= bytes.len()
+                && bytes[i..i + p.len()]
+                    .iter()
+                    .zip(p.iter())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                out.push_str("Assistant");
+                i += p.len();
+                hit = true;
+                continue 'outer;
+            }
+        }
+        // 未命中：按完整字符推进一步（保证落在 UTF-8 边界上）
+        let ch = text[i..].chars().next()?;
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if hit {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 最大强度归一化（11128 自愈重试用，见 [`build_upstream_body_ex`]）。
+///
+/// 上游对「负载是不是官方客户端发的」有一套**不公开**的规则，且会随策略变动：
+/// 2026-10-09 判环境注入块（`gitStatus:`）、2026-10-17 判 `developer` 角色，
+/// 2026-10-21 再测前者已放行、只剩后者。既然规则会漂，就留一条「全部收敛」的退路：
+/// 收到 `unapproved channel` 时用这个函数重造一份最保守的请求再试一次。
+///
+/// 三件事：
+/// 1. **角色收敛** —— 只保留 `system` / `user` / `assistant` / `tool`，
+///    其它一律按 `system` 处理（`developer` 及其它未知别名）。
+/// 2. **去掉 `name`** —— 部分客户端在这里写 agent 名，属于身份声明。
+/// 3. **内容块拍平** —— 数组 content 合并成一个字符串，避开多块解析差异。
+fn sanitize_messages_aggressive(messages: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    let mut touched = false;
+    for m in arr.iter_mut() {
+        // 1. 角色收敛
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("").to_string();
+        let mapped = match role.as_str() {
+            "system" | "user" | "assistant" | "tool" => None,
+            // developer 及其它未知角色 → system（语义最接近，且上游认识）
+            _ => Some("system"),
+        };
+        if let Some(new_role) = mapped {
+            m["role"] = Value::String(new_role.to_string());
+            touched = true;
+        }
+        // 2. 去掉 name
+        if m.as_object().map(|o| o.contains_key("name")).unwrap_or(false) {
+            if let Some(o) = m.as_object_mut() {
+                o.remove("name");
+            }
+            touched = true;
+        }
+        // 3. 内容块拍平成字符串
+        if let Some(parts) = m.get("content").and_then(Value::as_array) {
+            let flat: String = parts
+                .iter()
+                .filter_map(|p| {
+                    p.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| p.as_str())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            m["content"] = Value::String(flat);
+            touched = true;
+        }
+        // 4. 抹掉第三方 agent 身份声明（见 IDENTITY_DECLARATIONS）。
+        //    只对 system 生效 —— 用户消息里的同名词是正常内容，不该动。
+        if m.get("role").and_then(Value::as_str) == Some("system") {
+            if let Some(text) = m.get("content").and_then(Value::as_str) {
+                if let Some(cleaned) = strip_identity_declarations(text) {
+                    m["content"] = Value::String(cleaned);
+                    touched = true;
+                }
+            }
+        }
+    }
+    if touched {
+        degraded.push("aggressive-normalize".to_string());
+    }
+}
+
+/// 把 `tool_choice` 归一成上游认识的形式（**只吃字符串**）。
+///
+/// 🔴 OpenAI 规范里 `tool_choice` 允许对象：
+/// `{"type":"function","function":{"name":"f"}}`。
+/// 上游对这个对象形式直接 400：
+/// `11101 Unmarshal chat params failed with error: json: cannot unmarshal object …`
+/// （2026-10-21 实测）。而**函数名字符串 `"f"` 上游是接受的**，
+/// 所以对象形式可以无损降级成「函数名」——强制调用语义完整保留。
+///
+/// 返回 `None` = 无法安全转换，调用方应**丢弃**该字段（发过去只会 400）。
+fn normalize_tool_choice(v: &Value) -> Option<Value> {
+    match v {
+        // 字符串（"auto" / "none" / "required" / 函数名）上游原样接受。
+        Value::String(s) if !s.trim().is_empty() => Some(v.clone()),
+        Value::Object(map) => {
+            let ty = map.get("type").and_then(Value::as_str).unwrap_or("");
+            match ty {
+                // 指定函数 → 用函数名（上游接受的字符串形式，语义最接近）。
+                "function" => Some(
+                    map.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(|name| json!(name))
+                        .unwrap_or_else(|| json!("required")),
+                ),
+                "auto" | "none" | "required" => Some(json!(ty)),
+                // Anthropic 的 {"type":"any"} / {"type":"tool"} 语义
+                "any" => Some(json!("required")),
+                "tool" => map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|n| json!(n))
+                    .or_else(|| Some(json!("required"))),
+                // allowed_tools 之类：退化成 auto，别把请求打死。
+                "allowed" | "allowed_tools" => Some(json!("auto")),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
 /// 单次请求体上限。
 ///
 /// axum 默认只给 2 MB（`DEFAULT_LIMIT`），长上下文会话（几十万 token）序列化后
@@ -813,39 +1003,53 @@ fn strip_env_injection(text: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
-/// 上游的失败响应体是不是「渠道校验软拦截」（`11128`）。
+/// 上游的失败响应体是不是「渠道校验」拦截（`11128`）。
 ///
 /// 只看响应体里有没有这个码 / 这句 msg —— 上游把它包在 `message` 字符串里再套一层
 /// JSON，所以不能按结构化字段取，直接做子串匹配最稳。
 ///
-/// 视为**可重试**的理由见 [`MAX_CHANNEL_RETRY`]：它是间歇性的，且文案本身在让客户端重发。
-/// 判定成它之后**不要立刻冷却账号** —— 号是好的，冻它只会把整个账号池拖空。
+/// 判定成它之后**绝不能冷却账号** —— 号是好的（读接口照样 200），
+/// 冻它只会把整个账号池拖空。理由见 4xx 分支里的实测记录。
 fn is_channel_block(text: &str) -> bool {
     text.contains("11128") || text.contains("unapproved channel")
 }
 
-/// 解析上游「使用频率超限」（code 60004）响应，返回重置时刻（毫秒）。
+/// 在上游原文里扫第一个 `YYYY-MM-DD HH:MM:SS`（按 UTC+8 解释）。
 ///
-/// 上游体是双层 JSON：外层 `{"message":"{\"code\":60004,\"msg\":\"…将在
-/// 2026-10-17 11:46:56 UTC+8 重置…\"}"}`。直接在原文上抠关键字与时间串，
-/// 避免两层反序列化；时间格式固定为 `YYYY-MM-DD HH:MM:SS UTC+8`。
-/// 不是频率超限（或缺重置时间）返回 None，调用方走普通冷却。
+/// 🔴 **不用中文关键词定位**：上游的 JSON 会把中文转义成 `\uXXXX`，
+/// `contains("将在")` / `find("频率限制")` 这类判断在转义体上全线失效
+/// （v1.6.15 的解析就是这么失败的）。日期时间串是纯 ASCII，
+/// 在任何转义形式下都保持原样。
+fn find_reset_datetime(text: &str) -> Option<i64> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 19 {
+        return None;
+    }
+    let offset = FixedOffset::east_opt(8 * 3600)?;
+    for start in 0..=(chars.len() - 19) {
+        let candidate: String = chars[start..start + 19].iter().collect();
+        let b = candidate.as_bytes();
+        if b[4] != b'-' || b[7] != b'-' || b[10] != b' ' || b[13] != b':' || b[16] != b':' {
+            continue;
+        }
+        if let Ok(naive) = NaiveDateTime::parse_from_str(&candidate, "%Y-%m-%d %H:%M:%S") {
+            if let Some(dt) = offset.from_local_datetime(&naive).single() {
+                return Some(dt.timestamp_millis());
+            }
+        }
+    }
+    None
+}
+
+/// 解析上游「使用频率超限」响应，返回重置时刻（毫秒）。
+///
+/// 判定关键词保持 ASCII 优先：`60004` 是稳定错误码，数字不会被转义；
+/// 中文 `频率限制` 只作为补充（未转义时才有用）。
 fn rate_limit_reset_ms(text: &str) -> Option<i64> {
     if !(text.contains("60004") || text.contains("频率限制")) {
         return None;
     }
-    let idx = text.find("频率限制")?;
-    let tail = &text[idx..];
-    let at = tail.find("将在")?;
-    let tail = &tail[at + "将在".len()..];
-    let raw: String = tail
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take(19)
-        .collect();
-    let naive = NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
-    let offset = FixedOffset::east_opt(8 * 3600)?;
-    Some(offset.from_local_datetime(&naive).single()?.timestamp_millis())
+    find_reset_datetime(text)
 }
 
 /// 调试落盘开关：`~/.wb-switch/DEBUG_DUMP` **存在**时，把发往上游的真实请求体
@@ -997,6 +1201,20 @@ fn with_degraded_header(mut resp: Response, degraded: &[String]) -> Response {
 
 /// 把 OpenAI 入站体改写成上游形态（强制流式、去掉上游不认识的字段）。
 fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<String>) -> Value {
+    build_upstream_body_ex(incoming, edition, degraded, false)
+}
+
+/// `aggressive = true` 时启用**最大强度归一化**，用于 11128 自愈重试。
+///
+/// 只在上游以 `unapproved channel`（负载变体）打回后触发一次：
+/// 把角色收敛到上游认识的四类、去掉可能泄露第三方 agent 身份的 `name` 字段、
+/// 把内容块拍平成字符串。这些改动**都会改变请求形状**，所以不做默认行为。
+fn build_upstream_body_ex(
+    incoming: &Value,
+    edition: Edition,
+    degraded: &mut Vec<String>,
+    aggressive: bool,
+) -> Value {
     let model = incoming
         .get("model")
         .and_then(Value::as_str)
@@ -1004,23 +1222,36 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
         .to_string();
     let messages = incoming.get("messages").cloned().unwrap_or_else(|| json!([]));
     let mut sanitized = sanitize_messages(&messages, degraded);
+    if aggressive {
+        sanitize_messages_aggressive(&mut sanitized, degraded);
+    }
     ensure_leading_system(edition, &mut sanitized, degraded);
     let mut body = json!({
         "model": model,
         "messages": sanitized,
         "stream": true,
     });
-    if let Some(t) = incoming.get("temperature") {
-        body["temperature"] = t.clone();
-    }
-    if let Some(t) = incoming.get("top_p") {
-        body["top_p"] = t.clone();
-    }
-    if let Some(m) = incoming.get("max_tokens") {
-        body["max_tokens"] = m.clone();
+    // 标准采样 / 输出控制参数：上游全接受，原样透传（见 PASSTHROUGH_PARAMS）。
+    for key in PASSTHROUGH_PARAMS {
+        if let Some(v) = incoming.get(*key) {
+            body[*key] = v.clone();
+        }
     }
     if let Some(t) = incoming.get("tools") {
         body["tools"] = t.clone();
+    }
+    // 🔴 `tool_choice` 必须**归一化**后再发：上游只吃字符串，
+    // 收到 OpenAI 规范的对象形式会直接 11101（见 normalize_tool_choice）。
+    if let Some(tc) = incoming.get("tool_choice") {
+        match normalize_tool_choice(tc) {
+            Some(norm) => {
+                if norm != *tc {
+                    degraded.push("tool-choice".to_string());
+                }
+                body["tool_choice"] = norm;
+            }
+            None => degraded.push("tool-choice-dropped".to_string()),
+        }
     }
     // 🔴 思考强度：以前这里只转 model/messages/stream/temperature/top_p/max_tokens/tools，
     // 思考类字段**全被丢掉**，表现为「客户端调了推理等级、上游毫无反应、思考内容为空」。
@@ -2089,12 +2320,16 @@ async fn chat_completions(
     // 免得同一个 request id 被上游当成重复包直接判掉。
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
+    // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，
+    // 用最大强度归一化重造一份请求再试 —— 见 sanitize_messages_aggressive。
+    let mut self_healed = false;
+    let mut send_body = upstream_body.clone();
     let resp = loop {
         let mut req = client.post(chat_url(&acc));
         for (k, v) in chat_headers(&acc) {
             req = req.header(k, v);
         }
-        let r = match req.json(&upstream_body).send().await {
+        let r = match req.json(&send_body).send().await {
             Ok(r) => r,
             Err(e) => {
                 // 🔴 连接层失败：**不冷却账号**（原因见 MAX_TRANSPORT_RETRY）。
@@ -2125,15 +2360,36 @@ async fn chat_completions(
         }
         let raw_status = r.status();
         let text = r.text().await.unwrap_or_default();
-        if is_channel_block(&text) && channel_retry < MAX_CHANNEL_RETRY {
-            channel_retry += 1;
-            // 退避：按次数递增，给上游的间歇判定留出恢复窗口。
-            tokio::time::sleep(Duration::from_millis(300 * channel_retry as u64)).await;
-            eprintln!(
-                "[反代] 上游渠道校验拦下，第 {channel_retry}/{MAX_CHANNEL_RETRY} 次重试 \
-                 (model={model}, uid={uid})"
-            );
-            continue;
+        if is_channel_block(&text) {
+            // 🔴 先试「自愈」：`unapproved channel` 是**负载**被判成非官方客户端，
+            // 用最大强度归一化重造请求往往能直接过（`request illegal` 是客户端身份
+            // 变体，改负载没用，所以只对前者做）。只做一次，避免死循环。
+            if !self_healed && text.contains("unapproved channel") {
+                self_healed = true;
+                let mut heal_degraded: Vec<String> = Vec::new();
+                let healed = build_upstream_body_ex(&incoming, st.edition, &mut heal_degraded, true);
+                if healed != send_body {
+                    eprintln!(
+                        "[反代] 上游判负载不合规（11128 unapproved channel），启用最大强度\
+                         归一化重试 (model={model}, uid={uid}): {}",
+                        degraded_summary(&heal_degraded)
+                    );
+                    send_body = healed;
+                    degraded.extend(heal_degraded);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            }
+            if channel_retry < MAX_CHANNEL_RETRY {
+                channel_retry += 1;
+                // 退避：按次数递增，给上游的间歇判定留出恢复窗口。
+                tokio::time::sleep(Duration::from_millis(300 * channel_retry as u64)).await;
+                eprintln!(
+                    "[反代] 上游渠道校验拦下，第 {channel_retry}/{MAX_CHANNEL_RETRY} 次重试 \
+                     (model={model}, uid={uid})"
+                );
+                continue;
+            }
         }
         // 重试仍被拦、或本来就不是渠道校验的失败 → 才当账号/上游故障处理。
         debug_dump(
@@ -2149,11 +2405,21 @@ async fn chat_completions(
         // 与连接层失败是同一类误判，会让整池无谓地空掉。
         let status = StatusCode::from_u16(raw_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let account_name = meta.nickname.clone();
+        let edition_label = st.edition.label();
         // 🔴 60004 频率超限：按上游声明的重置时刻把**整个账号**暂停出池 ——
         // 120 秒的短冷却只会让它回池后立刻再 429，循环空转。同时给客户端一句
         // 人话：哪个账号、哪个模型、什么时候恢复、怎么继续用，
         // 替代之前那坨双层转义的原始 JSON。
-        if let Some(until_ms) = rate_limit_reset_ms(&text) {
+        // 429 是限流的通用状态码，不同上游的错误码不一定都是 60004；
+        // 「429 + 能解析出重置时间」同样按频率超限处理。
+        let rate_limited_until = rate_limit_reset_ms(&text).or_else(|| {
+            if raw_status.as_u16() == 429 {
+                find_reset_datetime(&text)
+            } else {
+                None
+            }
+        });
+        if let Some(until_ms) = rate_limited_until {
             // 长冷却记在**模型**键上：账号的其他模型仍可服务（上游自己也是
             // 这个口径 ——「您也可以切换其他模型继续使用」）。另外给一次账号级
             // 短冷却，把并发请求从「立刻又撞同一个失败号」里拉出来。
@@ -2185,12 +2451,26 @@ async fn chat_completions(
                 .into_response();
         }
         if raw_status.is_client_error() {
-            st.pool.mark_failed(&uid);
-            if is_channel_block(&text) {
+            // 🔴 11128 渠道校验**不能冷却账号**。
+            //
+            // 2026-10-17 实测（国际版 5 个号 + 国内版 3 个号，同 token 同 payload）：
+            // - 同一个号 `GET /v2/enterprises/personal/models` → 200（token 有效）
+            // - 同一个号 `POST /v2/chat/completions`         → 400 11128（每次都挂）
+            // - 换 4 种 User-Agent（含官方 WorkBuddy/5.6.2）→ 全部 11128
+            // - 首条补 system 的完全合规最小请求            → 依旧 11128
+            // - 5 个国际版号 5/5 全挂；国内版 3/3 全 200
+            // ⇒ 这是**上游在 chat 端点上的策略拦截**，与号、与请求形状、与 UA 都无关。
+            //   冻号不会让它变好，只会把本来能读接口的号也从池里摘掉：
+            //   以前一次坏请求就能把 5 个国际版号全冻 120 秒，
+            //   客户端随即收到「国际版的账号当前都不可用」，而这 5 个号其实一个都没坏。
+            let blocked = is_channel_block(&text);
+            if blocked {
                 eprintln!(
-                    "[反代] 渠道校验重试 {channel_retry} 次后仍被拦，冷却该账号 \
-                     (model={model}, uid={uid})"
+                    "[反代] 上游 chat 端点拒绝该请求（11128 渠道校验），**不冷却账号** \
+                     —— 这是端点级策略拦截，账号本身有效 (model={model}, uid={uid})"
                 );
+            } else {
+                st.pool.mark_failed(&uid);
             }
         } else {
             eprintln!(
@@ -2199,9 +2479,44 @@ async fn chat_completions(
             );
         }
         record_usage(&meta, None, false);
+        // 429 但解析不出重置时刻时，也别把原始 JSON 糊给客户端 —— 给一句能读的话。
+        // 渠道校验（11128）同理：重试耗尽后原样透传只会让用户看到一坨双层转义的
+        // JSON，根本不知道自己该做什么。这里给一句可执行的话。
+        let message = if raw_status.as_u16() == 429 {
+            format!(
+                "账号「{account_name}」请求过于频繁（HTTP 429），已临时冷却该账号，请稍后重试。"
+            )
+        } else if is_channel_block(&text) {
+            // 两种 11128 变体成因不同，提示也要分开 —— 混在一起用户无从下手：
+            // - `unapproved channel`：**负载**被判成非官方客户端（角色/身份声明）
+            // - `request illegal`   ：**调用方**被判成非官方客户端（客户端身份）
+            if text.contains("unapproved channel") {
+                format!(
+                    "上游拒绝了这次请求：{edition_label}网关判定「负载不合规」\
+                     （11128 Illegal API invocation from an unapproved channel）。\
+                     已自动做最大强度归一化（角色收敛 + 去 name + 抹身份声明）重试仍被拦。\
+                     这不是账号失效、不是频率超限，换账号也不会解决。\n\
+                     这是腾讯风控在识别系统提示词里的**第三方 agent 身份声明**（典型是 \
+                     `DeepSeek Harness`）。DSH 用户可关掉原生开关 `includeHarnessIdentity`，\
+                     或把系统提示词里那段身份声明删掉，即可恢复。\n\
+                     若已关掉仍报，请开启 `~/.wb-switch/DEBUG_DUMP` 后复现一次，\
+                     把 `~/.wb-switch/dump/last-request.json` 发给作者定位。"
+                )
+            } else {
+                format!(
+                    "上游拒绝了这次调用：{edition_label}网关判定「调用方不是官方客户端」\
+                     （11128 request illegal），已自动重试 {channel_retry} 次仍被拦。\
+                     这不是账号失效，也不是频率超限 —— 该账号的只读接口仍然正常，换账号也不会解决。\
+                     这是上游对非官方客户端的策略拦截，本地无法绕过。可以稍后重试；\
+                     国内版入口通常比国际版宽松，必要时換用国内版。"
+                )
+            }
+        } else {
+            text
+        };
         return (
             status,
-            Json(json!({"error": {"message": text, "type": "upstream_error"}})),
+            Json(json!({"error": {"message": message, "type": "upstream_error"}})),
         )
             .into_response();
     };
@@ -2434,6 +2749,35 @@ pub async fn run_proxy_server(cfg: ProxyConfig) -> Result<(), String> {
     run_endpoint_until(edition, endpoint, pool, Arc::new(cfg), shutdown_rx, ready_tx).await
 }
 
+/// 一个账号能不能进反代池。返回 `None` 表示可用，`Some(原因)` 表示不可用。
+///
+/// 🔴 **加密信封凭据必须排除**：WorkBuddy 5.6+ 会把 token 存成
+/// `{$wbEncrypted, envelope}`。这种账号**只能用于切换客户端** —— 要出站就得拿明文
+/// token，而信封解不开。放进来只会让反代在运行时返回「API 密钥无效」，
+/// 而界面上它看起来是勾选可用状态（`d1c60311` 就踩过这一条）。
+fn proxy_ineligible_reason(edition: Edition, a: &Value, allowed: &[String]) -> Option<&'static str> {
+    if a.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
+        return Some("需要重新登录");
+    }
+    if edition_of(a) != edition {
+        // 🔴 版本不匹配是最容易「勾了却不生效」的一条：勾选框里能看到它，
+        // 但 `edition_of` 按 domain/edition 字段把它判到另一档，
+        // 于是被静默剔除。国际版入口曾同时勾着两个国内版号（domain
+        // `copilot.tencent.com`），实际只有 5 个号在跑，界面却显示 7 个。
+        return Some("版本不匹配");
+    }
+    let Some(uid) = a.get("uid").and_then(Value::as_str) else {
+        return Some("缺少 uid");
+    };
+    if !allowed.is_empty() && !allowed.iter().any(|x| x == uid) {
+        return Some("未在本入口勾选");
+    }
+    if is_envelope(a, "access_token") {
+        return Some("凭据加密存储，无法用于反代");
+    }
+    None
+}
+
 /// 按配置挑出参与反代的 uid（两个入口的**并集**，供两者共享的账号池使用）。
 ///
 /// 每个版本的号只由**它自己那个入口**的名单决定 —— 国内版入口勾了谁就是谁，
@@ -2444,18 +2788,12 @@ fn eligible_accounts(cfg: &ProxyConfig) -> Vec<(String, Edition)> {
     for edition in Edition::ALL {
         let allowed = &cfg.endpoint(edition).accounts;
         for a in &all {
-            if a.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            if edition_of(a) != edition {
+            if proxy_ineligible_reason(edition, a, allowed).is_some() {
                 continue;
             }
             let Some(uid) = a.get("uid").and_then(Value::as_str) else {
                 continue;
             };
-            if !allowed.is_empty() && !allowed.iter().any(|x| x == uid) {
-                continue;
-            }
             out.push((uid.to_string(), edition));
         }
     }
@@ -2673,8 +3011,33 @@ mod tests {
         assert!(rate_limit_reset_ms(r#"{"message":"{\"code\":11128}"}"#).is_none());
         assert!(rate_limit_reset_ms("plain text").is_none());
         assert!(rate_limit_reset_ms("").is_none());
-        // 有 60004 关键字但缺「将在 … 重置」时间串的残缺体也要兜住。
+        // 有 60004 关键字但没有任何时间串的残缺体也要兜住。
         assert!(rate_limit_reset_ms(r#"{"message":"{\"code\":60004,\"msg\":\"?\"}"}"#).is_none());
+    }
+
+    /// 🔴 中文被转义成 `\uXXXX` 时（上游实际就是这么发的），解析仍必须成功。
+    /// v1.6.15 用中文关键词 `频率限制` 定位，在转义体上必然失败 ⇒ 原始 JSON 透传给客户端。
+    #[test]
+    fn parses_reset_time_even_when_chinese_is_escaped() {
+        let body = r#"{"code":60004,"msg":"\u60a8\u7684\u4f7f\u7528\u91cf\u5df2\u8d85\u51fa\u9891\u7387\u9650\u5236\uff0c\u5c06\u5728 2026-10-17 11:46:56 UTC+8 \u91cd\u7f6e"}"#;
+        let until = rate_limit_reset_ms(body).expect("转义体也必须能解析出重置时刻");
+        let expected = FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .from_local_datetime(
+                &NaiveDateTime::parse_from_str("2026-10-17 11:46:56", "%Y-%m-%d %H:%M:%S")
+                    .unwrap(),
+            )
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(until, expected);
+    }
+
+    /// 时间串扫描本身要稳：残破日期不算，正常日期能取到。
+    #[test]
+    fn find_reset_datetime_validates_shape() {
+        assert!(find_reset_datetime("no time here").is_none());
+        assert!(find_reset_datetime("2026-13-40 99:99:99").is_none());
+        assert!(find_reset_datetime("重置时间 2026-10-17 11:46:56 UTC+8").is_some());
     }
 
     /// system prompt 末尾的环境注入块会被摘掉——上游的渠道校验（11128）正是靠
@@ -3013,6 +3376,83 @@ mod tests {
 
     /// 账号池按版本取号：只要国内版时不该给出国际版的号。
     #[test]
+    /// 🔴 11128 渠道校验**不得冷却账号**。
+    ///
+    /// 2026-10-17 实测：同一个号的只读接口 200、chat 端点稳定 11128，
+    /// 换 UA / 补 system / 换模型都无效 —— 是端点级策略拦截，不是号坏了。
+    /// 以前一次坏请求会把池里 5 个号全冻 120 秒，客户端随即收到
+    /// 「国际版的账号当前都不可用」，而这些号其实一个都没坏。
+    #[test]
+    fn channel_block_must_not_poison_the_pool() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::International)]);
+        // 模拟「被 11128 拦过」：新逻辑下这条路径不该调 mark_failed。
+        // 反向验证判据：只要 is_channel_block 命中，调用方就跳过 mark_failed。
+        assert!(is_channel_block(r#"{"code":11128,"msg":"request illegal"}"#));
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::International), None).as_deref(),
+            Some("u1"),
+            "号没被冷却时应仍可选"
+        );
+        // 对照：真正需要冷却的失败（鉴权类）仍然生效 —— 别把这条护栏理解成「永不冷却」
+        pool.mark_failed("u1");
+        assert_eq!(pool.next_uid_of(Some(Edition::International), None), None);
+    }
+
+    /// 加密信封凭据的账号**不能进反代池**，否则运行时必报「API 密钥无效」。
+    #[test]
+    fn envelope_credentials_are_not_proxy_eligible() {
+        let intl = Edition::International;
+        let plain = serde_json::json!({
+            "uid": "u1", "edition": "international",
+            "access_token": "eyJhbGciOi.payload.sig"
+        });
+        assert_eq!(proxy_ineligible_reason(intl, &plain, &[]), None);
+
+        let envelope = serde_json::json!({
+            "uid": "u2", "edition": "international",
+            "access_token": {"$wbEncrypted": 1, "envelope": "AAAA"}
+        });
+        assert_eq!(
+            proxy_ineligible_reason(intl, &envelope, &[]),
+            Some("凭据加密存储，无法用于反代")
+        );
+    }
+
+    /// 版本不匹配的账号不能静默混进入口 —— 勾了却不生效是最难排查的一类。
+    #[test]
+    fn edition_mismatch_is_reported_not_silently_dropped() {
+        let domestic_acc = serde_json::json!({
+            "uid": "u-cn", "domain": "copilot.tencent.com", "access_token": "t"
+        });
+        assert_eq!(
+            proxy_ineligible_reason(Edition::International, &domestic_acc, &[]),
+            Some("版本不匹配"),
+            "国内版号不能出现在国际版入口的可用池里"
+        );
+        // 同一账号在国际版入口下判为不匹配；换成国内版入口就正常
+        assert_eq!(proxy_ineligible_reason(Edition::Domestic, &domestic_acc, &[]), None);
+    }
+
+    /// 未勾选的账号、以及标了 needs_relogin 的账号也要被明确剔除。
+    #[test]
+    fn unselected_or_stale_accounts_are_excluded() {
+        let acc = serde_json::json!({"uid": "u1", "edition": "international", "access_token": "t"});
+        let allowed = vec!["other".to_string()];
+        assert_eq!(
+            proxy_ineligible_reason(Edition::International, &acc, &allowed),
+            Some("未在本入口勾选")
+        );
+        let stale = serde_json::json!({
+            "uid": "u1", "edition": "international",
+            "access_token": "t", "needs_relogin": true
+        });
+        assert_eq!(
+            proxy_ineligible_reason(Edition::International, &stale, &[]),
+            Some("需要重新登录")
+        );
+    }
+
+    #[test]
     fn pool_filters_by_edition() {
         let pool = Pool::new(vec![
             ("u-intl".to_string(), Edition::International),
@@ -3143,6 +3583,122 @@ mod tests {
         let out = sanitize_messages(&msgs, &mut degraded);
         assert_eq!(out, msgs);
         assert!(degraded.is_empty());
+    }
+
+    #[test]
+    /// 🔴 `tool_choice` 对象形式必须归一成字符串。
+    ///
+    /// 上游只吃字符串，收到 OpenAI 规范的 `{"type":"function","function":{"name":"f"}}`
+    /// 直接 `11101 Unmarshal chat params failed`（2026-10-21 实测）。
+    /// 而函数名字符串 `"f"` 上游接受 —— 所以这个转换是**无损**的。
+    #[test]
+    fn tool_choice_object_is_normalized_to_string() {
+        // 指定函数 → 函数名（保留强制调用语义）
+        assert_eq!(
+            normalize_tool_choice(&json!({"type":"function","function":{"name":"read_file"}})),
+            Some(json!("read_file"))
+        );
+        // 只有 type 的几种
+        assert_eq!(normalize_tool_choice(&json!({"type":"auto"})), Some(json!("auto")));
+        assert_eq!(normalize_tool_choice(&json!({"type":"none"})), Some(json!("none")));
+        assert_eq!(normalize_tool_choice(&json!({"type":"required"})), Some(json!("required")));
+        // Anthropic 风格
+        assert_eq!(normalize_tool_choice(&json!({"type":"any"})), Some(json!("required")));
+        assert_eq!(
+            normalize_tool_choice(&json!({"type":"tool","name":"grep"})),
+            Some(json!("grep"))
+        );
+        // 字符串原样保留
+        assert_eq!(normalize_tool_choice(&json!("required")), Some(json!("required")));
+        // 认不出来的形态返回 None（调用方丢弃，别把 400 送给上游）
+        assert_eq!(normalize_tool_choice(&json!({"type":"weird"})), None);
+        assert_eq!(normalize_tool_choice(&json!({"no_type":1})), None);
+        assert_eq!(normalize_tool_choice(&json!(123)), None);
+    }
+
+    /// 标准采样参数不能丢 —— 以前只转 model/messages/stream/temperature/top_p/max_tokens/tools，
+    /// 其余全被静默吞掉，表现为「客户端设了等于没设」。
+    #[test]
+    fn upstream_body_passes_through_standard_params() {
+        let incoming = json!({
+            "model": "glm-5.3",
+            "messages": [{"role":"user","content":"hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "max_tokens": 512,
+            "stop": ["END"],
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.2,
+            "response_format": {"type":"json_object"},
+            "parallel_tool_calls": false,
+            "seed": 7,
+            "user": "u-1",
+            "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+            "tool_choice": {"type":"function","function":{"name":"f"}},
+        });
+        let mut degraded = Vec::new();
+        let body = build_upstream_body(&incoming, Edition::Domestic, &mut degraded);
+        for key in ["stop", "frequency_penalty", "presence_penalty", "response_format",
+                    "parallel_tool_calls", "seed", "user"] {
+            assert!(body.get(key).is_some(), "{key} 必须透传");
+        }
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["tool_choice"], "f", "对象形式要归一成函数名字符串");
+        assert!(degraded.iter().any(|d| d == "tool-choice"));
+    }
+
+    /// 11128 自愈：最大强度归一化要把非标准角色、name、数组 content 全部收敛。
+    #[test]
+    fn aggressive_normalize_collapses_payload_shape() {
+        let mut msgs = json!([
+            {"role":"developer","content":"sys","name":"dsh-agent"},
+            {"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},
+            {"role":"assistant","content":"ok"},
+        ]);
+        let mut degraded = Vec::new();
+        sanitize_messages_aggressive(&mut msgs, &mut degraded);
+        assert_eq!(msgs[0]["role"], "system", "developer 要收敛成 system");
+        assert!(msgs[0].get("name").is_none(), "name 必须摘掉");
+        assert_eq!(msgs[1]["content"], "a\nb", "多块 content 要拍平成字符串");
+        assert_eq!(msgs[2]["content"], "ok", "字符串 content 原样保留");
+        assert!(degraded.iter().any(|d| d == "aggressive-normalize"));
+    }
+
+    /// 身份声明清洗：抹掉 `DeepSeek Harness`（含大小写变体），未命中时不动原串。
+    #[test]
+    fn strips_third_party_identity_declarations() {
+        assert_eq!(
+            strip_identity_declarations("You are DeepSeek Harness, an agent.").as_deref(),
+            Some("You are Assistant, an agent.")
+        );
+        // 大小写变体
+        assert_eq!(
+            strip_identity_declarations("powered by deepseek harness").as_deref(),
+            Some("powered by Assistant")
+        );
+        // 连字符写法
+        assert!(strip_identity_declarations("via deepseek-harness bridge").is_some());
+        // 中文混排不破坏 UTF-8
+        let mixed = "你是DeepSeek Harness，一个助手。";
+        let out = strip_identity_declarations(mixed).unwrap();
+        assert_eq!(out, "你是Assistant，一个助手。");
+        assert!(out.is_char_boundary(out.len()));
+        // 未命中 → None（调用方不该改写用户提示词）
+        assert_eq!(strip_identity_declarations("You are a helpful assistant."), None);
+    }
+
+    /// 自愈路径必须把身份声明一并抹掉，但**不能**动 user 消息里的同名词。
+    #[test]
+    fn aggressive_normalize_scrubs_identity_in_system_only() {
+        let mut msgs = json!([
+            {"role":"system","content":"You are DeepSeek Harness. Be brief."},
+            {"role":"user","content":"DeepSeek Harness 是什么？"},
+        ]);
+        let mut degraded = Vec::new();
+        sanitize_messages_aggressive(&mut msgs, &mut degraded);
+        assert_eq!(msgs[0]["content"], "You are Assistant. Be brief.");
+        assert_eq!(msgs[1]["content"], "DeepSeek Harness 是什么？", "用户内容不该被改");
+        assert!(degraded.iter().any(|d| d == "aggressive-normalize"));
     }
 
     #[test]
