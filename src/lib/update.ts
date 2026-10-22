@@ -1,4 +1,4 @@
-export const GITHUB_OWNER = "cv-superding";
+export const GITHUB_OWNER = "Peoley199";
 export const GITHUB_REPO = "WorkBuddy-Switch2api";
 export const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`;
 export const GITHUB_RELEASE_URL = `${GITHUB_REPOSITORY_URL}/releases/latest`;

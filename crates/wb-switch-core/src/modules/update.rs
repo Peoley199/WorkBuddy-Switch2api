@@ -19,7 +19,7 @@ use crate::modules::config::{
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const GITHUB_OWNER: &str = "cv-superding";
+pub const GITHUB_OWNER: &str = "Peoley199";
 pub const GITHUB_REPO: &str = "WorkBuddy-Switch2api";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
@@ -328,25 +328,25 @@ mod tests {
 
     #[test]
     fn updater_manifest_urls_macos_skips_duplicate_fallback() {
-        let urls = updater_manifest_urls("cv-superding", "WorkBuddy-Switch2api", "macos", "aarch64");
+        let urls = updater_manifest_urls("Peoley199", "WorkBuddy-Switch2api", "macos", "aarch64");
         assert_eq!(
             urls,
             vec![
-                "https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest/download/latest.json",
-                "https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest/download/latest-macos-aarch64.json",
+                "https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest/download/latest.json",
+                "https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest/download/latest-macos-aarch64.json",
             ]
         );
     }
 
     #[test]
     fn updater_manifest_urls_windows_keeps_macos_compat() {
-        let urls = updater_manifest_urls("cv-superding", "WorkBuddy-Switch2api", "windows", "x86_64");
+        let urls = updater_manifest_urls("Peoley199", "WorkBuddy-Switch2api", "windows", "x86_64");
         assert_eq!(
             urls,
             vec![
-                "https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest/download/latest.json",
-                "https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest/download/latest-windows-x86_64.json",
-                "https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest/download/latest-macos-x86_64.json",
+                "https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest/download/latest.json",
+                "https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest/download/latest-windows-x86_64.json",
+                "https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest/download/latest-macos-x86_64.json",
             ]
         );
     }
