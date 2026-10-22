@@ -45,6 +45,16 @@ impl Totals {
         self.records = self.records.saturating_add(1);
     }
 
+    /// 并入另一份已聚合的统计。反代的按日桶里 `records` 是请求数之和，
+    /// 不能像 [`Totals::add`] 那样每个桶只记一条，所以单独走这个入口。
+    fn merge(&mut self, other: &Totals) {
+        self.usage.input = self.usage.input.saturating_add(other.usage.input);
+        self.usage.output = self.usage.output.saturating_add(other.usage.output);
+        self.usage.read = self.usage.read.saturating_add(other.usage.read);
+        self.usage.write = self.usage.write.saturating_add(other.usage.write);
+        self.records = self.records.saturating_add(other.records);
+    }
+
     fn value(&self) -> Value {
         let cache_hit_rate = (self.usage.input > 0)
             .then(|| self.usage.read as f64 / self.usage.input as f64);
@@ -65,6 +75,13 @@ impl Totals {
             "records": self.records,
             "cacheHitRate": cache_hit_rate,
         })
+    }
+
+    /// 面板的分组项 = 统计字段 + `key`，与 [`groups`] 的输出保持一致。
+    fn value_with_key(&self, key: &str) -> Value {
+        let mut value = self.value();
+        value["key"] = json!(key);
+        value
     }
 }
 
@@ -327,6 +344,162 @@ fn total_value(value: &Value) -> u64 {
                 .saturating_add(value.get("output").and_then(Value::as_u64).unwrap_or(0))
                 .saturating_add(value.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0))
         })
+}
+
+/// 把 `%Y-%m-%d` 按**本地时区**展开成当日 0 点 / 23:59:59.999 的毫秒时间戳。
+///
+/// 反代的 daily 桶只存日期，没有逐条时间戳；覆盖区间只能这样推。
+/// 写成显式 `01:00:00` 而不是在 `midnight()` 上加 1 秒，是避免夏令时结束那天
+/// 把区间多算 25 小时。
+fn local_day_bounds(day: &str) -> Option<(i64, i64)> {
+    use chrono::TimeZone;
+    let date = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+    let start = Local
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+        .earliest()?;
+    let end = Local
+        .from_local_datetime(&date.and_hms_milli_opt(23, 59, 59, 999)?)
+        .earliest()?;
+    Some((
+        start.timestamp_millis(),
+        end.timestamp_millis().max(start.timestamp_millis()),
+    ))
+}
+
+fn proxy_bucket_totals(bucket: &Map<String, Value>) -> Totals {
+    Totals {
+        usage: Usage {
+            input: field(bucket, &["promptTokens"]).unwrap_or(0),
+            output: field(bucket, &["completionTokens"]).unwrap_or(0),
+            read: field(bucket, &["cacheReadTokens"]).unwrap_or(0),
+            write: field(bucket, &["cacheWriteTokens"]).unwrap_or(0),
+        },
+        // 反代写盘时已把多次请求合成一个桶，records 是桶里的请求数，
+        // 不能像会话日志那样一个桶只记一条。
+        records: field(bucket, &["requests"]).unwrap_or(0),
+    }
+}
+
+/// 把 `dailyByModel` 的「模型 → 日期 → 桶」累加回「模型 → 日期 → Totals」。
+///
+/// summary / models / daily / dailyByModel 全部由它派生，而不是读各版的 `total`
+/// 计数器：total 是逐次请求累加的独立计数器，旧版本迁移/回填后可能与 daily
+/// 对不上，一旦两边不一致，「总览」和「趋势图合计」就会互相矛盾。
+fn proxy_daily_by_model(doc: &Value) -> HashMap<String, HashMap<String, Totals>> {
+    let mut result: HashMap<String, HashMap<String, Totals>> = HashMap::new();
+    for edition in crate::modules::edition::Edition::ALL {
+        let Some(models) = doc
+            .get("byEdition")
+            .and_then(|value| value.get(edition.key()))
+            .and_then(|value| value.get("dailyByModel"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (model_name, days) in models {
+            let Some(days) = days.as_object() else {
+                continue;
+            };
+            for (day, bucket) in days {
+                let Some(bucket) = bucket.as_object() else {
+                    continue;
+                };
+                result
+                    .entry(model_name.clone())
+                    .or_default()
+                    .entry(day.clone())
+                    .or_default()
+                    .merge(&proxy_bucket_totals(bucket));
+            }
+        }
+    }
+    result
+}
+
+/// 构造 `api-proxy` 来源。拆成纯函数（只读传入的 Value）是为了单测合并/整形逻辑，
+/// 不必依赖真实 home 目录里的 `proxy-usage.json`。
+fn proxy_source_from(doc: &Value) -> Value {
+    // 两个版本合并成一个来源：用户看到的是一条完整的反代用量曲线，
+    // 不关心请求是从国内版还是国际版账号发出去的。
+    let by_model = proxy_daily_by_model(doc);
+
+    let mut summary = Totals::default();
+    let mut daily_totals: HashMap<String, Totals> = HashMap::new();
+    for days in by_model.values() {
+        for (day, point) in days {
+            summary.merge(point);
+            daily_totals.entry(day.clone()).or_default().merge(point);
+        }
+    }
+
+    let mut daily: Vec<Value> = daily_totals
+        .iter()
+        .map(|(day, totals)| totals.value_with_key(day))
+        .collect();
+    // 与 groups() 一致按 total 降序；面板自己会再按日期排序。
+    daily.sort_by(|left, right| total_value(right).cmp(&total_value(left)));
+
+    let mut models: Vec<Value> = by_model
+        .iter()
+        .map(|(model_name, days)| {
+            let mut totals = Totals::default();
+            for point in days.values() {
+                totals.merge(point);
+            }
+            totals.value_with_key(model_name)
+        })
+        .collect();
+    models.sort_by(|left, right| total_value(right).cmp(&total_value(left)));
+
+    let daily_by_model = by_model
+        .iter()
+        .map(|(model_name, days)| {
+            let mut points: Vec<Value> = days
+                .iter()
+                .map(|(day, totals)| totals.value_with_key(day))
+                .collect();
+            points.sort_by(|left, right| total_value(right).cmp(&total_value(left)));
+            (model_name.clone(), Value::Array(points))
+        })
+        .collect::<Map<String, Value>>();
+
+    // 反代不区分项目，但「用量分布」至少需要一个分组，否则整块只显示空态。
+    let projects = if by_model.is_empty() {
+        Vec::new()
+    } else {
+        vec![summary.value_with_key("API 反代")]
+    };
+
+    // 覆盖区间只能由日期推：没有 daily 时保持 null，前端据此判断该来源是否可用。
+    let coverage_start_at = daily_totals
+        .keys()
+        .filter_map(|day| local_day_bounds(day).map(|(start, _)| start))
+        .min();
+    let coverage_end_at = daily_totals
+        .keys()
+        .filter_map(|day| local_day_bounds(day).map(|(_, end)| end))
+        .max();
+
+    json!({
+        "source": "api-proxy",
+        "summary": summary.value(),
+        "models": models,
+        "projects": projects,
+        // 反代没有会话与小时桶，这两个数组保持为空。
+        "sessions": [],
+        "daily": daily,
+        "dailyByModel": daily_by_model,
+        "hours": [],
+        "filesScanned": 0,
+        "parseErrors": 0,
+        "coverageStartAt": coverage_start_at,
+        "coverageEndAt": coverage_end_at,
+    })
+}
+
+/// 读取 `~/.wb-switch/proxy-usage.json` 并合并两版，产出与 [`source`] 同构的 Value。
+fn proxy_source() -> Value {
+    proxy_source_from(&crate::modules::proxy::load_usage())
 }
 
 #[derive(Default)]
@@ -880,7 +1053,7 @@ fn ide_source(
 }
 
 /// Return independent WorkBuddy (domestic), WorkBuddyAI (international),
-/// CodeBuddy CLI, and CodeBuddy IDE aggregates.
+/// CodeBuddy CLI, CodeBuddy IDE, and API proxy aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -908,6 +1081,10 @@ pub fn get_statistics(days: Option<i64>) -> Value {
                 cutoff,
                 &ide_projects,
             ),
+            // 反代用量**不套 cutoff**：proxy-usage.json 的 daily 桶本身就是全量历史，
+            // 面板各视图（今天/7 天/30 天/本月）会按日期自行筛选；在这里裁剪反而会把
+            // 历史曲线提前截断。这与上面 4 个按文件日志扫描的来源不同。
+            proxy_source(),
         ],
     })
 }
@@ -1367,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn get_statistics_returns_four_isolated_sources() {
+    fn get_statistics_returns_five_isolated_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
@@ -1376,7 +1553,195 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["workbuddy", "workbuddy-ai", "codebuddy-cli", "codebuddy-ide"]
+            [
+                "workbuddy",
+                "workbuddy-ai",
+                "codebuddy-cli",
+                "codebuddy-ide",
+                "api-proxy"
+            ]
         );
+    }
+
+    /// 反代桶的测试夹具：只有 dailyByModel 参与统计，故意把 total 写成错值，
+    /// 用来证明合并/汇总不依赖旧的 total 计数器。
+    fn proxy_usage_bucket(prompt: u64, completion: u64, read: u64, write: u64, requests: u64) -> Value {
+        json!({
+            "requests": requests,
+            "errors": 0,
+            "promptTokens": prompt,
+            "completionTokens": completion,
+            "cacheReadTokens": read,
+            "cacheWriteTokens": write,
+            "credit": 0,
+        })
+    }
+
+    fn proxy_usage_doc(editions: &[(&str, Value)]) -> Value {
+        let mut by_edition = Map::new();
+        for (edition, daily_by_model) in editions {
+            by_edition.insert(
+                (*edition).to_string(),
+                json!({
+                    // 与 dailyByModel 不一致的 total：必须被忽略。
+                    "total": proxy_usage_bucket(999_999, 999_999, 0, 0, 9_999),
+                    "byAccount": {},
+                    "byModel": {},
+                    "daily": {},
+                    "dailyByModel": daily_by_model,
+                    "recent": [],
+                }),
+            );
+        }
+        json!({ "updatedAt": 0, "byEdition": by_edition })
+    }
+
+    #[test]
+    fn proxy_source_merges_both_editions_and_shapes_daily_points() {
+        let doc = proxy_usage_doc(&[
+            (
+                "domestic",
+                json!({
+                    "deepseek-v4-flash": {
+                        "2026-10-01": proxy_usage_bucket(100, 20, 40, 5, 2),
+                    },
+                }),
+            ),
+            (
+                "international",
+                json!({
+                    "deepseek-v4-flash": {
+                        // 同一天两个版本都有量 ⇒ 相加。
+                        "2026-10-01": proxy_usage_bucket(50, 10, 60, 0, 1),
+                    },
+                }),
+            ),
+        ]);
+
+        let source = proxy_source_from(&doc);
+        assert_eq!(source["source"], "api-proxy");
+        assert_eq!(source["daily"].as_array().map(Vec::len), Some(1));
+
+        let point = &source["daily"][0];
+        assert_eq!(point["key"], "2026-10-01");
+        assert_eq!(point["input"], 150);
+        assert_eq!(point["output"], 30);
+        assert_eq!(point["cacheRead"], 100);
+        assert_eq!(point["cacheWrite"], 5);
+        assert_eq!(point["records"], 3);
+        // total 不含 cacheRead：150 + 30 + 5。
+        assert_eq!(point["total"], 185);
+        // cacheRead(100) 超过 input(150) 也不越界，且结果非负。
+        assert_eq!(point["uncachedInput"], 50);
+        assert_eq!(point["cacheHitRate"], 100.0 / 150.0);
+
+        // summary 与趋势图合计自洽，不受 fixture 里错误的 total 影响。
+        assert_eq!(source["summary"]["input"], 150);
+        assert_eq!(source["summary"]["records"], 3);
+        assert_eq!(source["summary"]["total"], 185);
+        assert_eq!(source["summary"]["cacheRead"], 100);
+
+        // 覆盖区间来自日期，按本地时区展开。
+        let coverage_start = source["coverageStartAt"].as_i64().expect("coverage start");
+        let coverage_end = source["coverageEndAt"].as_i64().expect("coverage end");
+        let (day_start, day_end) = local_day_bounds("2026-10-01").expect("local day bounds");
+        assert_eq!(coverage_start, day_start);
+        assert_eq!(coverage_end, day_end);
+    }
+
+    #[test]
+    fn proxy_source_models_are_summed_from_daily_by_model_and_sorted() {
+        let doc = proxy_usage_doc(&[
+            (
+                "domestic",
+                json!({
+                    "model-small": {
+                        "2026-10-01": proxy_usage_bucket(10, 1, 0, 0, 1),
+                        "2026-10-02": proxy_usage_bucket(10, 1, 0, 0, 1),
+                    },
+                }),
+            ),
+            (
+                "international",
+                json!({
+                    "model-large": {
+                        "2026-10-02": proxy_usage_bucket(300, 20, 200, 7, 3),
+                    },
+                }),
+            ),
+        ]);
+
+        let source = proxy_source_from(&doc);
+        let models = source["models"].as_array().expect("models");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["key"], "model-large");
+        assert_eq!(models[0]["total"], 327);
+        assert_eq!(models[0]["records"], 3);
+        assert_eq!(models[1]["key"], "model-small");
+        assert_eq!(models[1]["input"], 20);
+        assert_eq!(models[1]["records"], 2);
+
+        // dailyByModel 也按模型给出面板形状的按日序列。
+        assert_eq!(
+            source["dailyByModel"]["model-small"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(source["dailyByModel"]["model-large"][0]["key"], "2026-10-02");
+
+        // 反代不区分项目，但「用量分布」要有一项，否则整块显示空态。
+        assert_eq!(source["projects"][0]["key"], "API 反代");
+        assert_eq!(source["projects"][0]["total"], 349);
+    }
+
+    #[test]
+    fn proxy_source_stays_available_when_document_is_empty() {
+        let source = proxy_source_from(&json!({}));
+        assert_eq!(source["source"], "api-proxy");
+        assert_eq!(source["summary"]["total"], 0);
+        assert_eq!(source["summary"]["records"], 0);
+        assert!(source["coverageStartAt"].is_null());
+        assert!(source["coverageEndAt"].is_null());
+        for key in ["models", "projects", "sessions", "daily", "hours"] {
+            assert_eq!(
+                source[key].as_array().map(Vec::len),
+                Some(0),
+                "{key} should be empty"
+            );
+        }
+        assert_eq!(source["dailyByModel"].as_object().map(Map::len), Some(0));
+    }
+
+    #[test]
+    fn proxy_source_does_not_double_count_cache_read_in_totals() {
+        let doc = proxy_usage_doc(&[(
+            "domestic",
+            json!({
+                "model-a": {
+                    // prompt 已含 cacheRead：total 只能算 input + output + cacheWrite。
+                    "2026-10-03": proxy_usage_bucket(100, 10, 60, 5, 1),
+                },
+            }),
+        )]);
+
+        let source = proxy_source_from(&doc);
+        let point = &source["daily"][0];
+        assert_eq!(point["input"], 100);
+        assert_eq!(point["cacheRead"], 60);
+        assert_eq!(point["total"], 115);
+        assert_eq!(point["uncachedInput"], 40);
+        assert_eq!(source["summary"]["total"], 115);
+        assert_eq!(source["models"][0]["total"], 115);
+
+        // 缓存命中量比输入还大时，uncachedInput 饱和为 0，不会出现负数。
+        let overshoot = proxy_source_from(&proxy_usage_doc(&[(
+            "domestic",
+            json!({
+                "model-b": { "2026-10-04": proxy_usage_bucket(10, 1, 99, 0, 1) },
+            }),
+        )]));
+        assert_eq!(overshoot["daily"][0]["uncachedInput"], 0);
+        assert_eq!(overshoot["daily"][0]["total"], 11);
     }
 }

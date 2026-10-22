@@ -57,7 +57,8 @@ function isSourceKey(value: unknown): value is SourceKey {
     value === "workbuddy" ||
     value === "workbuddy-ai" ||
     value === "codebuddy-cli" ||
-    value === "codebuddy-ide"
+    value === "codebuddy-ide" ||
+    value === "api-proxy"
   );
 }
 
@@ -1082,6 +1083,14 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
   const denominator = tokenTotal(source.summary);
 
   if (source.summary.records === 0) {
+    // 反代没有会话文件概念，空态不能沿用「扫描会话文件」的文案。
+    if (source.source === "api-proxy") {
+      return (
+        <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
+          反代还没有可展示的用量。调用一次 API 后刷新即可看到。
+        </div>
+      );
+    }
     return (
       <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
         <div>
@@ -1328,6 +1337,13 @@ export default function TokenStatsPage() {
                   disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
                 >
                   CodeBuddy IDE
+                </TabsTrigger>
+                <TabsTrigger
+                  className="max-w-full whitespace-normal"
+                  value="api-proxy"
+                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "api-proxy"))}
+                >
+                  反代 API
                 </TabsTrigger>
               </TabsList>
             </Tabs>

@@ -25,12 +25,12 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use chrono::{FixedOffset, Local, NaiveDateTime, TimeZone};
 use uuid::Uuid;
 
-use super::account::{load_accounts, upsert_account};
+use super::account::{is_envelope, load_accounts, upsert_account};
 use super::config::{home_dir, now_ms};
 use super::edition::{edition_of, Edition};
 use super::refresh::refresh_account_token;
@@ -697,6 +697,18 @@ fn chat_headers(acc: &Value) -> HashMap<String, String> {
     // 会话头族（一次对话轮复用同一个聚合主键）。
     let conv_req = hex_id();
     let msg = hex_id();
+    // 🔴 `X-Conversation-ID` 是上游渠道校验的**必需项**，缺了整个 chat 请求被
+    // `400 / code 11128` 打回（文案「这次调用没通过渠道校验，可能不是官方客户端发出的」）。
+    //
+    // 2026-10-20 实测（同一个号、同一套出站头、同一 body、同一秒）：
+    // - 不带该头 → 假 model 探针连续 10 次全部 `11128`；真 model 也全部 `11128`；
+    // - 只补这一个头 → 10 次全部 `11102`（过了渠道校验，只是模型不存在）；
+    //   真 model `glm-5.3` 直接 `200` 出字。
+    //
+    // 官方桌面端在 `applyGatewayHeaders` 里必发 `X-Conversation-ID`（值 = sessionId），
+    // 反代此前只发了 `X-Conversation-Request-ID` 系列，于是从 2026-10-19~20 上游加固后
+    // 整条链路全灭。值用每次请求新生成的 32 位 hex 即可（实测随机值也放行）。
+    h.insert("X-Conversation-ID".into(), conv_req.clone());
     h.insert("X-Conversation-Request-ID".into(), conv_req.clone());
     h.insert("X-Conversation-Message-ID".into(), msg.clone());
     h.insert("X-Request-ID".into(), msg.clone());
@@ -1288,6 +1300,8 @@ async fn pick_account_of(cfg: &ProxyConfig, edition: Option<Edition>) -> Option<
         .unwrap_or_default();
     let acc = load_accounts().into_iter().find(|a| {
         a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
+            // 加密信封账号拿不到明文 token，打上游只会 401（同 `eligible_accounts`）。
+            && !is_envelope(a, "access_token")
             && edition.map(|e| edition_of(a) == e).unwrap_or(true)
             && (want.is_empty()
                 || a.get("uid")
@@ -1464,11 +1478,29 @@ fn edition_key(e: Edition) -> &'static str {
     }
 }
 
+/// 单个统计桶（total / 账号 / 模型 / 单日共用）的初始形状。
+///
+/// cache 字段是后加的：上游的缓存命中/写入量能直接换算成钱，
+/// 只看 promptTokens 会把「命中缓存」和「全量输入」混为一谈。
+fn empty_usage_bucket() -> Value {
+    json!({
+        "requests": 0, "errors": 0,
+        "promptTokens": 0, "completionTokens": 0,
+        "cacheReadTokens": 0, "cacheWriteTokens": 0,
+        "credit": 0,
+    })
+}
+
 /// 单个版本的用量文档（旧格式的扁平结构原样保留，前端不用大改）。
 fn empty_edition_usage() -> Value {
     json!({
-        "total": {"requests": 0, "errors": 0, "promptTokens": 0,
-                  "completionTokens": 0, "credit": 0},
+        "total": empty_usage_bucket(),
+        // 按**本地时区**日期（YYYY-MM-DD）聚合；跨过 0 点就是新的一天，
+        // 与用户看到的日历一致（UTC 会让东八区早上 8 点前的量落到前一天）。
+        "daily": {},
+        // 模型 → 日期 → 桶。总量曲线看不出是哪个模型在烧额度，
+        // 但把模型维度塞进 daily 的桶里会让前端结构变复杂，故单独一张表。
+        "dailyByModel": {},
         "byAccount": {},
         "byModel": {},
         "recent": [],
@@ -1570,6 +1602,12 @@ fn migrate_legacy_usage_with(doc: Value, ed_of: &HashMap<String, Edition>) -> Va
         }
     }
 
+    // ④ 刚拆出来的桶 daily 还是空的，但 recent 已有历史 ⇒ 强制从 recent 回填一次。
+    // 这是旧数据能还原「按天」曲线的唯一来源（byAccount 没有时间戳）。
+    for edition in Edition::ALL {
+        backfill_edition_usage(&mut out["byEdition"][edition_key(edition)], true);
+    }
+
     out
 }
 
@@ -1583,7 +1621,13 @@ pub fn load_usage() -> Value {
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
     {
-        Some(v) => migrate_legacy_usage(v),
+        Some(v) => {
+            let mut doc = migrate_legacy_usage(v);
+            // 已在用新格式、但由旧版本写下的桶没有 daily / cache 字段，这里补齐。
+            // 该步是幂等的（daily 已存在就不回填），每次 load 调用都安全。
+            backfill_usage_doc(&mut doc);
+            doc
+        }
         None => empty_usage(),
     }
 }
@@ -1635,6 +1679,361 @@ fn usage_credit(usage: Option<&Value>) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 上游 usage 里缓存**读**（命中）字段的别名。
+///
+/// 不同供应商各说各话：有的照 OpenAI 的 `prompt_cache_hit_tokens`，有的直接
+/// `cache_read_input_tokens`，还有的只把命中数嵌在 `prompt_tokens_details` 里。
+/// 取**第一个 > 0** 的别名（0 通常只是「这个别名没填」，不能挡住后面真正有值的）。
+const USAGE_CACHE_READ_KEYS: &[&str] = &[
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "prompt_cache_hit_tokens",
+    "cached_tokens",
+];
+
+/// 缓存**写**（创建）字段的别名。
+const USAGE_CACHE_WRITE_KEYS: &[&str] = &[
+    "cache_creation_input_tokens",
+    "prompt_cache_write_tokens",
+    "cache_write_input_tokens",
+    "cacheWriteInputTokens",
+];
+
+fn usage_positive_num(usage: Option<&Value>, keys: &[&str]) -> i64 {
+    let Some(obj) = usage.and_then(Value::as_object) else {
+        return 0;
+    };
+    keys.iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_i64).filter(|v| *v > 0))
+        .unwrap_or(0)
+}
+
+fn usage_cache_read(usage: Option<&Value>) -> i64 {
+    let flat = usage_positive_num(usage, USAGE_CACHE_READ_KEYS);
+    if flat > 0 {
+        return flat;
+    }
+    // OpenAI 兼容格式把命中数嵌在 details 里，放在扁平别名之后兜底。
+    usage
+        .and_then(Value::as_object)
+        .and_then(|o| o.get("prompt_tokens_details"))
+        .and_then(Value::as_object)
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|v| *v > 0)
+        .unwrap_or(0)
+}
+
+fn usage_cache_write(usage: Option<&Value>) -> i64 {
+    usage_positive_num(usage, USAGE_CACHE_WRITE_KEYS)
+}
+
+/// `now_ms` → **本地时区**日期（`%Y-%m-%d`）。
+///
+/// 按天聚合用本地日期而不是 UTC：否则东八区 0~8 点的用量会记到前一天，
+/// 用户在界面上看到的「今天」和系统日历对不上。
+fn local_date_of_ms(now_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(now_ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+fn ensure_object(v: &mut Value) {
+    if !v.is_object() {
+        *v = json!({});
+    }
+}
+
+/// 只补缺失的 cache 字段，**已有数值一律不动**（旧数据迁移时不能把统计清零）。
+fn ensure_cache_fields(bucket: &mut Value) {
+    if !bucket.is_object() {
+        *bucket = empty_usage_bucket();
+        return;
+    }
+    let o = bucket.as_object_mut().unwrap();
+    o.entry("cacheReadTokens").or_insert(json!(0));
+    o.entry("cacheWriteTokens").or_insert(json!(0));
+}
+
+fn bump_counter(o: &mut Map<String, Value>, key: &str, by: i64) {
+    let v = o.get(key).and_then(Value::as_i64).unwrap_or(0) + by;
+    o.insert(key.to_string(), json!(v));
+}
+
+/// 给一个统计桶（total / 账号 / 模型 / 单日）加上一笔。
+///
+/// 缺的字段按 0 起步，已有的累加，不重建对象 —— 调用方可能传入带
+/// `nickname` 等扩展字段的桶。
+fn bump_usage_bucket(
+    bucket: &mut Value,
+    prompt: i64,
+    completion: i64,
+    cache_read: i64,
+    cache_write: i64,
+    credit: f64,
+    ok: bool,
+) {
+    ensure_object(bucket);
+    let o = bucket.as_object_mut().unwrap();
+    bump_counter(o, "requests", 1);
+    if !ok {
+        bump_counter(o, "errors", 1);
+    }
+    bump_counter(o, "promptTokens", prompt);
+    bump_counter(o, "completionTokens", completion);
+    bump_counter(o, "cacheReadTokens", cache_read);
+    bump_counter(o, "cacheWriteTokens", cache_write);
+    let credit = o.get("credit").and_then(Value::as_f64).unwrap_or(0.0) + credit;
+    o.insert("credit".to_string(), json!(credit));
+}
+
+/// 把一次请求累加进**某一版**的用量文档。
+///
+/// 抽成纯函数（只碰传入的 Value，不读盘、不看 home 目录）是为了能直接单测
+/// 「同一天合并」「不同模型分开」这类容易写错、又只能靠日积月累才暴露的逻辑。
+/// 日期由 `now_ms` 推出来，测试可以注入任意时刻而不是依赖系统时钟。
+fn bump_usage_doc(doc: &mut Value, meta: &UsageMeta, usage: Option<&Value>, ok: bool, now_ms: i64) {
+    // 失败请求没有可信的 usage：token / 额度一律记 0，只留 requests/errors。
+    // 上游报错前偶尔会回一段残缺 usage，把它算进用量会让曲线凭空冒尖。
+    let (prompt, completion, cache_read, cache_write, credit) = if ok {
+        (
+            usage_num(usage, "prompt_tokens"),
+            usage_num(usage, "completion_tokens"),
+            usage_cache_read(usage),
+            usage_cache_write(usage),
+            usage_credit(usage),
+        )
+    } else {
+        (0, 0, 0, 0, 0.0)
+    };
+    let date = local_date_of_ms(now_ms);
+
+    ensure_object(doc);
+    bump_usage_bucket(
+        &mut doc["total"],
+        prompt,
+        completion,
+        cache_read,
+        cache_write,
+        credit,
+        ok,
+    );
+
+    ensure_object(&mut doc["byAccount"]);
+    let account = doc["byAccount"]
+        .as_object_mut()
+        .unwrap()
+        .entry(meta.uid.clone())
+        .or_insert_with(empty_usage_bucket);
+    ensure_object(account);
+    account["nickname"] = json!(meta.nickname);
+    bump_usage_bucket(
+        account,
+        prompt,
+        completion,
+        cache_read,
+        cache_write,
+        credit,
+        ok,
+    );
+
+    ensure_object(&mut doc["byModel"]);
+    let model = doc["byModel"]
+        .as_object_mut()
+        .unwrap()
+        .entry(meta.model.clone())
+        .or_insert_with(empty_usage_bucket);
+    bump_usage_bucket(
+        model,
+        prompt,
+        completion,
+        cache_read,
+        cache_write,
+        credit,
+        ok,
+    );
+
+    ensure_object(&mut doc["daily"]);
+    let day = doc["daily"]
+        .as_object_mut()
+        .unwrap()
+        .entry(date.clone())
+        .or_insert_with(empty_usage_bucket);
+    bump_usage_bucket(
+        day,
+        prompt,
+        completion,
+        cache_read,
+        cache_write,
+        credit,
+        ok,
+    );
+
+    ensure_object(&mut doc["dailyByModel"]);
+    let model_days = doc["dailyByModel"]
+        .as_object_mut()
+        .unwrap()
+        .entry(meta.model.clone())
+        .or_insert_with(|| json!({}));
+    ensure_object(model_days);
+    let day = model_days
+        .as_object_mut()
+        .unwrap()
+        .entry(date)
+        .or_insert_with(empty_usage_bucket);
+    bump_usage_bucket(
+        day,
+        prompt,
+        completion,
+        cache_read,
+        cache_write,
+        credit,
+        ok,
+    );
+
+    if doc.get("recent").map_or(true, |v| !v.is_array()) {
+        doc["recent"] = json!([]);
+    }
+    if let Some(arr) = doc["recent"].as_array_mut() {
+        arr.insert(
+            0,
+            json!({
+                "ts": now_ms,
+                "uid": meta.uid,
+                "nickname": meta.nickname,
+                "model": meta.model,
+                "stream": meta.stream,
+                "ok": ok,
+                "promptTokens": prompt,
+                "completionTokens": completion,
+                "cacheReadTokens": cache_read,
+                "cacheWriteTokens": cache_write,
+                "credit": credit,
+            }),
+        );
+        arr.truncate(USAGE_RECENT_MAX);
+    }
+}
+
+/// 给单个版本桶补齐新字段（daily / dailyByModel / cache）。
+///
+/// `force_backfill` 供「刚迁移完」的桶使用：此时 daily 是新建的空表，但 recent
+/// 里已有历史，需要按 recent 回填一次。
+///
+/// 🔴 幂等：非强制模式下只有 `daily` **缺失（或形状不对）**才回填。若每次 load
+/// 都拿 recent 重算，最近 100 条会被反复计入 daily，日曲线越看越多。
+fn backfill_edition_usage(bucket: &mut Value, force_backfill: bool) {
+    ensure_object(bucket);
+
+    // cache 字段是这次新加的：旧桶没有就补 0，已有的数值不动。
+    ensure_cache_fields(&mut bucket["total"]);
+    for key in ["byAccount", "byModel"] {
+        if let Some(m) = bucket.get_mut(key).and_then(Value::as_object_mut) {
+            for b in m.values_mut() {
+                ensure_cache_fields(b);
+            }
+        }
+    }
+
+    let daily_valid = bucket.get("daily").and_then(Value::as_object).is_some();
+    if force_backfill || !daily_valid {
+        // 历史只能从 recent 还原：它是唯一带时间戳的数据（最多 100 条），
+        // 更早的用量早已滚出列表，无法按天还原，只能从今天起重新累积。
+        let mut daily = Map::new();
+        let mut daily_by_model: Map<String, Value> = Map::new();
+        if let Some(arr) = bucket.get("recent").and_then(Value::as_array) {
+            for item in arr {
+                let ts = item.get("ts").and_then(Value::as_i64).unwrap_or(0);
+                let date = local_date_of_ms(ts);
+                let prompt = item
+                    .get("promptTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let completion = item
+                    .get("completionTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                // 缓存字段是本版新增的，旧 recent 没有 ⇒ 按 0 记。
+                let cache_read = item
+                    .get("cacheReadTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let cache_write = item
+                    .get("cacheWriteTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let credit = item.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+                // 旧数据可能没有 ok 字段，默认为成功（错误数只会少算，不会多算）。
+                let ok = item.get("ok").and_then(Value::as_bool).unwrap_or(true);
+
+                bump_usage_bucket(
+                    daily.entry(date.clone()).or_insert_with(empty_usage_bucket),
+                    prompt,
+                    completion,
+                    cache_read,
+                    cache_write,
+                    credit,
+                    ok,
+                );
+
+                let model = item.get("model").and_then(Value::as_str).unwrap_or("");
+                let model_days = daily_by_model
+                    .entry(model.to_string())
+                    .or_insert_with(|| json!({}));
+                ensure_object(model_days);
+                bump_usage_bucket(
+                    model_days
+                        .as_object_mut()
+                        .unwrap()
+                        .entry(date)
+                        .or_insert_with(empty_usage_bucket),
+                    prompt,
+                    completion,
+                    cache_read,
+                    cache_write,
+                    credit,
+                    ok,
+                );
+            }
+        }
+        bucket["daily"] = Value::Object(daily);
+        bucket["dailyByModel"] = Value::Object(daily_by_model);
+    } else {
+        // daily 已经有数据 ⇒ 绝不重算，只保证 dailyByModel 存在。
+        ensure_object(&mut bucket["dailyByModel"]);
+    }
+
+    // 半升级版本（有 daily 但桶里没 cache 字段）也要补齐，且不重算任何数。
+    if let Some(days) = bucket.get_mut("daily").and_then(Value::as_object_mut) {
+        for b in days.values_mut() {
+            ensure_cache_fields(b);
+        }
+    }
+    if let Some(models) = bucket
+        .get_mut("dailyByModel")
+        .and_then(Value::as_object_mut)
+    {
+        for days in models.values_mut() {
+            if let Some(days) = days.as_object_mut() {
+                for b in days.values_mut() {
+                    ensure_cache_fields(b);
+                }
+            }
+        }
+    }
+}
+
+/// 给整份统计文档补齐新字段（幂等，可放心在每次 load 时调用）。
+fn backfill_usage_doc(doc: &mut Value) {
+    if let Some(m) = doc.get_mut("byEdition").and_then(Value::as_object_mut) {
+        for bucket in m.values_mut() {
+            backfill_edition_usage(bucket, false);
+        }
+    }
+}
+
 /// 从上游 SSE 原文里取最后一个 usage 块。
 fn usage_from_sse(text: &str) -> Option<Value> {
     let mut last: Option<Value> = None;
@@ -1659,11 +2058,11 @@ fn usage_from_sse(text: &str) -> Option<Value> {
 }
 
 /// 累加一次请求到统计文件（请求量很小，直接读改写即可）。
+///
+/// 这里只负责加锁、读盘、调用纯函数 [`bump_usage_doc`]、写盘；
+/// 累加逻辑全部在那个纯函数里，便于单测。
 fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
-    let prompt = usage_num(usage, "prompt_tokens");
-    let completion = usage_num(usage, "completion_tokens");
-    let credit = usage_credit(usage);
-
+    let now = now_ms();
     let _g = USAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut doc = load_usage();
     // 🔴 只写自己那一档：国内版入口的量不会跑到国际版页面上（反之亦然）。
@@ -1672,64 +2071,9 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
         doc["byEdition"][key] = empty_edition_usage();
     }
 
-    let bump = |obj: &mut Value, prompt: i64, completion: i64, credit: f64, ok: bool| {
-        if !obj.is_object() {
-            *obj = json!({});
-        }
-        let o = obj.as_object_mut().unwrap();
-        *o.entry("requests").or_insert(json!(0)) =
-            json!(o.get("requests").and_then(Value::as_i64).unwrap_or(0) + 1);
-        if !ok {
-            *o.entry("errors").or_insert(json!(0)) =
-                json!(o.get("errors").and_then(Value::as_i64).unwrap_or(0) + 1);
-        }
-        *o.entry("promptTokens").or_insert(json!(0)) =
-            json!(o.get("promptTokens").and_then(Value::as_i64).unwrap_or(0) + prompt);
-        *o.entry("completionTokens").or_insert(json!(0)) =
-            json!(o.get("completionTokens").and_then(Value::as_i64).unwrap_or(0) + completion);
-        *o.entry("credit").or_insert(json!(0.0)) =
-            json!(o.get("credit").and_then(Value::as_f64).unwrap_or(0.0) + credit);
-    };
+    bump_usage_doc(&mut doc["byEdition"][key], meta, usage, ok, now);
 
-    bump(&mut doc["byEdition"][key]["total"], prompt, completion, credit, ok);
-
-    if let Some(m) = doc["byEdition"][key]["byAccount"].as_object_mut() {
-        let e = m.entry(meta.uid.clone()).or_insert_with(|| {
-            json!({"nickname": meta.nickname, "requests": 0, "errors": 0,
-                   "promptTokens": 0, "completionTokens": 0, "credit": 0})
-        });
-        e["nickname"] = json!(meta.nickname);
-        bump(e, prompt, completion, credit, ok);
-    }
-    if let Some(m) = doc["byEdition"][key]["byModel"].as_object_mut() {
-        let e = m
-            .entry(meta.model.clone())
-            .or_insert_with(|| {
-                json!({"requests": 0, "errors": 0, "promptTokens": 0,
-                       "completionTokens": 0, "credit": 0})
-            });
-        bump(e, prompt, completion, credit, ok);
-    }
-
-    if let Some(arr) = doc["byEdition"][key]["recent"].as_array_mut() {
-        arr.insert(
-            0,
-            json!({
-                "ts": now_ms(),
-                "uid": meta.uid,
-                "nickname": meta.nickname,
-                "model": meta.model,
-                "stream": meta.stream,
-                "ok": ok,
-                "promptTokens": prompt,
-                "completionTokens": completion,
-                "credit": credit,
-            }),
-        );
-        arr.truncate(USAGE_RECENT_MAX);
-    }
-
-    doc["updatedAt"] = json!(now_ms());
+    doc["updatedAt"] = json!(now);
     if let Ok(text) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(usage_path(), text);
     }
@@ -3613,6 +3957,15 @@ fn eligible_accounts(cfg: &ProxyConfig) -> Vec<(String, Edition)> {
             if a.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
                 continue;
             }
+            // 🔴 加密信封账号进不了反代：`access_token` 是 `{$wbEncrypted, …}` 对象，
+            // 拼不出 `Authorization: Bearer …`，上游网关直接回
+            // `401 Authorization Required`（APISIX 的 HTML 错误页）。
+            // 这类号留在池里会按轮转每隔几次就撞一次 401 —— 在单账号场景下
+            // 表现为「隔一会儿报一次错」，还会把好号连累进冷却。
+            // 它们只对「切换账号」有意义（密文原样写回 auth 文件），不进轮转。
+            if is_envelope(a, "access_token") {
+                continue;
+            }
             if edition_of(a) != edition {
                 continue;
             }
@@ -3939,6 +4292,167 @@ mod tests {
         // 空文件 / 损坏文件 → 空结构，不 panic
         let empty = migrate_legacy_usage_with(json!({}), &ed_of);
         assert_eq!(empty["byEdition"]["domestic"]["total"]["requests"], 0);
+    }
+
+    fn test_meta(model: &str) -> UsageMeta {
+        UsageMeta {
+            uid: "u1".into(),
+            nickname: "测试号".into(),
+            model: model.into(),
+            stream: false,
+            edition: Edition::Domestic,
+        }
+    }
+
+    /// 同一天两次请求要合并进同一个 daily 桶；不同模型各记各的 dailyByModel。
+    /// 这是前端画日曲线的基础，写错就会一天冒出两个点或模型串账。
+    #[test]
+    fn usage_daily_merges_same_day_and_splits_models() {
+        let mut doc = empty_edition_usage();
+        let usage = json!({"prompt_tokens": 10, "completion_tokens": 2, "credit": 0.5});
+        let t1 = 1_760_000_000_000i64;
+
+        bump_usage_doc(&mut doc, &test_meta("m-a"), Some(&usage), true, t1);
+        // 同一本地日期，晚一小时 → 必须并进同一个桶。
+        bump_usage_doc(&mut doc, &test_meta("m-a"), Some(&usage), true, t1 + 3_600_000);
+        bump_usage_doc(&mut doc, &test_meta("m-b"), Some(&usage), true, t1);
+
+        let date = local_date_of_ms(t1);
+        assert_eq!(doc["daily"][date.as_str()]["requests"], 3);
+        assert_eq!(doc["daily"][date.as_str()]["promptTokens"], 30);
+        assert_eq!(doc["daily"][date.as_str()]["credit"], 1.5);
+
+        assert_eq!(doc["dailyByModel"]["m-a"][date.as_str()]["requests"], 2);
+        assert_eq!(doc["dailyByModel"]["m-a"][date.as_str()]["completionTokens"], 4);
+        assert_eq!(doc["dailyByModel"]["m-b"][date.as_str()]["requests"], 1);
+        assert!(
+            doc["dailyByModel"]["m-b"].get(date.as_str()).is_some(),
+            "不同模型要各自成表，不能互相覆盖"
+        );
+
+        // 总量 / 账号 / 模型桶同步累加。
+        assert_eq!(doc["total"]["requests"], 3);
+        assert_eq!(doc["byAccount"]["u1"]["requests"], 3);
+        assert_eq!(doc["byModel"]["m-a"]["requests"], 2);
+    }
+
+    /// 失败请求只记 requests/errors，token 不能算进任何桶。
+    #[test]
+    fn usage_failed_request_records_zero_tokens() {
+        let mut doc = empty_edition_usage();
+        let usage = json!({"prompt_tokens": 100, "completion_tokens": 9, "credit": 1.0});
+        // 即便上游残留了一段 usage，ok=false 时也不能计入用量。
+        bump_usage_doc(&mut doc, &test_meta("m"), Some(&usage), false, 1_760_000_000_000);
+        assert_eq!(doc["total"]["requests"], 1);
+        assert_eq!(doc["total"]["errors"], 1);
+        assert_eq!(doc["total"]["promptTokens"], 0);
+        assert_eq!(doc["daily"][local_date_of_ms(1_760_000_000_000).as_str()]["errors"], 1);
+    }
+
+    /// cache 字段别名：OpenAI 嵌套的 `prompt_tokens_details.cached_tokens`
+    /// 与 Anthropic 风格的 `cache_creation_input_tokens` 都要认出来。
+    #[test]
+    fn usage_extracts_cache_tokens_from_aliases() {
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 40},
+            "cache_creation_input_tokens": 7,
+        });
+        assert_eq!(usage_cache_read(Some(&usage)), 40);
+        assert_eq!(usage_cache_write(Some(&usage)), 7);
+
+        let mut doc = empty_edition_usage();
+        bump_usage_doc(&mut doc, &test_meta("m"), Some(&usage), true, 1_760_000_000_000);
+        assert_eq!(doc["total"]["cacheReadTokens"], 40);
+        assert_eq!(doc["total"]["cacheWriteTokens"], 7);
+        assert_eq!(doc["byAccount"]["u1"]["cacheReadTokens"], 40);
+        assert_eq!(doc["byModel"]["m"]["cacheWriteTokens"], 7);
+        let date = local_date_of_ms(1_760_000_000_000);
+        assert_eq!(doc["daily"][date.as_str()]["cacheReadTokens"], 40);
+        assert_eq!(
+            doc["dailyByModel"]["m"][date.as_str()]["cacheWriteTokens"],
+            7
+        );
+
+        // 扁平别名为 0 时不能挡住后面真正有值的别名（0 通常只是没填）。
+        let other = json!({"cache_read_input_tokens": 0, "prompt_cache_hit_tokens": 12});
+        assert_eq!(usage_cache_read(Some(&other)), 12);
+        // 多别名取第一个 > 0 的，缺失一律 0。
+        assert_eq!(usage_cache_read(None), 0);
+        assert_eq!(usage_cache_write(Some(&json!({}))), 0);
+    }
+
+    /// daily 回填必须幂等：第一次从 recent 算出历史，之后再 load 不能翻倍。
+    #[test]
+    fn usage_backfill_is_idempotent() {
+        let mut bucket = json!({
+            "total": {"requests": 2, "errors": 0, "promptTokens": 30,
+                      "completionTokens": 3, "credit": 0.2},
+            "byAccount": {"u1": {"nickname": "x", "requests": 2, "errors": 0,
+                                 "promptTokens": 30, "completionTokens": 3, "credit": 0.2}},
+            "byModel": {"m": {"requests": 2, "errors": 0, "promptTokens": 30,
+                              "completionTokens": 3, "credit": 0.2}},
+            "recent": [
+                {"ts": 1_760_000_000_000i64, "uid": "u1", "model": "m", "ok": true,
+                 "promptTokens": 10, "completionTokens": 1, "credit": 0.1},
+                {"ts": 1_760_003_600_000i64, "uid": "u1", "model": "m", "ok": true,
+                 "promptTokens": 20, "completionTokens": 2, "credit": 0.1},
+            ],
+        });
+        let date = local_date_of_ms(1_760_000_000_000);
+
+        backfill_edition_usage(&mut bucket, false);
+        assert_eq!(bucket["daily"][date.as_str()]["requests"], 2);
+        assert_eq!(bucket["daily"][date.as_str()]["promptTokens"], 30);
+        assert_eq!(bucket["dailyByModel"]["m"][date.as_str()]["requests"], 2);
+        // 旧桶缺的 cache 字段补 0，已有数值一律不动。
+        assert_eq!(bucket["total"]["cacheReadTokens"], 0);
+        assert_eq!(bucket["total"]["cacheWriteTokens"], 0);
+        assert_eq!(bucket["total"]["promptTokens"], 30);
+        assert_eq!(bucket["byAccount"]["u1"]["cacheWriteTokens"], 0);
+        assert_eq!(bucket["byModel"]["m"]["promptTokens"], 30);
+
+        // 再跑一次（模拟每次 load 都调）：daily 已存在 ⇒ 只补字段，不重算。
+        backfill_edition_usage(&mut bucket, false);
+        assert_eq!(
+            bucket["daily"][date.as_str()]["requests"], 2,
+            "重复 load 不能把 recent 重复计入 daily"
+        );
+        assert_eq!(bucket["daily"][date.as_str()]["promptTokens"], 30);
+        assert_eq!(
+            bucket["dailyByModel"]["m"][date.as_str()]["completionTokens"],
+            3
+        );
+    }
+
+    /// 旧扁平格式迁移完也要从 recent 回填 daily —— 否则升级后日曲线从零开始，
+    /// 明明有最近 100 条历史却画不出来。
+    #[test]
+    fn legacy_usage_backfills_daily_from_recent() {
+        let mut ed_of = HashMap::new();
+        ed_of.insert("u-cn".to_string(), Edition::Domestic);
+
+        let legacy = json!({
+            "byAccount": {
+                "u-cn": {"nickname": "n", "requests": 2, "errors": 0,
+                         "promptTokens": 30, "completionTokens": 3, "credit": 0.2},
+            },
+            "recent": [
+                {"ts": 1_760_000_000_000i64, "uid": "u-cn", "model": "m", "ok": true,
+                 "promptTokens": 10, "completionTokens": 1, "credit": 0.1},
+                {"ts": 1_760_003_600_000i64, "uid": "u-cn", "model": "m", "ok": true,
+                 "promptTokens": 20, "completionTokens": 2, "credit": 0.1},
+            ],
+        });
+        let out = migrate_legacy_usage_with(legacy, &ed_of);
+        let date = local_date_of_ms(1_760_000_000_000);
+        let cn = &out["byEdition"]["domestic"];
+        assert_eq!(cn["daily"][date.as_str()]["requests"], 2);
+        assert_eq!(cn["daily"][date.as_str()]["promptTokens"], 30);
+        assert_eq!(cn["dailyByModel"]["m"][date.as_str()]["requests"], 2);
+        assert_eq!(cn["total"]["cacheReadTokens"], 0);
+        assert_eq!(cn["byAccount"]["u-cn"]["cacheWriteTokens"], 0);
     }
 
     /// 渠道校验软拦截（11128）要能被认出来 —— 它是**可重试**的，认错就会白冻一个号。

@@ -38,6 +38,12 @@ import { EDITIONS, editionLabel, isInternational, accountGroupLabel, type Accoun
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
+/**
+ * 「首次启动自动导入本机账号」只做一次的持久化标记。
+ * 见下面 useEffect 的说明：不能用「账号列表为空」判断，否则删掉的号每次启动都会被写回。
+ */
+const AUTO_IMPORT_DONE_KEY = "wb-switch.auto-import-local.done";
+
 function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
 }
@@ -258,13 +264,34 @@ export default function AccountsPage() {
     };
   }, []);
 
-  /** 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默） */
+  /**
+   * 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默）。
+   *
+   * 🔴 必须用**持久化标记**而不是只看「账号列表为空」：store 初始状态恒为
+   * `accounts: []` + `loading: false`，每次启动首帧条件都成立，
+   * 于是用户删掉的账号会被**每次启动重新导回来**（本机扫到几个就写回几个）。
+   * 导入成功才落标记；失败（本机没登录态）留待下次启动再试。
+   */
   const autoImportTried = useRef(false);
   useEffect(() => {
     if (autoImportTried.current || loading || accounts.length > 0) return;
     autoImportTried.current = true;
+    let done = false;
+    try {
+      done = localStorage.getItem(AUTO_IMPORT_DONE_KEY) === "1";
+    } catch {
+      /* localStorage 不可用时按「未导入」处理，最多多扫一次 */
+    }
+    if (done) return;
     void importLocal()
-      .then(() => void fetchAll())
+      .then(() => {
+        try {
+          localStorage.setItem(AUTO_IMPORT_DONE_KEY, "1");
+        } catch {
+          /* 忽略 */
+        }
+        void fetchAll();
+      })
       .catch(() => {
         /* 本机无 WorkBuddy 登录态时静默，不打扰用户 */
       });
