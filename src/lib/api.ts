@@ -297,7 +297,6 @@ const CACHEABLE_READS = new Set([
   "get_checkin_logs",
   "get_rotate_logs",
   "get_proxy_config",
-  "get_proxy_status",
   "get_credit_statistics",
   "get_token_statistics",
   "list_sessions",
@@ -324,6 +323,10 @@ const LIVE_READS = new Set([
   "get_codebuddy_cn_ide_status",
   "detect_codebuddy_cn_ide_account",
   "get_proxy_models",
+  // 🔴 反代运行状态**必须实时**：里面的 `accounts` 是冷却快照，请求一失败就会变。
+  // 缓存 60 秒会让「刚冷却的号」在页面上迟迟不出现，正好与这个功能的目的相反。
+  // 放这里 = 既不缓存、也不清缓存。
+  "get_proxy_status",
   // 🔴 反代用量**必须实时**：它每个请求都在变。放进可缓存名单会让「进页面看到的
   // 还是 60 秒前的旧值」，用户得手点刷新 —— 这正是要修的症状。
   // 放这里 = 既不缓存、也不清缓存（不会把同一次挂载里其它的缓存白刷掉）。

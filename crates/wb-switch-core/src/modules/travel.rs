@@ -17,7 +17,7 @@ use crate::modules::config::{
     WORKBUDDY_API_ENDPOINT,
 };
 use crate::modules::edition::edition_of;
-use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
+use crate::modules::refresh::{ensure_fresh_token, refresh_token_only};
 
 static TRAVEL_RUNNING: AtomicBool = AtomicBool::new(false);
 static TRAVEL_CLAIM_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -97,7 +97,24 @@ async fn travel_request(path: &str, method: &str, body: Option<Value>, account: 
             .unwrap_or("")
             .is_empty()
     {
-        let refreshed = refresh_account_token(account.clone()).await;
+        // 🔴 必须用**不落盘**的版本：这里是后台查询（启动时就会跑一轮）。
+        // 落盘版一旦被上游拒绝，就在用户毫不知情的情况下把号永久标成「需要重新登录」，
+        // 反代随即把它从磁盘判定里剔除 —— 之后每次请求都只能 503，直到用户手动处理。
+        let refreshed = refresh_token_only(account.clone()).await;
+        let rejected = refreshed
+            .get("_wb_refresh_rejected")
+            .and_then(Value::as_bool)
+            == Some(true);
+        if rejected {
+            eprintln!(
+                "[旅行] 账号 {} 的 refresh token 已被上游拒绝（{}）",
+                account.get("uid").and_then(Value::as_str).unwrap_or(""),
+                refreshed
+                    .get("needs_relogin_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+        }
         let headers = build_travel_headers(&refreshed);
         resp = http_request(&url, method, body, Some(&headers)).await;
     }

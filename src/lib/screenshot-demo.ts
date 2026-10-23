@@ -1,7 +1,7 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, ProxyConfig, ProxyModels, ProxyStatus, ProxyUsage, RotateLog, RotateStatus,
+  GithubConfig, ProxyAccountCooldown, ProxyConfig, ProxyModels, ProxyStatus, ProxyUsage, RotateLog, RotateStatus,
   TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals, TravelConfig, TravelStatus,
   UsageBucket,
   CacheMovePlan, CacheVerifyResult,
@@ -384,6 +384,48 @@ function proxyConfig(): ProxyConfig {
 function proxyStatus(): ProxyStatus {
   const n = (ed: string) =>
     accounts.filter((a) => a.group === "proxy" && (a.edition ?? "domestic") === ed).length;
+  const proxyDomestic = accounts.filter(
+    (a) => a.group === "proxy" && (a.edition ?? "domestic") === "domestic",
+  );
+  const proxyIntl = accounts.filter(
+    (a) => a.group === "proxy" && (a.edition ?? "domestic") === "international",
+  );
+  const now = Date.now();
+  // 演示三种冷却形态：整个号短冷却 / 只有某个模型长冷却 / 多个模型同时冷却。
+  // 截图与 Pages 演示必须能看到它们，否则这个功能在演示里等于不存在。
+  const accountsCooldown: ProxyAccountCooldown[] = [];
+  if (proxyDomestic[0]?.uid) {
+    accountsCooldown.push({
+      uid: proxyDomestic[0].uid,
+      edition: "domestic",
+      until: now + 83_000,
+      reason: "上游返回 401",
+      models: [],
+    });
+  }
+  if (proxyDomestic[1]?.uid) {
+    accountsCooldown.push({
+      uid: proxyDomestic[1].uid,
+      edition: "domestic",
+      until: null,
+      reason: null,
+      models: [
+        { model: "deepseek-v4-pro", until: now + 2 * 3600_000, reason: "上游频率超限（60004）" },
+      ],
+    });
+  }
+  if (proxyIntl[0]?.uid) {
+    accountsCooldown.push({
+      uid: proxyIntl[0].uid,
+      edition: "international",
+      until: null,
+      reason: null,
+      models: [
+        { model: "deepseek-v4.1-flash", until: now + 26 * 60_000, reason: "上游频率超限（60004）" },
+        { model: "glm-5.3", until: now + 47 * 60_000, reason: "上游频率超限（60004）" },
+      ],
+    });
+  }
   return {
     running: true,
     endpoints: [
@@ -406,6 +448,7 @@ function proxyStatus(): ProxyStatus {
         running: true,
       },
     ],
+    accounts: accountsCooldown,
   };
 }
 

@@ -9,6 +9,7 @@ pub mod config;
 pub mod credit_usage;
 pub mod credits;
 pub mod edition;
+pub mod http_guard;
 pub mod export_import;
 #[cfg(target_os = "linux")]
 pub mod linux_keyring;

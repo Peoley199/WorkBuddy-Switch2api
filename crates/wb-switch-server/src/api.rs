@@ -1,20 +1,24 @@
-//! HTTP API 层：把 wb-switch-core 暴露为本地 REST 接口，供 webui（浏览器）调用。
-//!
-//! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。
-//!
 //! 安全姿态：
 //! - **默认**只绑 `127.0.0.1`、不校验口令 —— token 不出本机，与以前一致；
 //! - 一旦把监听地址改成非回环（Docker / 反代），**入口会强制要求设置访问口令**
 //!   （见 `main.rs` 的 `resolve_bind`），中间件 [`auth_guard`] 校验 `/api/*`。
 //!   这两道是配套的：只改地址不设口令，等于把账号库挂到网上。
+//! - 口令之外还有一道「谁在访问」校验（[`wb_switch_core::modules::http_guard`]）：
+//!   `Host` 必须是回环 / 本机 IP / 白名单域名，否则直接 421 —— 挡的是 **DNS rebinding**
+//!   （攻击者页面把自己的域名解析到 `127.0.0.1` 后，浏览器把它当同源，CORS 管不到）。
+//! - 从**别的机器**上的页面访问时，浏览器带的 `Origin` 是那台机器的地址。这里采用
+//!   「**凭口令认主机**」：第一次必须用 `Authorization: Bearer <口令>`，成功后记住该来源主机
+//!   24 小时；地址栏里的 `?token=` 只在**顶层导航**里被拿来 302 跳转一次
+//!   （见 [`auth_guard`] 里的 `__auth/boot` 分支），跳完就从地址栏消失。
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{RawQuery, Request};
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,15 +26,24 @@ use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
+use wb_switch_core::modules::http_guard::{self, Access, Exposure, TrustedOrigins};
+
 /// 访问口令。`None` = 不校验（本机默认行为，与以前完全一致）。
 ///
 /// Docker / 反向代理场景下必须设：本服务能读写账号库、能切号、能签到，
 /// 裸奔在网络上等于把账号交出去。
-static ACCESS_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static ACCESS_TOKEN: OnceLock<Option<String>> = OnceLock::new();
 
 /// 由入口（`main.rs`）在 `router()` 之前调用，设置访问口令。
 pub fn set_access_token(token: Option<String>) {
     let _ = ACCESS_TOKEN.set(token);
+}
+
+static FORCED_EXPOSURE: OnceLock<bool> = OnceLock::new();
+
+/// 由入口在 `router()` 之前调用：这次服务不是「直接绑回环」（容器 / 端口转发）。
+pub fn set_forwarded(forwarded: bool) {
+    let _ = FORCED_EXPOSURE.set(forwarded);
 }
 
 fn access_token() -> Option<&'static str> {
@@ -39,6 +52,38 @@ fn access_token() -> Option<&'static str> {
         .and_then(|t| t.as_deref())
         .map(str::trim)
         .filter(|t| !t.is_empty())
+}
+
+/// 这次连接来自「别处」：听的不是回环，或连进来的端口 ≠ 监听端口（Docker 映射 / SSH 转发）。
+fn exposure_of(headers: &HeaderMap, local_port: u16) -> Exposure {
+    if FORCED_EXPOSURE.get().copied().unwrap_or(false) {
+        return Exposure::Forwarded;
+    }
+    let (host, host_port) = match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(raw) => {
+            let port = raw
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.trim_end_matches(']').parse::<u16>().ok());
+            (http_guard::normalize_host(raw), port)
+        }
+        None => (String::new(), None),
+    };
+    let host_is_loopback = host.is_empty() || http_guard::is_loopback_name(&host);
+    // 拿不到端口的旧式请求不做端口比对（按 0 处理会让一切变成 Forwarded）。
+    Exposure::detect(host_is_loopback, host_port.unwrap_or(0), local_port)
+}
+
+fn trusted() -> &'static TrustedOrigins {
+    static T: OnceLock<TrustedOrigins> = OnceLock::new();
+    T.get_or_init(TrustedOrigins::new)
+}
+
+/// 记下本机来源（`main.rs` 启动浏览器前调用）。本机上打开页面走的是 `127.0.0.1` /
+/// `localhost`，本来就与「能连上这个回环服务」等价；记下来是为了容器环境下同样放行。
+pub fn trust_loopback_origin() {
+    for h in ["127.0.0.1", "localhost", "::1"] {
+        trusted().remember(h);
+    }
 }
 
 /// 极简 query 解析：只按 `&` / `=` 切，不做百分号转义。
@@ -52,48 +97,157 @@ fn query_pairs(q: &str) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// 访问口令中间件。
-///
-/// 🔴 **只校验 `/api/*`**，静态资源（HTML / JS / CSS）一律放行：
-/// 它们不含任何用户数据，而且「打开页面时用 `?token=…` 引导一次口令」这条路径
-/// 本身就要求 index.html 能匿名取到。真正的数据接口一个都不放过。
-///
-/// 口令来源二选一：`Authorization: Bearer <token>` 或 `?token=<token>`。
-/// 前者是页面加载后前端自己带的，后者只用于第一次引导。
-async fn auth_guard(req: Request, next: Next) -> Response {
-    let Some(want) = access_token() else {
-        return next.run(req).await;
-    };
-    if !req.uri().path().starts_with("/api/") {
-        return next.run(req).await;
-    }
-    let by_header = req
-        .headers()
+/// 带 `?token=` 的 GET 地址（文档 / 启动横幅推荐的那条）落到这里做一次 302。
+/// 地址栏口令入口（`main.rs` 的启动横幅也用它拼地址）。
+pub const BOOTSTRAP_PATH: &str = "/__auth/boot";
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
-        == Some(want);
-    let by_query = req
-        .uri()
-        .query()
-        .map(query_pairs)
-        .unwrap_or_default()
-        .iter()
-        .any(|(k, v)| *k == "token" && *v == want);
-    if by_header || by_query {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "message": "未授权：请带上访问口令（首次访问用 ?token=…，之后前端会自动带 Bearer）"
-            })),
-        )
-            .into_response()
-    }
 }
 
+fn query_token(uri: &Uri) -> Option<String> {
+    uri.query()
+        .map(query_pairs)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(k, _)| *k == "token")
+        .map(|(_, v)| v.to_string())
+}
+
+/// 常数时间比较：先比长度再逐字节，别让口令成为计时侧信道的突破口。
+fn same_token(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "message": "未授权：请带上访问口令（首次访问用 ?token=…，之后前端会自动带 Bearer）"
+        })),
+    )
+        .into_response()
+}
+
+/// 访问口令中间件。
+///
+/// 校验顺序：
+/// 1. `Host` 不合法（DNS rebinding）⇒ 421，**任何路径都拒**；
+/// 2. 静态资源（HTML / JS / CSS）放行 —— 它们不含用户数据，页面加载后才会带着
+///    `Bearer` 去请求数据；
+/// 3. `?token=…`（页面加载时由前端跳来）：只接受**导航式**请求
+///    （`Sec-Fetch-Mode: navigate`，或无 `Sec-Fetch-*` 头的旧浏览器里 `Accept` 含 `text/html`），
+///    验证口令后 302 到去掉 token 的地址；`<img>` / `<iframe>` / `fetch` 嵌入一律拒绝，
+///    口令因此不会被第三方页面的标注请求带进日志；
+/// 4. 其余 `/api/*`：`Authorization: Bearer`，或 URL 里的 `?token=`（兼容本地脚本）。
+///    来源主机与监听地址不同时（别的机器上的页面），还要求该来源已经「凭口令」被记住过。
+async fn auth_guard(req: Request, next: Next) -> Response {
+    if http_guard::check_host(req.headers()).is_err() {
+        return http_guard::rejected(Access::BadHost);
+    }
+    let Some(want) = access_token() else {
+        return next.run(req).await;
+    };
+    let path = req.uri().path().to_string();
+    let boot = path == BOOTSTRAP_PATH;
+    if !boot && !path.starts_with("/api/") {
+        return next.run(req).await;
+    }
+
+    let has_header = bearer_token(req.headers())
+        .map(|t| same_token(t, want))
+        .unwrap_or(false);
+    let has_query = !boot && query_token(req.uri()).map(|t| same_token(&t, want)).unwrap_or(false);
+
+    if boot {
+        let navigating = match req
+            .headers()
+            .get("sec-fetch-mode")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(m) => m.eq_ignore_ascii_case("navigate"),
+            // 老浏览器不带 Sec-Fetch-*：退化成「Accept 里有 text/html」。
+            None => req
+                .headers()
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .map(|a| a.contains("text/html"))
+                .unwrap_or(false),
+        };
+        if !navigating && !has_header {
+            return (StatusCode::FORBIDDEN, "只接受浏览器地址栏 / 链接的跳转").into_response();
+        }
+        if !has_header && !(query_token(req.uri()).map(|t| same_token(&t, want)).unwrap_or(false)) {
+            return unauthorized();
+        }
+        if let Some(host) = TrustedOrigins::origin_host(req.headers()) {
+            trusted().remember(&host);
+        }
+        // 302 到去掉 token 的地址：口令不再留在地址栏、历史记录、截图里。
+        let rest: Vec<String> = req
+            .uri()
+            .query()
+            .map(query_pairs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| *k != "token")
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect();
+        let target = if rest.is_empty() {
+            path
+        } else {
+            format!("{path}?{}", rest.join("&"))
+        };
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, target)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::REFERRER_POLICY, "no-referrer")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    if !has_header && !has_query {
+        return unauthorized();
+    }
+
+    // 来源主机与监听地址不同：必须已经「凭口令」被记住过（见 [`TrustedOrigins`]）。
+    let local_port = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.port())
+        .unwrap_or(0);
+    let exposure = exposure_of(req.headers(), local_port);
+    if let Err(access) = http_guard::check_origin(req.headers(), exposure) {
+        if !trusted().allows(req.headers()) {
+            return http_guard::rejected(access);
+        }
+    }
+    if exposure == Exposure::Forwarded {
+        // 🔴 只有「别的机器也访问得到」时才凭口令认主机。
+        // 本机直连（Loopback）时不记：否则本机上任何页面只要拿到一次口令，
+        // 对应的 Host 就会被信任 —— 而本地回环本来就该只认回环名。
+        if let Some(host) = TrustedOrigins::origin_host(req.headers()) {
+            // 校验通过的请求顺手给来源续期（持续使用就一直有效）。
+            trusted().remember(&host);
+        }
+    }
+    next.run(req).await
+}
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
     edition::Edition, export_import,
@@ -135,6 +289,9 @@ static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 
 pub fn router() -> Router {
     Router::new()
+        // 地址栏里的口令入口（`/__auth/boot?token=…`，任何带 `?token=` 的 GET 都会被
+        // `main.rs` 改写到这里）：只接受顶层导航，302 到去掉口令的 `/`。
+        .route(BOOTSTRAP_PATH, get(auth_bootstrap_redirect))
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
         .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
@@ -211,6 +368,19 @@ pub fn router() -> Router {
         // 🔴 必须在所有路由**之后**挂：layer 只对它之前注册的项生效。
         // 没设口令时这层是空操作，本机行为与以前一模一样。
         .layer(axum::middleware::from_fn(auth_guard))
+}
+
+/// 顶层导航到 `/__auth/boot?token=…` 之后，302 回不带口令的 `/`。
+///
+/// 口令本身由 [`auth_guard`] 校验；这里只负责把地址栏里的口令抹掉。
+async fn auth_bootstrap_redirect() -> Response {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, "/")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn json_ok(v: Value) -> Response {
@@ -663,7 +833,12 @@ async fn api_refresh_token(Json(body): Json<Value>) -> Response {
     let Some(acc) = account::find_account(id) else {
         return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
-    json_ok(refresh::refresh_account_token(acc).await)
+    // 与桌面端同一口径：手动刷新失败不落盘（见 commands.rs 的 refresh_account_token）。
+    let fresh = refresh::refresh_token_only(acc).await;
+    if fresh.get("needs_relogin").and_then(Value::as_bool) != Some(true) {
+        let _ = account::upsert_account(&fresh);
+    }
+    json_ok(fresh)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +871,12 @@ fn proxy_status_value() -> Value {
             })
         })
         .collect();
-    json!({ "running": proxy::proxy_running(), "endpoints": endpoints })
+    json!({
+        "running": proxy::proxy_running(),
+        "endpoints": endpoints,
+        // 冷却快照：只列正在冷却的号（原因 + 绝对恢复时刻）。与桌面端同形状。
+        "accounts": proxy::cooldown_snapshot(),
+    })
 }
 
 async fn api_proxy_config() -> Response {
@@ -928,16 +1108,22 @@ fn content_type(path: &str) -> &'static str {
 }
 
 async fn static_handler(uri: Uri) -> Response {
-    let mut path = uri.path().trim_start_matches('/').to_string();
-    if path.is_empty() || path == "index.html" {
-        path = "index.html".to_string();
-    }
-    // 前端路由回退到 index.html
-    let data = Assets::get(&path).or_else(|| Assets::get("index.html"));
-    match data {
+    // 前端路由回退到 index.html —— 返回的**是 index.html 的内容**，
+    // 所以 MIME 必须按实际返回的文件判定，不能按请求路径。
+    // 以前这里用请求路径判定：`/api-proxy` 这类深链接回退后带的是
+    // `application/octet-stream`，浏览器会直接下载而不是渲染页面。
+    let path = uri.path().trim_start_matches('/');
+    // 只认「看起来像静态资源」的路径（带扩展名）。其余一律回退 index.html：
+    // 反正 Assets 里没有它们，免得带 `.` 的怪路径（如 `/.git/config`）被读成静态文件。
+    let looks_static = path.rsplit('/').next().map(|f| f.contains('.')).unwrap_or(false);
+    let (asset, name) = match Assets::get(path).filter(|_| looks_static) {
+        Some(f) => (Some(f), path),
+        None => (Assets::get("index.html"), "index.html"),
+    };
+    match asset {
         Some(f) => Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type(&path))
+            .header(header::CONTENT_TYPE, content_type(name))
             .body(Body::from(f.data.into_owned()))
             .unwrap(),
         None => Response::builder()

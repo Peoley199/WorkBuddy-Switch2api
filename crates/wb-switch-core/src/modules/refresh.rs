@@ -38,8 +38,40 @@ fn heal_encrypted_account(acc: &mut Value) -> bool {
 
 /// 刷新单账号 token（POST /v2/plugin/auth/token/refresh），成功则落盘并返回新账号。
 ///
-/// 刷新失败（refresh token 失效等）时给账号标记 needs_relogin，避免无限重试。
-pub async fn refresh_account_token(mut account: Value) -> Value {
+/// 刷新失败（refresh token 失效等）时，结果通过 `needs_relogin` 字段返回给调用方。
+/// 需要**不落盘**的版本（反代出站前的顺手刷新）见 [`refresh_token_only`]。
+pub async fn refresh_account_token(account: Value) -> Value {
+    let (account, rejected) = refresh_core(account, true).await;
+    // 信封账号只打标记、不改状态；其余（成功 / 缺 RT / 被拒 / 缺 accessToken）都落盘。
+    if rejected && account.get("credentials_encrypted").and_then(Value::as_bool) != Some(true) {
+        // 「被上游拒绝」时 `refresh_core` 不落盘，由这里补上 —— 这是
+        // `refresh_account_token` 与 `refresh_token_only` 唯一的区别。
+        let _ = upsert_account(&account);
+    }
+    account
+}
+
+/// 同 [`refresh_account_token`]，但**从不落盘** —— 上游拒绝（refresh token 失效等）
+/// 时不会把号标成 `needs_relogin`，只把状态写进返回值的 `needs_relogin` /
+/// `_wb_refresh_rejected`。
+///
+/// 反代出站前的「顺手刷新」必须用它：那一步的失败不该把一个号永久打成 `needs_relogin`。
+/// 🔴 曾经踩过：落盘版会把 `needs_relogin=true` 立刻写进账号库，于是 `take_account`
+/// 里的「刷新失败先用旧 token 试一次」永远触发不了 —— 首次失败之后每个请求都只能 503，
+/// 直到用户手动点「刷新」或重新登录。
+pub async fn refresh_token_only(account: Value) -> Value {
+    let (account, _rejected) = refresh_core(account, false).await;
+    account
+}
+
+/// 内部字段：`refresh_core` 用来回报「上游拒绝了这个 refresh token」。
+const REFRESH_REJECTED_KEY: &str = "_wb_refresh_rejected";
+
+/// 刷新的公共部分。`persist_without_token` 决定「拿不到 refresh token」时是否落盘。
+///
+/// 返回 `(账号, 是否被上游拒绝)`。被拒绝时**只有** `refresh_account_token` 会落盘
+/// （见它自己的说明），`refresh_token_only` 一律不落盘。
+async fn refresh_core(mut account: Value, persist_without_token: bool) -> (Value, bool) {
     let previous_access_token = account
         .get("access_token")
         .and_then(|value| value.as_str())
@@ -59,14 +91,16 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     // 该类账号的可用范围仅限于「切换账号」（密文原样写回，客户端自行解密）。
     if has_encrypted_credentials(&account) {
         account["credentials_encrypted"] = json!(true);
-        return account;
+        return (account, false);
     }
 
     if rt.is_empty() {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("缺少 refresh token，无法刷新，需重新登录");
-        let _ = upsert_account(&account);
-        return account;
+        if persist_without_token {
+            let _ = upsert_account(&account);
+        }
+        return (account, false);
     }
 
     let mut headers = build_auth_headers(&account);
@@ -89,21 +123,22 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     // （`eligible_accounts` 会跳过这种号），于是「网络一抖 → 整池罢工」。
     // 2026-10-11 一晚踩了两次：国内版 19:18 / 20:09、国际版 21:53 / 22:05，都是这个原因。
     //
-    // 这里先重试一次（网络抖动多为瞬时），仍失败就**原样返回、不落盘**：
+    // 这里先重试一次（网络抖动多为瞬时），仍失败就**原样返回**：
     // 旧的 access token 可能还有效，后续请求会再试；瞬时失败交给反代的失败冷却去兜，
     // 而不是给账号判死刑。
     if resp.get("code").and_then(Value::as_i64) == Some(-1) {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
         if resp.get("code").and_then(Value::as_i64) == Some(-1) {
-            return account;
+            return (account, false);
         }
     }
 
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
         // 走到这里说明**上游真的拒绝了**（401 / refresh token 失效 / 参数不对），
-        // 这种才是需要重新登录的，照旧标记。
+        // 这种才是需要重新登录的。
+        account[REFRESH_REJECTED_KEY] = json!(true);
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!(format!(
             "刷新失败(code={code}): {}",
@@ -112,8 +147,7 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("未知错误")
         ));
-        let _ = upsert_account(&account);
-        return account;
+        return (account, true);
     }
 
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -125,8 +159,10 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let Some(new_at) = new_at else {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("刷新响应缺少 accessToken");
-        let _ = upsert_account(&account);
-        return account;
+        if persist_without_token {
+            let _ = upsert_account(&account);
+        }
+        return (account, false);
     };
 
     account["access_token"] = json!(new_at);
@@ -175,6 +211,7 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let map = account.as_object_mut().unwrap();
     map.remove("needs_relogin");
     map.remove("needs_relogin_reason");
+    // 刷新**成功**时总是落盘：反代路径也要把新 token 写回去，否则每次请求都会再刷新一遍。
     let _ = upsert_account(&account);
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否
@@ -185,7 +222,7 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
             previous_access_token.as_deref(),
         );
     }
-    account
+    (account, false)
 }
 
 /// 惰性刷新：expiresAt 缺失或剩余 < lazy_refresh_hours 则刷新。返回最新账号。

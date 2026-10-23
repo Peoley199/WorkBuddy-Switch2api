@@ -75,7 +75,7 @@ docker compose -f docker-compose.ghcr.yml up -d
 # 或者本地构建（首次 Rust 全量编译，约 10~20 分钟）
 docker compose up -d --build
 
-# 浏览器打开： http://<这台机器的IP>:57890/?token=$WB_SWITCH_TOKEN
+# 浏览器打开： http://<这台机器的IP>:57890/__auth/boot?token=$WB_SWITCH_TOKEN
 ```
 
 数据全在命名卷 `wb-switch-data` 里，容器重建不丢。镜像只跑 webui + API 反代这条常驻通道。

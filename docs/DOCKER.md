@@ -23,7 +23,7 @@ docker run -d --name wb-switch --restart unless-stopped \
   -v wb-switch-data:/data \
   ghcr.io/cv-superding/workbuddy-switch2api:latest
 
-# 浏览器打开： http://<这台机器的IP>:57890/?token=$WB_SWITCH_TOKEN
+# 浏览器打开： http://<这台机器的IP>:57890/__auth/boot?token=$WB_SWITCH_TOKEN
 ```
 
 也可以用 `docker-compose.ghcr.yml`（免构建）：
@@ -129,9 +129,21 @@ webui 上点了会报错，属预期：
 
 口令的传递方式：
 
-- 首次：地址栏 `?token=<口令>`（静态资源不校验，所以页面能匿名加载）
+- 首次：地址栏 `http://<IP>:57890/__auth/boot?token=<口令>`。这是一个**一次性跳转**：
+  服务端验证口令后 302 到干净的 `/`，口令不出现在页面里（启动横幅 / README 都按这个地址提示）。
+  直接打开 `/?token=…` 同样有效 —— 前端加载后会用 `history.replaceState` 把口令从地址栏抹掉。
 - 之后：前端把它存进 `localStorage`，每次 `/api/*` 带 `Authorization: Bearer <口令>`
-- 引导完立刻把 `?token=` 从地址栏抹掉（`history.replaceState`），免得留在浏览器历史和截图里
+
+`Host` 与来源校验：
+
+- 服务只接受回环名 / **本机 IP** / 白名单里的 `Host`，否则 421 —— 挡 DNS rebinding
+- 反代（不在容器里就用不到，容器的 `-p` 映射已经判成「外部访问」）：
+  从别的机器上的页面访问时，该页面必须先**带对一次口令**（会记住这台主机 24 小时）
+- 用域名访问（反向代理 / 白名单域名）时，把域名加进 `WB_SWITCH_ALLOWED_HOSTS`：
+
+  ```bash
+  -e WB_SWITCH_ALLOWED_HOSTS=wb.example.com,.example.com
+  ```
 
 其它：
 
@@ -148,7 +160,7 @@ webui 上点了会报错，属预期：
 监听地址还是 `127.0.0.1:786X`。看上面「反代怎么对外」。
 
 **所有接口报「无法连接 workbuddy-switch 服务」**
-用的是 `http://<IP>:57890` 打开的吗？换成 `http://<IP>:57890/?token=…`。
+用的是 `http://<IP>:57890` 打开的吗？换成 `http://<IP>:57890/__auth/boot?token=…`。
 如果页面能开但接口全挂，先确认浏览器地址栏的 host 就是容器的 host
 （前端按页面同源请求 API）。
 

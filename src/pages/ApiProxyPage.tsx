@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Check, Copy, ListPlus, Loader2, RefreshCw, Save, Trash2, Users } from "lucide-react";
+import { Check, Clock3, Copy, ListPlus, Loader2, RefreshCw, Save, Trash2, Users } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -18,11 +18,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import {
   accountGroupLabel,
   EDITIONS,
   type AccountMeta,
+  type ProxyAccountCooldown,
   type ProxyConfig,
   type ProxyEndpoint,
   type ProxyEndpointStatus,
@@ -221,6 +223,136 @@ function num3(v?: number): string {
   }).format(v ?? 0);
 }
 
+/** 剩余时间：`1:23` / `12 秒`；已过期返回 null（调用方据此收掉徽标）。 */
+function formatRemaining(until: number, now: number): string | null {
+  const ms = until - now;
+  if (ms <= 0) return null;
+  const total = Math.ceil(ms / 1000);
+  if (total < 60) return `${total} 秒`;
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m < 60) return `${m}:${String(s).padStart(2, "0")}`;
+  const h = Math.floor(m / 60);
+  return `${h} 小时 ${m % 60} 分`;
+}
+
+/** 恢复时刻（本地时间），给 Tooltip 用。 */
+function formatUntil(until: number): string {
+  return new Date(until).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/**
+ * 每秒走一次的「当前时刻」。
+ *
+ * 后端给的是**绝对恢复时刻**，所以倒计时纯本地算 —— 不轮询、不请求后端。
+ * 只在真的有冷却时才起定时器，冷却全部结束后自动停。
+ */
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  return now;
+}
+
+/** 一条冷却徽标：账号级（琥珀）或模型级（次要色）。 */
+function CooldownChip({
+  label,
+  title,
+  tone,
+}: {
+  label: string;
+  title: string;
+  tone: "account" | "model";
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="secondary"
+          className={cn(
+            "h-5 shrink-0 gap-1 border-0 px-1.5 text-[10px] leading-5",
+            tone === "account"
+              ? "bg-amber-100 text-amber-800"
+              : "text-muted-foreground",
+          )}
+        >
+          <Clock3 className="size-3" />
+          {label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-72">
+        {title}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * 某个账号的冷却徽标。
+ *
+ * 账号级冷却优先显示（整个号都不可用）；没有账号级冷却时，逐个列出被冻的模型
+ * —— 那种情况下换个模型就能继续用，文案必须说清楚，别让人以为号废了。
+ */
+function AccountCooldownChips({
+  cooldown,
+  now,
+}: {
+  cooldown: ProxyAccountCooldown | undefined;
+  now: number;
+}) {
+  if (!cooldown) return null;
+
+  const accountLeft =
+    cooldown.until != null ? formatRemaining(cooldown.until, now) : null;
+  if (accountLeft) {
+    return (
+      <CooldownChip
+        tone="account"
+        label={`冷却 ${accountLeft}`}
+        title={`${cooldown.reason || "上游失败"} · ${formatUntil(cooldown.until!)} 恢复。该账号暂时不参与轮转。`}
+      />
+    );
+  }
+
+  // 账号级冷却已结束（或本来就没有）：只展示仍在冷却的模型。
+  const models = (cooldown.models ?? [])
+    .map((m) => ({ ...m, left: formatRemaining(m.until, now) }))
+    .filter((m): m is typeof m & { left: string } => m.left != null);
+  if (models.length === 0) return null;
+
+  return (
+    <>
+      {models.slice(0, 2).map((m) => (
+        <CooldownChip
+          key={m.model}
+          tone="model"
+          label={`${m.model} ${m.left}`}
+          title={`模型 ${m.model}：${m.reason} · ${formatUntil(m.until)} 恢复。该账号的其他模型仍可用。`}
+        />
+      ))}
+      {models.length > 2 ? (
+        <CooldownChip
+          tone="model"
+          label={`+${models.length - 2} 个模型`}
+          title={models
+            .slice(2)
+            .map((m) => `${m.model}（${m.left}）`)
+            .join("、")}
+        />
+      ) : null}
+    </>
+  );
+}
+
 /**
  * 一张统计卡片。
  *
@@ -293,6 +425,24 @@ export default function ApiProxyPage({
     // 于是切过去看到的还是上一版的数据，必须手点「刷新」才对 —— 用户实测就是这个症状。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [edition]);
+
+  /**
+   * 冷却状态轮询。
+   *
+   * 冷却只会因为「请求失败」而产生，后端不会主动推送，所以这里定时问一次。
+   * 只拉 `get_proxy_status`（轻量），不重跑 `load()` —— 那会把账号列表和用量
+   * 也重拉一遍，既慢又会让页面闪。倒计时本身是本地算的（见 `useNow`），
+   * 这个轮询只负责「有没有新的号进入/退出冷却」。
+   */
+  useEffect(() => {
+    if (!st?.running) return;
+    const timer = window.setInterval(() => {
+      // 窗口隐藏时不打扰后端。
+      if (document.visibilityState === "hidden") return;
+      void api.getProxyStatus().then(setSt).catch(() => {});
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [st?.running]);
 
   async function load() {
     try {
@@ -375,6 +525,26 @@ export default function ApiProxyPage({
   const editionAccounts = accounts.filter((a) => (a.edition ?? "domestic") === edition);
   const allAccounts = (ep?.accounts.length ?? 0) === 0;
   const groups = groupAccounts(editionAccounts);
+
+  /** 本版正在冷却的号：`uid -> 冷却状态`。 */
+  const cooldowns = new Map(
+    (st?.accounts ?? [])
+      .filter((c) => c.edition === edition)
+      .map((c) => [c.uid, c] as const),
+  );
+  // 只在真有冷却时走秒；否则不起定时器（页面闲着不该每秒重渲染）。
+  const now = useNow(cooldowns.size > 0);
+
+  /**
+   * 当前仍然有效的冷却条数（账号级算 1 条，每个被冻模型各算 1 条）。
+   *
+   * 用本地时刻算，所以冷却一结束汇总就自动消失 —— 不必等后端下一次返回。
+   */
+  const coolingCount = Array.from(cooldowns.values()).reduce((sum, c) => {
+    const accountActive = c.until != null && c.until > now;
+    const models = (c.models ?? []).filter((m) => m.until > now).length;
+    return sum + (accountActive ? 1 : models);
+  }, 0);
 
   /** 改本页那个入口的字段。
    *
@@ -498,6 +668,7 @@ export default function ApiProxyPage({
                                       {editionLabelOf(a)}
                                     </Badge>
                                   ) : null}
+                                  <AccountCooldownChips cooldown={cooldowns.get(uid)} now={now} />
                                 </div>
                                 {a.needsRelogin ? (
                                   <div className="text-xs text-amber-600">需要重新登录，不会参与</div>
@@ -525,11 +696,81 @@ export default function ApiProxyPage({
                 </div>
               ) : null}
 
+              {/*
+                冷却面板：**不依赖「使用全部账号」那个开关**。
+                关掉时账号列表里虽然有徽标，但打开「使用全部账号」后整个列表都不渲染，
+                冷却状态就会彻底看不见 —— 而那恰恰是最常见的配置。所以单独给一块。
+              */}
+              {coolingCount > 0 ? (
+                <div className="mx-4 my-3 overflow-hidden rounded-lg border border-amber-200/70 bg-amber-50/50 sm:mx-5 dark:border-amber-900/40 dark:bg-amber-950/20">
+                  <div className="flex items-center gap-1.5 border-b border-amber-200/60 px-3 py-1.5 text-xs font-medium text-amber-800 dark:border-amber-900/40 dark:text-amber-300">
+                    <Clock3 className="size-3.5" />
+                    冷却中
+                    <span className="font-normal text-amber-700/70 dark:text-amber-400/70">
+                      · 到期后自动回到轮转池，无需操作
+                    </span>
+                  </div>
+                  <div className="divide-y divide-amber-200/50 dark:divide-amber-900/30">
+                    {Array.from(cooldowns.values()).map((c) => {
+                      const accountLeft =
+                        c.until != null ? formatRemaining(c.until, now) : null;
+                      const models = (c.models ?? []).filter((m) => m.until > now);
+                      if (!accountLeft && models.length === 0) return null;
+                      const acc = accounts.find((a) => (a.uid ?? "") === c.uid);
+                      const name = acc?.nickname || acc?.email || c.uid.slice(0, 8);
+                      return (
+                        <div key={c.uid} className="px-3 py-2 text-xs">
+                          <div className="flex items-baseline justify-between gap-3">
+                            <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
+                            {accountLeft ? (
+                              <span className="shrink-0 tabular-nums text-amber-800 dark:text-amber-300">
+                                {accountLeft} 后恢复
+                              </span>
+                            ) : (
+                              <span className="shrink-0 text-muted-foreground">账号可用</span>
+                            )}
+                          </div>
+                          {accountLeft ? (
+                            <div className="mt-0.5 text-muted-foreground">
+                              {c.reason || "上游失败"} · 整个账号暂停轮转
+                            </div>
+                          ) : null}
+                          {models.length > 0 ? (
+                            <div className="mt-1 space-y-0.5">
+                              {models.map((m) => (
+                                <div
+                                  key={m.model}
+                                  className="flex items-baseline justify-between gap-3 text-muted-foreground"
+                                >
+                                  <code className="min-w-0 truncate">{m.model}</code>
+                                  <span className="shrink-0 tabular-nums">
+                                    {formatRemaining(m.until, now) ?? "即将恢复"}
+                                  </span>
+                                </div>
+                              ))}
+                              <div className="text-[11px] text-muted-foreground/70">
+                                只有上面这些模型被暂停，换其他模型可继续使用
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+
               <div className={cn("mx-4 flex items-center justify-between gap-3 py-3 sm:mx-5", allAccounts && "border-t border-border/50")}>
                 <div className="min-w-0 flex-1 text-xs leading-5 text-muted-foreground/80">
                   {epStatus?.running ? (
                     <>
-                      运行中 · OpenAI 基址{" "}
+                      运行中
+                      {coolingCount > 0 ? (
+                        <span className="text-amber-700 dark:text-amber-400">
+                          {" "}· {coolingCount} 项冷却中
+                        </span>
+                      ) : null}
+                      {" "}· OpenAI 基址{" "}
                       <code className="rounded bg-muted px-1 py-0.5">http://{epStatus.listen}/v1</code>
                       <br />
                       Anthropic 基址{" "}

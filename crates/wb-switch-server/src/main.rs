@@ -195,7 +195,12 @@ async fn serve(args: &[String]) {
     let port = resolve_port(args);
     let token = resolve_token(args);
     guard_exposure(&host, &token);
+    // 不带 `--no-open` 时启动会直接打开浏览器：它在设置口令**之后**、由本机自己发起，
+    // 先把本机来源记进信任表，免得「开着口令、本机从 127.0.0.1 打开」也被跨源校验挡掉。
+    api::trust_loopback_origin();
     api::set_access_token(token.clone());
+    // 端口被映射（`-p 8080:57890`）或监听非回环时，跨源请求必须来自「凭口令认过的」主机。
+    api::set_forwarded(!is_loopback(&host) || std::env::var("WB_SWITCH_IN_CONTAINER").is_ok());
 
     let app = api::router();
     let addr = format!("{host}:{port}");
@@ -210,8 +215,12 @@ async fn serve(args: &[String]) {
     println!("workbuddy-switch v{}", update::APP_VERSION);
     // 带口令时把口令拼进提示里 —— 首次打开要的就是这个带 `?token=` 的地址。
     let shown_host = if host == "0.0.0.0" { "127.0.0.1" } else { &host };
+    // 🔴 带口令时给的是 `/__auth/boot?token=…`，不是 `/?token=…`：
+    // 后者的口令会留在地址栏 / 历史 / 截图里，而且任何「带口令的 GET」都成了一个可被
+    // 第三方页面（`<img>` / `<iframe>` / 重定向）触发的入口。boot 路径验证口令后
+    // 302 到干净的 `/`，页面加载后再用 `Authorization: Bearer` 取数据。
     match &token {
-        Some(t) => println!("webui: http://{shown_host}:{port}/?token={t}"),
+        Some(t) => println!("webui: http://{shown_host}:{port}{}?token={t}", api::BOOTSTRAP_PATH),
         None => println!("webui: http://{shown_host}:{port}"),
     }
     println!("按 Ctrl+C 停止服务。");
@@ -228,7 +237,14 @@ async fn serve(args: &[String]) {
     // `spawn_from_config` 自己会读 proxy.json，只起 enabled 的入口，起不来只打日志不 panic。
     proxy::spawn_from_config();
 
-    axum::serve(listener, app).await.unwrap();
+    // `ConnectInfo` 让中间件拿到「这次连接的本地端口」：`docker -p 8080:57890`
+    // 这类端口映射只有靠它才看得出来，进而把跨源请求判成不可信。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 fn open_browser(addr: &str) {

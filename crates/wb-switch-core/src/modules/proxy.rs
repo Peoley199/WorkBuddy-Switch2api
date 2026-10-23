@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -33,7 +33,8 @@ use uuid::Uuid;
 use super::account::{is_envelope, load_accounts, upsert_account};
 use super::config::{home_dir, now_ms};
 use super::edition::{edition_of, Edition};
-use super::refresh::refresh_account_token;
+use super::http_guard::{self, Access};
+use super::refresh::refresh_token_only;
 
 const CONFIG_FILE: &str = "proxy.json";
 const DEFAULT_CLIENT_VERSION: &str = "5.5.4";
@@ -42,6 +43,11 @@ const DEFAULT_CLI_VERSION: &str = "2.137.1";
 const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
+/// 「号在磁盘上已经不可用」（被删 / 需重新登录 / 无明文凭据）的池内冷却。
+///
+/// 比 [`COOLDOWN`] 短：这类状态可能被用户重新导入 / 重新登录修好，
+/// 长冻只会让「修好了还要等」；短冻足以避免每个请求都去磁盘上重新判定一遍。
+const SKIP_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// 上游「渠道校验」软拦截（`11128`）的最大重试次数。
 ///
@@ -53,7 +59,6 @@ const COOLDOWN: Duration = Duration::from_secs(120);
 const MAX_CHANNEL_RETRY: usize = 2;
 
 /// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
-///
 /// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
 /// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
 /// 国际版只有 3 个号，几下就冻空 ⇒ 客户端收到
@@ -61,6 +66,42 @@ const MAX_CHANNEL_RETRY: usize = 2;
 /// 然后网络再抖 → 再冻 —— 表现为「一会儿报错停下来、一会儿又能用」反复横跳。
 /// （2026-10-11 与 `refresh.rs` 里 `code=-1` 那个坑同源。）
 const MAX_TRANSPORT_RETRY: usize = 1;
+
+/// 出站连接超时。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 流式读取的**首包**超时：从出站到收到第一个字节最多等这么久。
+///
+/// 供 `WB_SWITCH_STREAM_FIRST_BYTE_SECS` 覆盖（默认 90 秒），便于验证与特殊上游。
+fn first_byte_timeout() -> Duration {
+    env_secs("WB_SWITCH_STREAM_FIRST_BYTE_SECS", STREAM_FIRST_BYTE)
+}
+
+const STREAM_FIRST_BYTE: Duration = Duration::from_secs(90);
+
+/// 流式读取的**帧间隔**超时：两次收到上游数据之间最多间隔这么久。
+///
+/// 流式响应不能用 `.timeout()`（那会把整段生成一起掐掉），要限制的是「停滞」。
+/// ⚠️ reqwest 的 `read_timeout` 只对 blocking 客户端生效，async 侧会被静默忽略，
+/// 所以这里必须在泵里自己实现，见 [`StreamGuard::tick`]。
+///
+/// 240 秒是**故意放宽**的：上游在思考模型首字前常常静默几分钟，卡得太紧会把正常请求掐死。
+/// 它防的是「网关静默丢包 / 连接半开导致永久悬挂」，不是慢。
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// 同上，供 `WB_SWITCH_STREAM_IDLE_SECS` 覆盖。
+fn idle_timeout() -> Duration {
+    env_secs("WB_SWITCH_STREAM_IDLE_SECS", STREAM_IDLE_TIMEOUT)
+}
+
+fn env_secs(key: &str, default: Duration) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
 
 /// 入站「思考强度」相关字段名，原样透传给上游。
 ///
@@ -356,19 +397,29 @@ pub fn save_proxy_config(cfg: &ProxyConfig) -> Result<(), String> {
 
 // ---------------------------------------------------------------- 账号池
 
+/// 一个模型的长冷却：恢复时刻 + 为什么被冻。
+struct ModelCooldown {
+    until_ms: i64,
+    reason: String,
+}
+
 struct AccountLease {
     uid: String,
     /// 这个号属于哪一档。国内版和国际版的模型列表不同，
     /// 拿国际版专属的 model 去打国内版网关会被拒，所以选号必须认版本。
     edition: Edition,
-    failed_at: Option<Instant>,
+    /// 账号级短冷却的恢复时刻（epoch 毫秒）。存**绝对时刻**而不是 `Instant`：
+    /// 界面要拿它做本地倒计时，`Instant` 无法序列化给前端。
+    failed_until_ms: Option<i64>,
+    /// 短冷却的原因（给界面看的一句话）。
+    failed_reason: Option<String>,
     /// **按模型**的长冷却：`model -> 恢复时刻`。
     ///
     /// 60004 只代表「这个模型的额度用完了」，同一账号换模型仍可用（上游文案
     /// 自己就写着「您也可以切换其他模型继续使用」）。账号级长冷却会把还能
     /// 用的模型一起冻掉，所以这类失败记在模型键上；账号仍留在池子里服务
     /// 其他模型。
-    model_cooldowns: HashMap<String, Instant>,
+    model_cooldowns: HashMap<String, ModelCooldown>,
 }
 
 struct Pool {
@@ -385,7 +436,8 @@ impl Pool {
                     std::sync::Mutex::new(AccountLease {
                         uid,
                         edition,
-                        failed_at: None,
+                        failed_until_ms: None,
+                        failed_reason: None,
                         model_cooldowns: HashMap::new(),
                     })
                 })
@@ -399,9 +451,17 @@ impl Pool {
     /// `model` 给出时，还会跳过「该模型正在长冷却」的号 —— 60004 只冻那个模型，
     /// 同一账号的其他模型仍可服务。
     ///
+    /// `exclude` 是本轮调用方已经排除掉的 uid（见 [`take_account`]）：挑号与「能不能
+    /// 拿到明文」是两件事，后者只有调用方知道，所以由它把失败的号传回来继续轮。
+    ///
     /// 一个版本都没有可用号时**不会**悄悄换另一个版本 —— 那样只会把
     /// 「模型不存在」的 400 换个地方报出来，不如直接说清楚。
-    fn next_uid_of(&self, want: Option<Edition>, model: Option<&str>) -> Option<String> {
+    fn next_uid_of(
+        &self,
+        want: Option<Edition>,
+        model: Option<&str>,
+        exclude: &[String],
+    ) -> Option<String> {
         if self.leases.is_empty() {
             return None;
         }
@@ -416,9 +476,13 @@ impl Pool {
                     continue;
                 }
             }
+            if exclude.iter().any(|u| *u == lease.uid) {
+                continue;
+            }
+            let now = now_ms_i64();
             let cooling = lease
-                .failed_at
-                .map(|t| t.elapsed() < COOLDOWN)
+                .failed_until_ms
+                .map(|t| t > now)
                 .unwrap_or(false);
             if cooling {
                 continue;
@@ -427,7 +491,7 @@ impl Pool {
                 let model_cooling = lease
                     .model_cooldowns
                     .get(m)
-                    .map(|t| *t > Instant::now())
+                    .map(|c| c.until_ms > now)
                     .unwrap_or(false);
                 if model_cooling {
                     continue;
@@ -447,11 +511,37 @@ impl Pool {
         })
     }
 
-    fn mark_failed(&self, uid: &str) {
+    /// 给账号打一次短冷却（固定 [`COOLDOWN`]），并记下原因供界面展示。
+    fn mark_failed(&self, uid: &str, reason: &str) {
+        self.mark_until(uid, now_ms_i64() + COOLDOWN.as_millis() as i64, reason);
+    }
+
+    /// 号在磁盘上已不可用（被删 / 需重新登录）：短冷却 [`SKIP_COOLDOWN`]。
+    ///
+    /// 用「短冷却」而不是立刻从池子里摘掉：池子是配置快照，摘掉之后用户重新导入 /
+    /// 重新登录也回不来；短冷却到期后 [`take_account`] 会重新读盘判定。
+    fn mark_unusable(&self, uid: &str, reason: &str) {
+        self.mark_until(uid, now_ms_i64() + SKIP_COOLDOWN.as_millis() as i64, reason);
+    }
+
+    /// 把账号级短冷却设到指定时刻（epoch 毫秒）。
+    fn mark_until(&self, uid: &str, until_ms: i64, reason: &str) {
         for slot in &self.leases {
             let Ok(mut lease) = slot.lock() else { continue };
             if lease.uid == uid {
-                lease.failed_at = Some(Instant::now());
+                lease.failed_until_ms = Some(until_ms);
+                lease.failed_reason = Some(reason.to_string());
+            }
+        }
+    }
+
+    /// 清掉账号级短冷却（模型级长冷却不动）。
+    fn clear_cooldown(&self, uid: &str) {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.failed_until_ms = None;
+                lease.failed_reason = None;
             }
         }
     }
@@ -460,47 +550,259 @@ impl Pool {
     ///
     /// 固定的 120 秒短冷却对付频率超限不够：120 秒后号回池立刻又 429，循环空转。
     /// `until_ms` 是上游声明的重置时刻（毫秒）；已过期则视为不冷却。
-    fn mark_model_failed_until(&self, uid: &str, model: &str, until_ms: i64) {
-        let now = now_ms_i64();
-        if until_ms <= now {
+    fn mark_model_failed_until(&self, uid: &str, model: &str, until_ms: i64, reason: &str) {
+        if until_ms <= now_ms_i64() {
             return;
         }
-        let until = Instant::now() + Duration::from_millis((until_ms - now) as u64);
         for slot in &self.leases {
             let Ok(mut lease) = slot.lock() else { continue };
             if lease.uid == uid {
-                lease.model_cooldowns.insert(model.to_string(), until);
+                lease.model_cooldowns.insert(
+                    model.to_string(),
+                    ModelCooldown {
+                        until_ms,
+                        reason: reason.to_string(),
+                    },
+                );
             }
         }
     }
 
     /// 该账号剩余冷却毫秒数：短冷却与**所有模型**长冷却里最晚的那个。
     /// 不在冷却中返回 None。
+    ///
+    /// ⚠️ 这是 `/status` 沿用的**合并口径**（一个数代表整个号）。界面要区分
+    /// 「账号短冷却」和「仅某模型冷却」时用 [`Pool::cooldown_snapshot`]，
+    /// 不要用这个。
     fn cooling_for(&self, uid: &str) -> Option<i64> {
-        let now = Instant::now();
+        let now = now_ms_i64();
         for slot in &self.leases {
             let Ok(lease) = slot.lock() else { continue };
             if lease.uid != uid {
                 continue;
             }
             let short = lease
-                .failed_at
-                .map(|t| COOLDOWN.as_millis() as i64 - t.elapsed().as_millis() as i64)
+                .failed_until_ms
+                .map(|t| t - now)
                 .filter(|m| *m > 0);
             let long = lease
                 .model_cooldowns
                 .values()
-                .map(|t| t.saturating_duration_since(now).as_millis() as i64)
+                .map(|c| c.until_ms - now)
                 .filter(|m| *m > 0)
                 .max();
             return long.max(short);
         }
         None
     }
+
+    /// 冷却快照：**只列仍在冷却中的项**，供界面展示。
+    ///
+    /// 与 [`Pool::cooling_for`] 的关键区别是**不合并**：账号短冷却和逐模型长冷却
+    /// 分开给出，界面才能说清「这个号整个不可用」还是「只有某个模型不可用、换个
+    /// 模型就行」。时间一律是 **epoch 毫秒的绝对时刻**，前端自己做倒计时 ——
+    /// 返回剩余毫秒的话，界面一刷新就会跳变，还得靠轮询续命。
+    ///
+    /// 形如：
+    /// ```json
+    /// { "uid": "u1",
+    ///   "until": 1761200000000, "reason": "上游返回 401",
+    ///   "models": [{"model": "deepseek-v4-pro", "until": 1761203600000, "reason": "频率超限"}] }
+    /// ```
+    /// 两者都为空时不出现（即：不在冷却中的号不进这个数组）。
+    fn cooldown_snapshot(&self) -> Vec<Value> {
+        let now = now_ms_i64();
+        let mut out = Vec::new();
+        for slot in &self.leases {
+            let Ok(lease) = slot.lock() else { continue };
+            let short = lease
+                .failed_until_ms
+                .filter(|t| *t > now)
+                .map(|t| (t, lease.failed_reason.clone().unwrap_or_default()));
+            let models: Vec<Value> = {
+                let mut v: Vec<(String, &ModelCooldown)> = lease
+                    .model_cooldowns
+                    .iter()
+                    .filter(|(_, c)| c.until_ms > now)
+                    .map(|(m, c)| (m.clone(), c))
+                    .collect();
+                // 先恢复的排前面，界面不用再排一次。
+                v.sort_by_key(|(_, c)| c.until_ms);
+                v.into_iter()
+                    .map(|(model, c)| {
+                        json!({
+                            "model": model,
+                            "until": c.until_ms,
+                            "reason": c.reason,
+                        })
+                    })
+                    .collect()
+            };
+            if short.is_none() && models.is_empty() {
+                continue;
+            }
+            out.push(json!({
+                "uid": lease.uid,
+                "edition": lease.edition.key(),
+                "until": short.as_ref().map(|(t, _)| *t),
+                "reason": short.as_ref().map(|(_, r)| r.clone()),
+                "models": models,
+            }));
+        }
+        out
+    }
 }
 
 fn now_ms_i64() -> i64 {
     now_ms() as i64
+}
+
+/// 读上游流的「停滞」看门狗：首包 90 秒、之后每帧间隔 240 秒。
+///
+/// 用法：每次 `next()` 前调 [`StreamGuard::arm`]（超时点 + 原因），
+/// `timeout_at` 超时后把原因交给调用方，拼进错误信息。
+/// 放在泵里而不是 client 上，是因为流式响应不能设整体超时。
+struct StreamGuard {
+    deadline: tokio::time::Instant,
+    stage: &'static str,
+}
+
+impl StreamGuard {
+    fn new() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + first_byte_timeout(),
+            stage: "首包",
+        }
+    }
+
+    /// 进入一轮等待：返回本轮的超时点。`first` = 还没有收到任何字节。
+    fn arm(&mut self, first: bool) {
+        if first {
+            self.deadline = tokio::time::Instant::now() + first_byte_timeout();
+            self.stage = "首包";
+        } else {
+            self.deadline = tokio::time::Instant::now() + idle_timeout();
+            self.stage = "帧间隔";
+        }
+    }
+
+    /// 超时说明（给客户端和日志看的一句话）。
+    fn timed_out(&self) -> String {
+        let limit = if self.stage == "首包" {
+            first_byte_timeout()
+        } else {
+            idle_timeout()
+        };
+        format!(
+            "上游{}超时：{} 秒内没有收到新数据，已中止本次请求",
+            self.stage,
+            limit.as_secs()
+        )
+    }
+}
+
+/// SSE 读泵的产出：要么转给客户端的字节流，要么是「该记账了」的结束事件。
+///
+/// 为什么要单独一个枚举：客户端断开后泵会**立刻停读上游**，但绑定路由还需要一个
+/// 最后的机会去写统计（以前泵直接 return，导致断开后既不记账，也无法区分
+/// 「完整发完」和「中途被断开」）。
+enum PumpOut {
+    Bytes(bytes::Bytes),
+    /// 泵结束了（或刚发现客户端已断开）。只有 `Emitted::Done` 记成功。
+    Finished(Emitted),
+}
+
+/// 泵结束时，客户端到底拿到了多少。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Emitted {
+    /// 上游流完整读完。
+    Done,
+    /// 客户端已经断开，泵主动停读。
+    ClientGone,
+    /// 上游报错 / 读超时。
+    UpstreamError,
+}
+
+/// 客户端侧的 SSE 响应体。
+///
+/// 包一层（换成 `PumpBody`）是为了在**客户端断开**时也能拿到通知：axum 会直接 drop
+/// 响应体，纯 `unfold` 流没有机会做收尾。`PumpBody` 实现 `Drop`，借泵的作者通道
+/// 给泵发一条 `Finished(ClientGone)`；泵收到后才记账 —— 否则被取消的请求在统计里
+/// ok=true、token 照算，账目全错（修复前的行为）。
+fn sse_body(
+    rx: tokio::sync::mpsc::Receiver<PumpOut>,
+    pump_tx: tokio::sync::mpsc::UnboundedSender<Emitted>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+) -> PumpBody {
+    PumpBody {
+        rx: Some(rx),
+        pump_tx: Some(pump_tx),
+        ended: false,
+        stop,
+    }
+}
+
+/// [`sse_body`] 的返回类型：读 `rx`，并在被丢弃（客户端断开 / 服务停止）时通知泵。
+struct PumpBody {
+    rx: Option<tokio::sync::mpsc::Receiver<PumpOut>>,
+    pump_tx: Option<tokio::sync::mpsc::UnboundedSender<Emitted>>,
+    /// 已经读到泵的结束标记；之后再被 drop 就不用重复通知。
+    ended: bool,
+    /// 只给「不自己记账」的泵用：drop 时发一枪令其停读上游。
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl futures::Stream for PumpBody {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let Some(rx) = self.rx.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        match rx.poll_recv(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(None) => {
+                self.ended = true;
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(PumpOut::Bytes(b))) => {
+                std::task::Poll::Ready(Some(Ok(b)))
+            }
+            std::task::Poll::Ready(Some(PumpOut::Finished(outcome))) => {
+                self.ended = true;
+                if outcome == Emitted::UpstreamError {
+                    // 让客户端看到连接异常而不是「正常结束」的半截回复。
+                    std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                        "upstream stream interrupted",
+                    ))))
+                } else {
+                    std::task::Poll::Ready(None)
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PumpBody {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let (Some(rx), Some(tx)) = (
+            self.rx.take(),
+            self.pump_tx.take(),
+        ) {
+            // 泵已经结束（rx 被关）时这条发不出去，忽略即可；泵还活着时它必须收到。
+            let _ = tx.send(Emitted::ClientGone);
+            drop(rx);
+        }
+    }
 }
 
 /// 取一个可用的账号（必要时先刷新 token）。
@@ -512,37 +814,197 @@ async fn take_account(
     want: Option<Edition>,
     model: Option<&str>,
 ) -> Option<Value> {
-    let uid = pool.next_uid_of(want, model)?;
-    let mut acc = load_accounts().into_iter().find(|a| {
-        a.get("uid").and_then(Value::as_str) == Some(uid.as_str())
-            && a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
-    })?;
+    // 🔴 挑号与「从磁盘取明文」必须绑在一起重试。
+    //
+    // `next_uid_of` 只看版本与冷却，看不到 `needs_relogin`，也看不到号是不是还在磁盘上；
+    // 以前这里「挑一次号 + find 一次」再 `?` 掉，于是只要命中的那个号被删了 / 被导入覆盖 /
+    // 被保活或刷新失败标成需要重新登录，这一单就直接 503 —— 哪怕池里还有健康号。
+    // 而 `needs_relogin` 是**永久标记**、`next_uid_of` 从不跳过它，所以只要轮转一次就会
+    // 一直撞上这个号，直到用户点保存或重启（只有那时才会按磁盘重建池）。
+    //
+    // 现在：挑到一个失效号就给它打短冷却（[`SKIP_COOLDOWN`]，到期会重新读盘判定）
+    // 并继续挑下一个 —— 单个坏号只让「这一轮」多绕一步，不会再把整单打成 503。
+    let failed: Vec<String> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    let mut skipped: Option<Value> = None;
+    loop {
+        let Some(uid) = pool.next_uid_of(want, model, &failed) else {
+            // 本轮所有号都被略过了：放过一个（「刷新失败但可能还能用」的）再试一次，
+            // 免得单个号的问题把整池拖空；连一个都没有才真的 503。
+            let acc = skipped?;
+            pool.clear_cooldown(&uid_of(&acc));
+            return Some(acc);
+        };
+        // 同一个号本轮已经试过（理论走不到，兜底防空转）。
+        if tried.contains(&uid) {
+            return None;
+        }
+        // 磁盘上每一个号**每轮只看一次**：已经试过的 uid 不会再被 `next_uid_of`
+        // 绕回来（`tried` 里一出现就直接收工），所以这里不需要额外的排除列表。
+        tried.push(uid.clone());
+        let Some(acc) = load_accounts()
+            .into_iter()
+            .find(|a| is_leasable_uid(a, &uid))
+        else {
+            // 磁盘上没有、或已被标记需要重新登录（或是拿不到明文的信封账号）：
+            // 本轮不再用它。重置得快一些 —— 号可能被重新导入 / 重新登录修好。
+            match load_accounts()
+                .into_iter()
+                .find(|a| a.get("uid").and_then(Value::as_str) == Some(uid.as_str()))
+            {
+                None => eprintln!("[反代] 跳过一个暂不可用的号 uid={uid}（磁盘上已没有这个号）"),
+                Some(a) => eprintln!(
+                    "[反代] 跳过一个暂不可用的号 uid={uid}（{}）",
+                    if a.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
+                        format!(
+                            "需要重新登录：{}",
+                            a.get("needs_relogin_reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                        )
+                    } else {
+                        "没有明文 access token".to_string()
+                    }
+                ),
+            }
+            pool.mark_unusable(&uid, "账号已删除或需要重新登录");
+            continue;
+        };
+        match try_prepare(pool, acc).await {
+            Prepared::Ready(acc) => return Some(acc),
+            Prepared::Fallback(acc) => {
+                // 刷新失败：不再纠结直接出站（token 真失效上游会回 401 并冷却该号），
+                // 但记下来 —— 整池都落到这一档时选它，好过回 503。
+                if skipped.is_none() {
+                    skipped = Some(acc);
+                }
+            }
+            Prepared::Rejected => {}
+            Prepared::Unusable => {
+                pool.mark_unusable(&uid, "刷新失败：没有可用凭据，需要重新登录");
+            }
+        }
+    }
+}
 
+/// 磁盘上「能出站」的账号数量 —— 只用于把 503 说清楚。
+fn eligible_on_disk(cfg: &ProxyConfig, edition: Edition) -> usize {
+    let allowed = &cfg.endpoint(edition).accounts;
+    load_accounts()
+        .iter()
+        .filter(|a| {
+            is_leasable_uid(a, a.get("uid").and_then(Value::as_str).unwrap_or(""))
+                && edition_of(a) == edition
+                && (allowed.is_empty()
+                    || a.get("uid")
+                        .and_then(Value::as_str)
+                        .map(|u| allowed.iter().any(|x| x == u))
+                        .unwrap_or(false))
+        })
+        .count()
+}
+
+/// 账号对象的 uid。
+fn uid_of(acc: &Value) -> String {
+    acc.get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 这个账号对象能否作为 `uid` 的可用凭据：uid 对得上、不需要重新登录、带明文 access token。
+///
+/// 信封账号（`access_token` 是 `{$wbEncrypted,…}`）拼不出 `Authorization: Bearer …`，
+/// 打上游只会 401 —— 与 [`eligible_accounts`] 同一个判据，别各写一份。
+fn is_leasable_uid(a: &Value, uid: &str) -> bool {
+    a.get("uid").and_then(Value::as_str) == Some(uid)
+        && a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
+        && !is_envelope(a, "access_token")
+}
+
+/// 重试取号的结论。
+enum Prepared {
+    /// 凭据就绪（必要时已刷新并落盘）。
+    Ready(Value),
+    /// 刷新失败，但磁盘上的旧凭据还可以用 —— 只有当整池都落到这一档时才会被选中。
+    ///
+    /// 注意这里**不打冷却**：号本身可能没坏（上游抖了一下），打冷却等于把它踢出轮转。
+    /// 连整池都落到这一档时才有意义 —— 那时它会因为 `skipped` 被直接选中。
+    Fallback(Value),
+    /// 上游明确拒绝了 refresh token（需要重新登录），不冷却、不落盘，也不当兜底。
+    Rejected,
+    /// 手上没有可用凭据（缺 refresh token / 刷新响应里没有 accessToken）：
+    /// 这一轮跳过，给它一个短冷却后重新读盘判定。
+    Unusable,
+}
+
+/// 拿到账号后按需刷新 token。
+async fn try_prepare(_pool: &Pool, mut acc: Value) -> Prepared {
     let exp = acc.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
     if exp - now_ms_i64() < REFRESH_MARGIN_MS {
+        let uid = uid_of(&acc);
+        // 🔴 刷新失败**不直接回 503**：旧 access token 可能还没过期，或上游只是抖了一下。
+        // 以前单个号刷新失败/超时就把整单 503 掉，哪怕池里还有别的号。
+        //
+        // 🔴 必须用**不落盘**的版本：落盘版会顺手把号打成 `needs_relogin`，于是下一次
+        // `is_leasable_uid` 就直接把它当「磁盘上不可用」跳过 —— 这里的兜底永远触发不了，
+        // 首次刷新失败之后每个请求都只能 503。
         match tokio::time::timeout(
             Duration::from_secs(30),
-            refresh_account_token(acc.clone()),
+            refresh_token_only(acc.clone()),
         )
         .await
         {
             Ok(refreshed) => {
                 if refreshed.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
-                    pool.mark_failed(&uid);
-                    return None;
+                    // 只在日志里体现；号不冷却、不落盘，下一次请求还会再试刷新。
+                    if refreshed
+                        .get("_wb_refresh_rejected")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        // 上游明确拒绝了 refresh token —— 这是**账号层面**的事实，不是抖动：
+                        // 不冻号（旧 token 可能还没过期，冻了就丢掉一次可用机会），
+                        // 但也不能假装它能恢复：本轮的兜底（整池都落到这一档时才用它）会跳过它。
+                        eprintln!(
+                            "[反代] uid={uid} 的 refresh token 已被上游拒绝（{}），请重新登录",
+                            refreshed
+                                .get("needs_relogin_reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                        );
+                        return Prepared::Rejected;
+                    }
+                    // 其余失败里，「缺 RT」「刷出来的响应里没有 accessToken」这两种
+                    // 说明手上**没有可用的凭据**，拿旧 token 出站也只会被上游 401：
+                    // 这一轮跳过（不落盘、不冷却过久 —— 30 秒后再重新读盘判定，
+                    // 用户重新登录 / 重新导入后自动回池）。
+                    let reason = refreshed
+                        .get("needs_relogin_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let no_credential = reason.contains("缺少 refresh token")
+                        || reason.contains("缺少 accessToken");
+                    if no_credential {
+                        eprintln!("[反代] 跳过 uid={uid}：没有可用凭据（{reason}）");
+                        return Prepared::Unusable;
+                    }
+                    // 网络类失败可能只是暂时的：先用旧 token 试。
+                    eprintln!("[反代] 刷新失败 uid={uid}（{reason}），先用现有 token 重试");
+                    return Prepared::Fallback(acc);
                 }
                 acc = refreshed;
             }
             Err(_) => {
-                eprintln!("[反代] 刷新超时 uid={uid}");
-                pool.mark_failed(&uid);
-                return None;
+                eprintln!("[反代] 刷新超时 uid={uid}，先用现有 token 重试");
+                return Prepared::Fallback(acc);
             }
         }
     }
     let _ = upsert_account(&acc);
-    Some(acc)
+    Prepared::Ready(acc)
 }
+
 
 // ---------------------------------------------------------------- 上游
 
@@ -880,20 +1342,34 @@ fn is_channel_block(text: &str) -> bool {
     text.contains("11128") || text.contains("unapproved channel")
 }
 
-/// 解析上游「使用频率超限」（code 60004）响应，返回重置时刻（毫秒）。
+/// 解析上游「使用频率超限」响应，返回重置时刻（毫秒）。
 ///
-/// 上游体是双层 JSON：外层 `{"message":"{\"code\":60004,\"msg\":\"…将在
-/// 2026-10-17 11:46:56 UTC+8 重置…\"}"}`。直接在原文上抠关键字与时间串，
-/// 避免两层反序列化；时间格式固定为 `YYYY-MM-DD HH:MM:SS UTC+8`。
+/// 两档上游的码和文案都不一样，但时间都写死在句子里，格式同为
+/// `YYYY-MM-DD HH:MM:SS UTC+8`：
+///
+/// - 国内版（code 60004）：`{"message":"{\"code\":60004,\"msg\":\"…将在
+///   2026-10-17 11:46:56 UTC+8 重置…\"}"}`（双层 JSON）
+/// - 国际版（code 6004）：`{"code":6004,"msg":"usage exceeds frequency limit,
+///   but don't worry, your usage will reset at 2026-10-23 21:59:54 UTC+8, …"}`
+///
+/// 直接在原文上抠关键字与时间串，避免两层反序列化。
 /// 不是频率超限（或缺重置时间）返回 None，调用方走普通冷却。
 fn rate_limit_reset_ms(text: &str) -> Option<i64> {
-    if !(text.contains("60004") || text.contains("频率限制")) {
+    // 🔴 先认国内版：`6004` 是 `60004` 的子串，顺序反过来会把两版混在一起。
+    // 国际版漏判的后果很实在：只走 120 秒短冷却，号回池立刻又 429、整池空转，
+    // 客户端拿到的还是原始英文 JSON —— 而不是「哪个号、哪个模型、何时恢复」。
+    let tail = if text.contains("60004") || text.contains("频率限制") {
+        let tail = &text[text.find("频率限制")?..];
+        &tail[tail.find("将在")? + "将在".len()..]
+    } else if text.contains("6004")
+        && text.contains("frequency limit")
+        && text.contains("will reset at")
+    {
+        // 三个条件都要：单靠 `6004` 会被 requestId 之类十六进制串误命中。
+        &text[text.find("will reset at")? + "will reset at".len()..]
+    } else {
         return None;
-    }
-    let idx = text.find("频率限制")?;
-    let tail = &text[idx..];
-    let at = tail.find("将在")?;
-    let tail = &tail[at + "将在".len()..];
+    };
     let raw: String = tail
         .chars()
         .skip_while(|c| !c.is_ascii_digit())
@@ -1156,6 +1632,14 @@ struct AppState {
     edition: Edition,
     /// 本实例的接入点（监听地址 + **自己的** API Key）。
     endpoint: Arc<Endpoint>,
+    /// 聊天主链路共用的出站 client。
+    ///
+    /// 🔴 以前**每个请求**都 `Client::builder().build()` 一个新的：连接池、TLS 会话
+    /// 全都不能复用，还得带超时重连；同时它**没有任何超时**，上游静默丢包时
+    /// `send().await` 会永久悬挂，[`MAX_TRANSPORT_RETRY`] 永远等不到 Err。
+    /// 现在全局一份，带 [`CONNECT_TIMEOUT`]；流式响应的「停滞」由泵里的
+    /// [`StreamGuard`] 兜（整体超时会误杀长回复）。
+    stream_upstream: Arc<reqwest::Client>,
 }
 
 fn unauthorized() -> Response {
@@ -1313,7 +1797,7 @@ async fn pick_account_of(cfg: &ProxyConfig, edition: Option<Edition>) -> Option<
     if exp - now_ms_i64() >= REFRESH_MARGIN_MS {
         return Some(acc);
     }
-    match tokio::time::timeout(Duration::from_secs(30), refresh_account_token(acc.clone())).await {
+    match tokio::time::timeout(Duration::from_secs(30), refresh_token_only(acc.clone())).await {
         Ok(refreshed) if refreshed.get("needs_relogin").and_then(Value::as_bool) != Some(true) => {
             let _ = upsert_account(&refreshed);
             Some(refreshed)
@@ -2238,13 +2722,23 @@ fn take_flush(
     out
 }
 
-/// 读完整条上游流，边重组边推给客户端；结束时补末帧与 `[DONE]`，并记录用量。
+/// 读完整条上游流，边重组边推给客户端；结束时补末帧与 `[DONE]`，并通过
+/// [`PumpOut::Finished`] 告诉路由这一单该怎么记账。
+///
+/// 🔴 记账判定（修复前这里是**无条件** `ok=true`）：
+/// - `Done`：上游流完整读完；
+/// - `ClientGone`：客户端中途断开 —— **立刻停读上游**（drop 上游流），记 `ok=false`，
+///   且已发出的部分 token 照实计（上游确实算过费）。以前这里会把剩余回复读完丢弃、
+///   还记成功；
+/// - `UpstreamError`：上游报错 / 读超时，记 `ok=false`。
+#[allow(clippy::too_many_arguments)]
 async fn sse_pump<S>(
+    client: Arc<reqwest::Client>,
     mut upstream: S,
-    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    tx: tokio::sync::mpsc::Sender<PumpOut>,
     meta: UsageMeta,
 ) where
-    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
     let mut raw = String::new();
     let mut tail = String::new();
@@ -2253,28 +2747,36 @@ async fn sse_pump<S>(
     let mut role_done = false;
     let mut field = String::new();
     let mut acc = String::new();
+    let mut guard = StreamGuard::new();
+    let mut got_any = false;
 
-    'outer: while let Some(item) = upstream.next().await {
+    let outcome = 'outer: loop {
+        guard.arm(!got_any);
+        let next = match tokio::time::timeout_at(guard.deadline, upstream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                eprintln!("[反代] uid={} model={} {}", meta.uid, meta.model, guard.timed_out());
+                break Emitted::UpstreamError;
+            }
+        };
+        let Some(item) = next else { break Emitted::Done };
         match item {
             Ok(chunk) => {
+                got_any = true;
                 let text = String::from_utf8_lossy(&chunk).to_string();
                 raw.push_str(&text);
                 tail.push_str(&text);
             }
             Err(e) => {
-                record_usage(&meta, None, false);
-                let _ = tx
-                    .send(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )))
-                    .await;
-                return;
+                eprintln!("[反代] 上游流中断 uid={} model={}: {e}", meta.uid, meta.model);
+                break Emitted::UpstreamError;
             }
         }
 
         // 按空行切出完整事件；不足一个事件的留在 tail 里等下一块
-        while let Some(idx) = tail.find("\n\n") {
+        while let Some(idx) = tail.find("
+
+") {
             let event = tail[..idx].to_string();
             tail.drain(..idx + 2);
 
@@ -2300,16 +2802,16 @@ async fn sse_pump<S>(
             // 客户端只能收到 finish_reason="tool_calls" 却拿不到工具数据。
             if has_tool_delta(&frame) {
                 if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
-                    if tx.send(Ok(b)).await.is_err() {
-                        break 'outer;
+                    if tx.send(PumpOut::Bytes(b)).await.is_err() {
+                        break 'outer Emitted::ClientGone;
                     }
                 }
                 field.clear();
                 let mut fwd = frame.clone();
                 normalize_finish(&mut fwd);
                 if let Some(b) = sse_bytes(&fwd) {
-                    if tx.send(Ok(b)).await.is_err() {
-                        break 'outer;
+                    if tx.send(PumpOut::Bytes(b)).await.is_err() {
+                        break 'outer Emitted::ClientGone;
                     }
                 }
                 // 这帧已带着自己的 finish_reason 原样发出，不能再进 last_frame
@@ -2327,8 +2829,8 @@ async fn sse_pump<S>(
                 };
                 if field != next_field {
                     if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
-                        if tx.send(Ok(b)).await.is_err() {
-                            break 'outer;
+                        if tx.send(PumpOut::Bytes(b)).await.is_err() {
+                            break 'outer Emitted::ClientGone;
                         }
                     }
                     field = next_field.to_string();
@@ -2341,8 +2843,8 @@ async fn sse_pump<S>(
                 };
                 if acc.chars().count() >= limit {
                     if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
-                        if tx.send(Ok(b)).await.is_err() {
-                            break 'outer;
+                        if tx.send(PumpOut::Bytes(b)).await.is_err() {
+                            break 'outer Emitted::ClientGone;
                         }
                     }
                 }
@@ -2353,10 +2855,21 @@ async fn sse_pump<S>(
                 last_frame = Some(frame);
             }
         }
+    };
+
+    // 🔴 客户端已经走了：先断开上游，后面的收尾一律没必要做。
+    if outcome == Emitted::ClientGone {
+        drop(upstream);
+        let usage = usage_from_sse(&raw);
+        record_usage(&meta, usage.as_ref(), false);
+        // 这里不再往 tx 发结束标记：客户端那侧的 [`PumpBody`] 可能已经被 drop，
+        // 发不出去反而会阻塞。收尾状态由 `PumpBody::drop` 自己的通知驱动，不依赖这条。
+        let _ = &client;
+        return;
     }
 
     if let Some(b) = take_flush(template.as_ref(), &field, &mut acc, &mut role_done) {
-        let _ = tx.send(Ok(b)).await;
+        let _ = tx.send(PumpOut::Bytes(b)).await;
     }
     if let Some(mut frame) = last_frame {
         normalize_finish(&mut frame);
@@ -2374,15 +2887,19 @@ async fn sse_pump<S>(
             }
         }
         if let Some(b) = sse_bytes(&frame) {
-            let _ = tx.send(Ok(b)).await;
+            let _ = tx.send(PumpOut::Bytes(b)).await;
         }
     }
     let _ = tx
-        .send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+        .send(PumpOut::Bytes(bytes::Bytes::from_static(b"data: [DONE]
+
+")))
         .await;
 
     let usage = usage_from_sse(&raw);
-    record_usage(&meta, usage.as_ref(), true);
+    record_usage(&meta, usage.as_ref(), outcome == Emitted::Done);
+    let _ = tx.send(PumpOut::Finished(outcome)).await;
+    drop(client);
 }
 
 async fn chat_completions(
@@ -2442,7 +2959,17 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     }
 
     let Some(acc) = take_account(&st.pool, &st.cfg, Some(st.edition), Some(model.as_str())).await else {
-        let message = if st.pool.has_edition(st.edition) {
+        // 报错要说清楚是「冷却中」还是「号在磁盘上已经不可用（被删 / 需重新登录）」——
+        // 以前两者共用一句「都不可用」，用户修完重新登录还以为没生效。
+        let eligible = eligible_on_disk(&st.cfg, st.edition);
+        let message = if st.pool.has_edition(st.edition) && eligible == 0 {
+            // 池子里还有这一版的号，但磁盘上一个都拿不到明文 ⇒ 它们都是「被删 / 需重新登录」，
+            // 只是还在 30 秒的跳过冷却里。
+            format!(
+                "{}的账号都在磁盘上不可用（被删除、需要重新登录、或缺少明文凭据），正在等待重新登录 / 重新导入",
+                st.edition.label()
+            )
+        } else if st.pool.has_edition(st.edition) {
             format!(
                 "{}的账号当前都不可用（冷却中，或需要重新登录）",
                 st.edition.label()
@@ -2474,10 +3001,7 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         edition: st.edition,
     };
 
-    let client = match reqwest::Client::builder().build() {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let client = st.stream_upstream.as_ref();
     // 上游不认识的内容块（zcode 等客户端发的 file / document）在这里降级成文本，
     // 否则整条请求会被上游 400：`unsupported content type at index 0: file`。
     let mut degraded: Vec<String> = Vec::new();
@@ -2566,16 +3090,20 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         // 与连接层失败是同一类误判，会让整池无谓地空掉。
         let status = StatusCode::from_u16(raw_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let account_name = meta.nickname.clone();
-        // 🔴 60004 频率超限：按上游声明的重置时刻把**整个账号**暂停出池 ——
-        // 120 秒的短冷却只会让它回池后立刻再 429，循环空转。同时给客户端一句
-        // 人话：哪个账号、哪个模型、什么时候恢复、怎么继续用，
+        // 🔴 频率超限（国内版 60004 / 国际版 6004）：按上游声明的重置时刻把
+        // **整个账号**暂停出池 —— 120 秒的短冷却只会让它回池后立刻再 429，循环空转。
+        // 同时给客户端一句人话：哪个账号、哪个模型、什么时候恢复、怎么继续用，
         // 替代之前那坨双层转义的原始 JSON。
         if let Some(until_ms) = rate_limit_reset_ms(&text) {
             // 长冷却记在**模型**键上：账号的其他模型仍可服务（上游自己也是
             // 这个口径 ——「您也可以切换其他模型继续使用」）。另外给一次账号级
             // 短冷却，把并发请求从「立刻又撞同一个失败号」里拉出来。
-            st.pool.mark_model_failed_until(&uid, &model, until_ms);
-            st.pool.mark_failed(&uid);
+            st.pool
+                .mark_model_failed_until(&uid, &model, until_ms, "上游频率超限（6004/60004）");
+            // 账号级短冷却：把并发请求从「立刻又撞同一个失败号」里拉出来。
+            // 注意它同时冻住了该号的其他模型 120 秒 —— 界面会把这两条分开显示，
+            // 所以原因写清楚是「因频率超限」。
+            st.pool.mark_failed(&uid, "上游频率超限（6004/60004），账号暂停 120 秒");
             let reset_at = Local
                 .timestamp_millis_opt(until_ms)
                 .single()
@@ -2602,13 +3130,16 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                 .into_response();
         }
         if raw_status.is_client_error() {
-            st.pool.mark_failed(&uid);
-            if is_channel_block(&text) {
+            let reason = if is_channel_block(&text) {
                 eprintln!(
                     "[反代] 渠道校验重试 {channel_retry} 次后仍被拦，冷却该账号 \
                      (model={model}, uid={uid})"
                 );
-            }
+                "渠道校验被拦（重试后仍失败）".to_string()
+            } else {
+                format!("上游返回 {}", raw_status.as_u16())
+            };
+            st.pool.mark_failed(&uid, &reason);
         } else {
             eprintln!(
                 "[反代] 上游 {} 失败（上游侧问题，不冷却账号）(model={model}, uid={uid})",
@@ -2626,15 +3157,18 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     if want_stream {
         // 不再原样透传：先过一层 SSE 重组器（见 sse_pump 的说明），
         // 否则上游「一两个词一帧」的粒度会让客户端把思考渲染成一片小方块。
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<PumpOut>(64);
         // bytes_stream() 返回的 impl Stream 不保证 Unpin，必须 Box::pin 一下
         let upstream = Box::pin(resp.bytes_stream());
+        // 泵持有 client 的 Arc：连接池属于 client，client 一旦被 drop，尚未读完的
+        // 连接也会跟着关掉。泵要在客户端断开后独立收尾，所以这个引用不能提前释放。
+        let upstream_arc = Arc::clone(&st.stream_upstream);
         tokio::spawn(async move {
-            sse_pump(upstream, tx, meta).await;
+            sse_pump(upstream_arc, upstream, tx, meta).await;
         });
-        let body = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
+        // 泵的结束状态：`PumpBody` 读到就结束响应体；被 drop（客户端断开）时用它叫停泵。
+        let (pump_tx, mut pump_rx) = tokio::sync::mpsc::unbounded_channel::<Emitted>();
+        let body = sse_body(rx, pump_tx, None);
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream; charset=utf-8")
@@ -2642,6 +3176,10 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
             .header("X-Accel-Buffering", "no")
             .body(axum::body::Body::from_stream(body))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        // 泵的收尾通知（记完账才发）在这里消费掉：留着不管的话 channel 会一直挂着。
+        tokio::spawn(async move {
+            while pump_rx.recv().await.is_some() {}
+        });
         with_degraded_header(resp, &degraded)
     } else {
         let resp = match aggregate(Box::pin(resp.bytes_stream()), &model).await {
@@ -3563,37 +4101,44 @@ fn anthropic_usage_from(usage: Option<&Value>) -> Value {
 /// 读内部 chat 的 SSE，逐帧转成 Anthropic SSE。
 async fn anthropic_sse_pump<S, E>(
     mut upstream: S,
-    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    tx: tokio::sync::mpsc::Sender<PumpOut>,
     model: String,
-) where
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> Emitted
+where
     S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut st = AnthropicStream::new(model);
     for (event, data) in st.start_events() {
         if tx
-            .send(Ok(anthropic_event_bytes(&event, &data)))
+            .send(PumpOut::Bytes(anthropic_event_bytes(&event, &data)))
             .await
             .is_err()
         {
-            return;
+            return Emitted::ClientGone;
         }
     }
 
     let mut tail = String::new();
-    'outer: while let Some(item) = upstream.next().await {
-        let chunk = match item {
-            Ok(c) => c,
-            Err(e) => {
-                let data = json!({
-                    "type": "error",
-                    "error": {"type": "api_error", "message": e.to_string()}
-                });
-                let _ = tx
-                    .send(Ok(anthropic_event_bytes("error", &data)))
-                    .await;
-                return;
-            }
+    'outer: loop {
+        // 客户端断开时 `PumpBody::drop` 会发一枪 stop：立刻停读并释放上游。
+        let chunk = tokio::select! {
+            _ = &mut stop => return Emitted::ClientGone,
+            item = upstream.next() => match item {
+                None => break 'outer,
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    let data = json!({
+                        "type": "error",
+                        "error": {"type": "api_error", "message": e.to_string()}
+                    });
+                    let _ = tx
+                        .send(PumpOut::Bytes(anthropic_event_bytes("error", &data)))
+                        .await;
+                    return Emitted::UpstreamError;
+                }
+            },
         };
         tail.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(idx) = tail.find("\n\n") {
@@ -3618,24 +4163,25 @@ async fn anthropic_sse_pump<S, E>(
             let has_error = events.iter().any(|(name, _)| name == "error");
             for (name, value) in events {
                 if tx
-                    .send(Ok(anthropic_event_bytes(&name, &value)))
+                    .send(PumpOut::Bytes(anthropic_event_bytes(&name, &value)))
                     .await
                     .is_err()
                 {
-                    return;
+                    return Emitted::ClientGone;
                 }
             }
             if has_error {
-                return;
+                return Emitted::UpstreamError;
             }
         }
     }
 
     for (event, data) in st.finish() {
         let _ = tx
-            .send(Ok(anthropic_event_bytes(&event, &data)))
+            .send(PumpOut::Bytes(anthropic_event_bytes(&event, &data)))
             .await;
     }
+    Emitted::Done
 }
 
 /// 非流式：把内部 chat 的 SSE 聚合成一条 Anthropic message。
@@ -3779,15 +4325,19 @@ async fn anthropic_messages(
 
     let stream = Box::pin(resp.into_body().into_data_stream());
     if want_stream {
-        let (tx, rx) =
-            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<PumpOut>(64);
+        // Anthropic 入口读的是上面 `chat_completions_inner` 产出的本地 SSE
+        // （收尾记账由那条链路负责）。但客户端断开时它同样要**停读并释放上游**，
+        // 否则「取消后继续读完」在这里也存在 —— 只是浪费少一些（不跨网络）。
+        let (pump_tx, pump_rx) = tokio::sync::mpsc::unbounded_channel::<Emitted>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let pump_model = model.clone();
         tokio::spawn(async move {
-            anthropic_sse_pump(stream, tx, pump_model).await;
+            anthropic_sse_pump(stream, tx, pump_model, stop_rx).await;
         });
-        let body = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
+        let body = sse_body(rx, pump_tx, Some(stop_tx));
+        // 这条链路不记账，`pump_rx` 直接丢掉即可（接收端一 drop，发送端就发不出去）。
+        drop(pump_rx);
         let out = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream; charset=utf-8")
@@ -3818,8 +4368,39 @@ async fn anthropic_count_tokens(
     Json(json!({"input_tokens": tokens})).into_response()
 }
 
+/// 诊断类只读接口的守卫。
+///
+/// `/status` 与 `/usage-stats` **不需要 `api_key`**（它们是给本机排障 / 监控脚本用的），
+/// 但会吐出账号昵称、uid、过期时间、用量曲线 —— 对本机反代来说这就是敏感数据。
+/// 以前它们完全不做来源校验：浏览器里任何页面都能借 DNS rebinding 把它们当同源读走
+/// （实测伪造 `Host: evil.example.com` 照样 200 返回完整数据）。
+///
+/// 规则：
+/// - `Host` 必须是回环 / 本机 IP / 白名单域名（`http_guard::check_host`）；
+/// - 带了 `Origin` 却不在本机（或白名单）⇒ 拒。本机直连时浏览器里只有本机页面能访问
+///   这个回环端口，`Origin` 只可能是本机页面，放行。
+fn guard_diagnostics(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if http_guard::check_host(headers).is_err() {
+        return Err(Box::new(http_guard::rejected(Access::BadHost)));
+    }
+    let cross_site = match headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some("null") => true,
+        Some(o) => http_guard::host_of_url(o)
+            .map(|h| !http_guard::is_trusted_host(&h))
+            .unwrap_or(true),
+        None => false,
+    };
+    if cross_site {
+        return Err(Box::new(http_guard::rejected(Access::CrossSite)));
+    }
+    Ok(())
+}
+
 /// `/status` —— 报告**本入口**的情况：它是哪一版、监听在哪、这一版有哪些号。
-async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
+async fn proxy_status(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = guard_diagnostics(&headers) {
+        return *resp;
+    }
     let allowed = &st.endpoint.accounts;
     let items: Vec<Value> = load_accounts()
         .into_iter()
@@ -3857,10 +4438,14 @@ async fn proxy_status(State(st): State<AppState>) -> impl IntoResponse {
         "hasApiKey": !st.endpoint.api_key.trim().is_empty(),
         "accounts": items
     }))
+    .into_response()
 }
 
 /// 本入口自己的用量统计（**只含本版**，不会把另一版的量混进来）。
-async fn usage_stats(State(st): State<AppState>) -> Response {
+async fn usage_stats(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = guard_diagnostics(&headers) {
+        return *resp;
+    }
     Json(load_usage_for(st.edition)).into_response()
 }
 
@@ -3910,6 +4495,12 @@ async fn run_endpoint_until(
         pool,
         edition,
         endpoint: Arc::new(endpoint),
+        stream_upstream: Arc::new(
+            reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("reqwest client 构建失败只在 TLS 后端异常时发生"),
+        ),
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -4125,6 +4716,30 @@ pub fn stop_proxy_server() {
     }
 }
 
+/// 当前在用的账号池（两个入口共享同一份）。
+///
+/// 为什么要存到进程级：`Pool` 原本是 [`apply_config`] 里的局部变量，只有
+/// `AppState` 够得着，界面层（Tauri 命令 / WebUI）拿不到 ⇒ 冷却状态在界面上
+/// 完全看不见。这里只存 `Arc` 引用，不改变生命周期与所有权。
+fn current_pool() -> &'static Mutex<Option<Arc<Pool>>> {
+    static POOL: OnceLock<Mutex<Option<Arc<Pool>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(None))
+}
+
+/// 冷却快照（**两个入口合并**，每条自带 `edition`）。
+///
+/// 反代没在跑（或从未启动）时返回空数组 —— 此时池子不存在，自然也没有冷却。
+pub fn cooldown_snapshot() -> Vec<Value> {
+    let pool = current_pool()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    match pool {
+        Some(p) => p.cooldown_snapshot(),
+        None => Vec::new(),
+    }
+}
+
 /// 按配置重建两个入口。返回**每个已启用版本**的启动结果。
 ///
 /// 刻意做成「逐版本返回」而不是一个总的 Result：国际版没账号属于常态，
@@ -4132,6 +4747,10 @@ pub fn stop_proxy_server() {
 pub fn apply_config(cfg: &ProxyConfig) -> Vec<(Edition, Result<(), String>)> {
     stop_proxy_server();
     let pool = Arc::new(Pool::new(eligible_accounts(cfg)));
+    // 让界面层能读到这份池子的冷却状态（见 `cooldown_snapshot`）。
+    if let Ok(mut g) = current_pool().lock() {
+        *g = Some(pool.clone());
+    }
     let cfg = Arc::new(cfg.clone());
     let mut out = Vec::new();
     for edition in Edition::ALL {
@@ -4166,24 +4785,33 @@ pub fn restart_proxy_server() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// `YYYY-MM-DD HH:MM:SS`（UTC+8）→ epoch 毫秒，只给下面几条解析用例用。
+    fn utc8_ms(s: &str) -> i64 {
+        chrono::FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap(),
+            )
+            .unwrap()
+            .timestamp_millis()
+    }
+
     /// 60004 的双层转义 JSON 必须能解析出重置时刻 —— 这是「按重置时间
     /// 暂停账号」而不是「120 秒后回池再 429」的依据。
     #[test]
     fn parses_rate_limit_reset_from_nested_json() {
         let body = r#"{"message":"{\"code\":60004,\"msg\":\"您的使用量已超出频率限制，将在 2026-10-17 11:46:56 UTC+8 重置，您也可以切换其他模型继续使用。\",\"requestId\":\"00000000000000463270d2d3db8ba1\"}","type":"upstream_error"}"#;
         let until = rate_limit_reset_ms(body).expect("60004 应解析出重置时刻");
-        let expected = chrono::FixedOffset::east_opt(8 * 3600)
-            .unwrap()
-            .from_local_datetime(
-                &chrono::NaiveDateTime::parse_from_str(
-                    "2026-10-17 11:46:56",
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .unwrap(),
-            )
-            .unwrap()
-            .timestamp_millis();
-        assert_eq!(until, expected);
+        assert_eq!(until, utc8_ms("2026-10-17 11:46:56"));
+    }
+
+    /// 国际版（code 6004）的英文文案同样要解析出重置时刻 ——
+    /// 漏判的话只会走 120 秒短冷却，号回池立刻又 429、整池空转。
+    #[test]
+    fn parses_rate_limit_reset_from_international_body() {
+        let body = r#"{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-10-23 21:59:54 UTC+8, alternatively, you can switch to the other models to continue using it.","requestId":"0000000000000000460c41606902166d"}"#;
+        let until = rate_limit_reset_ms(body).expect("6004 应解析出重置时刻");
+        assert_eq!(until, utc8_ms("2026-10-23 21:59:54"));
     }
 
     /// 非频率超限的上游体不得误判 —— 否则普通 4xx 会被错误地长时间冷却。
@@ -4194,6 +4822,10 @@ mod tests {
         assert!(rate_limit_reset_ms("").is_none());
         // 有 60004 关键字但缺「将在 … 重置」时间串的残缺体也要兜住。
         assert!(rate_limit_reset_ms(r#"{"message":"{\"code\":60004,\"msg\":\"?\"}"}"#).is_none());
+        // 国际版同理：缺 `will reset at` 时不能当成频率超限。
+        assert!(rate_limit_reset_ms(r#"{"code":6004,"msg":"?"}"#).is_none());
+        // `6004` 单独出现不算数 —— requestId 之类十六进制串可能恰好含它。
+        assert!(rate_limit_reset_ms(r#"{"code":0,"msg":"ok","requestId":"6004abcd"}"#).is_none());
     }
 
     /// system prompt 末尾的环境注入块会被摘掉——上游的渠道校验（11128）正是靠
@@ -4698,16 +5330,16 @@ mod tests {
             ("u-intl".to_string(), Edition::International),
             ("u-dom".to_string(), Edition::Domestic),
         ]);
-        assert_eq!(pool.next_uid_of(Some(Edition::Domestic), None).as_deref(), Some("u-dom"));
-        assert_eq!(pool.next_uid_of(Some(Edition::International), None).as_deref(), Some("u-intl"));
+        assert_eq!(pool.next_uid_of(Some(Edition::Domestic), None, &[]).as_deref(), Some("u-dom"));
+        assert_eq!(pool.next_uid_of(Some(Edition::International), None, &[]).as_deref(), Some("u-intl"));
         assert!(pool.has_edition(Edition::Domestic));
         assert!(pool.has_edition(Edition::International));
 
         let only_intl = Pool::new(vec![("u-intl".to_string(), Edition::International)]);
-        assert_eq!(only_intl.next_uid_of(Some(Edition::Domestic), None), None);
+        assert_eq!(only_intl.next_uid_of(Some(Edition::Domestic), None, &[]), None);
         assert!(!only_intl.has_edition(Edition::Domestic));
         // 不限版本时照常能拿到
-        assert_eq!(only_intl.next_uid_of(None, None).as_deref(), Some("u-intl"));
+        assert_eq!(only_intl.next_uid_of(None, None::<&str>, &[]).as_deref(), Some("u-intl"));
     }
 
     /// 🔴 60004 只冻**模型**：同账号的其他模型仍能被选中，冷却到期后该模型自动回归。
@@ -4715,33 +5347,70 @@ mod tests {
     #[test]
     fn model_cooldown_only_blocks_that_model() {
         let pool = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
-        pool.mark_model_failed_until("u1", "model-a", now_ms_i64() + 3_600_000);
+        pool.mark_model_failed_until(
+            "u1",
+            "model-a",
+            now_ms_i64() + 3_600_000,
+            "上游频率超限（60004）",
+        );
 
         assert_eq!(
-            pool.next_uid_of(Some(Edition::Domestic), Some("model-a")),
+            pool.next_uid_of(Some(Edition::Domestic), Some("model-a"), &[]),
             None,
             "被冻的模型不应再选中该号"
         );
         assert_eq!(
-            pool.next_uid_of(Some(Edition::Domestic), Some("model-b")).as_deref(),
+            pool.next_uid_of(Some(Edition::Domestic), Some("model-b"), &[]).as_deref(),
             Some("u1"),
             "同账号的其他模型必须照常可用"
         );
         // 不关心模型时（model = None）不受模型冷却限制
         assert_eq!(
-            pool.next_uid_of(Some(Edition::Domestic), None).as_deref(),
+            pool.next_uid_of(Some(Edition::Domestic), None, &[]).as_deref(),
             Some("u1")
         );
 
         // 已过期的冷确不应生效（mark_model_failed_until 会直接忽略过去时刻）
         let fresh = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
-        fresh.mark_model_failed_until("u1", "model-a", now_ms_i64() - 1_000);
+        fresh.mark_model_failed_until("u1", "model-a", now_ms_i64() - 1_000, "过期");
         assert_eq!(
             fresh
-                .next_uid_of(Some(Edition::Domestic), Some("model-a"))
+                .next_uid_of(Some(Edition::Domestic), Some("model-a"), &[])
                 .as_deref(),
             Some("u1")
         );
+    }
+
+    /// 冷却快照必须**把账号短冷却与逐模型长冷却分开**，并给出绝对恢复时刻 ——
+    /// 界面靠这两点才能说清「整个号不可用」还是「换个模型就行」。
+    #[test]
+    fn cooldown_snapshot_separates_account_and_model_cooldowns() {
+        let pool = Pool::new(vec![
+            ("u1".to_string(), Edition::Domestic),
+            ("u2".to_string(), Edition::Domestic),
+        ]);
+        let until = now_ms_i64() + 3_600_000;
+        pool.mark_model_failed_until("u1", "model-a", until, "上游频率超限（60004）");
+        pool.mark_failed("u1", "上游返回 401");
+
+        let snap = pool.cooldown_snapshot();
+        assert_eq!(snap.len(), 1, "只有 u1 在冷却，u2 不该出现");
+        let u1 = &snap[0];
+        assert_eq!(u1["uid"], json!("u1"));
+        assert_eq!(u1["edition"], json!("domestic"));
+        assert_eq!(u1["reason"], json!("上游返回 401"));
+        assert!(u1["until"].as_i64().unwrap() > now_ms_i64());
+        assert_eq!(u1["models"][0]["model"], json!("model-a"));
+        assert_eq!(u1["models"][0]["until"], json!(until));
+        assert_eq!(
+            u1["models"][0]["reason"],
+            json!("上游频率超限（60004）")
+        );
+
+        // 全部到期后快照为空（界面据此把徽标收掉）。
+        let expired = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        expired.mark_model_failed_until("u1", "m", now_ms_i64() - 1, "过去");
+        assert!(expired.cooldown_snapshot().is_empty());
     }
 
     /// 复现线上的 400：客户端把附件当 `{"type":"file"}` 发过来，
@@ -5241,5 +5910,89 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["stop"][0], "END");
         assert_eq!(body["top_k"], 5);
+    }
+    // ---------------------------------------------------------------- 本次修复的回归测试
+
+    /// 磁盘上的账号对象能不能拿来出站：uid 对得上、不需要重新登录、带明文 token。
+    ///
+    /// 修复前 `take_account` 只做前两条；信封号的 `access_token` 是密文对象，
+    /// 拼出的 `Bearer` 头是 `[object Object]` 之类，上游只会回 401。
+    #[test]
+    fn leasable_uid_requires_plaintext_and_no_relogin() {
+        let plain = json!({"uid": "u1", "access_token": "at-1"});
+        assert!(is_leasable_uid(&plain, "u1"));
+        assert!(!is_leasable_uid(&plain, "u2"), "uid 对不上");
+
+        let mut relogin = plain.clone();
+        relogin["needs_relogin"] = json!(true);
+        assert!(!is_leasable_uid(&relogin, "u1"), "需要重新登录的号不该再被选中");
+
+        let envelope = json!({
+            "uid": "u1",
+            "access_token": {"$wbEncrypted": true, "envelope": "zzz"}
+        });
+        assert!(!is_leasable_uid(&envelope, "u1"), "信封号拿不到明文");
+    }
+
+    /// 修复前：挑到失效号就整单 503。现在被跳过的号只进**短冷却**（30 秒），
+    /// 到期后 `next_uid_of` 会重新把它交出来 —— 让「重新导入 / 重新登录修好了」
+    /// 能自动回到轮转里，而不是等到重启。
+    #[test]
+    fn unusable_account_is_skipped_briefly_not_forever() {
+        let pool = Pool::new(vec![
+            ("dead".to_string(), Edition::Domestic),
+            ("alive".to_string(), Edition::Domestic),
+        ]);
+        pool.mark_unusable("dead", "账号已删除或需要重新登录");
+        assert_eq!(SKIP_COOLDOWN, Duration::from_secs(30));
+
+        // 第一个轮回把「真的还在」的号交出来（dead 在冷却）：
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(pool.next_uid_of(Some(Edition::Domestic), None::<&str>, &[]));
+        }
+        assert!(seen.iter().all(|u| u.as_deref() == Some("alive")), "{seen:?}");
+
+        // 冷却到期（把绝对时刻拨到过去模拟）后，dead 回到轮转里。
+        pool.mark_until("dead", now_ms_i64() - 1, "过去");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(pool.next_uid_of(Some(Edition::Domestic), None::<&str>, &[]));
+        }
+        assert!(seen.iter().any(|u| u.as_deref() == Some("dead")), "{seen:?}");
+    }
+
+    /// 「整池都在冷却」时仍然 503 —— 只是这类「刷新失败的可能还能用」的号，
+    /// 会被 `take_account` 在最后挑出来兜底（见那里的 `skipped`）。这里只锁住
+    /// 池子的基本契约：排除列表生效、拨时间能恢复。
+    #[test]
+    fn exclusion_list_is_honoured() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), None::<&str>, &[]),
+            Some("u1".to_string())
+        );
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), None::<&str>, &["u1".to_string()]),
+            None
+        );
+    }
+
+    /// 流式泵的首包/帧间隔超时：首包用短超时，之后切到帧间隔超时；
+    /// 文案里要能看出卡在哪一段（排查用）。两者都可以用环境变量覆盖。
+    #[test]
+    fn stream_guard_has_first_byte_and_idle_stages() {
+        std::env::remove_var("WB_SWITCH_STREAM_FIRST_BYTE_SECS");
+        std::env::remove_var("WB_SWITCH_STREAM_IDLE_SECS");
+        let mut g = StreamGuard::new();
+        g.arm(true);
+        assert!(g.timed_out().contains("首包"), "{}", g.timed_out());
+        g.arm(false);
+        assert!(g.timed_out().contains("帧间隔"), "{}", g.timed_out());
+        assert_eq!(first_byte_timeout(), STREAM_FIRST_BYTE);
+        assert_eq!(idle_timeout(), STREAM_IDLE_TIMEOUT);
+        assert!(STREAM_IDLE_TIMEOUT > STREAM_FIRST_BYTE);
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(env_secs("WB_SWITCH_TEST_NOT_SET", Duration::from_secs(5)), Duration::from_secs(5));
     }
 }

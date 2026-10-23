@@ -6,7 +6,7 @@
 #   2. 起服务：
 #        docker compose up -d --build
 #   3. 浏览器打开（地址栏带一次口令，之后前端会自己记住并从地址栏抹掉）：
-#        http://<这台机器的IP>:57890/?token=$WB_SWITCH_TOKEN
+#        http://<这台机器的IP>:57890/__auth/boot?token=$WB_SWITCH_TOKEN
 #
 # 数据（账号库 / 反代配置 / 用量统计）都在命名卷 wb-switch-data 里，容器重建不丢。
 

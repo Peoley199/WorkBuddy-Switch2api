@@ -240,10 +240,44 @@ export interface ProxyEndpointStatus {
   running: boolean;
 }
 
+/**
+ * 一个模型的长冷却（如上游 60004 频率超限，只冻这一个模型）。
+ */
+export interface ProxyModelCooldown {
+  model: string;
+  /** 恢复时刻（epoch 毫秒）。 */
+  until: number;
+  reason: string;
+}
+
+/**
+ * 一个账号的冷却状态。
+ *
+ * 账号级短冷却（`until` / `reason`）与逐模型长冷却（`models`）**分开给**：
+ * 前者表示「这个号暂时整个不用」，后者表示「只有某个模型不可用，换个模型就行」。
+ * 两者都为空时后端不会返回这条记录。
+ */
+export interface ProxyAccountCooldown {
+  uid: string;
+  /** "domestic" | "international" */
+  edition: string;
+  /** 账号级冷却的恢复时刻（epoch 毫秒）；没有账号级冷却时为 null。 */
+  until: number | null;
+  reason: string | null;
+  models: ProxyModelCooldown[];
+}
+
 export interface ProxyStatus {
   /** 有没有**任何**入口在监听。 */
   running: boolean;
   endpoints: ProxyEndpointStatus[];
+  /**
+   * 正在冷却的账号（**两个入口合并**，每条自带 `edition`）。
+   *
+   * 反代没在跑时为空数组。时间是**绝对时刻**，界面自己做倒计时 ——
+   * 不要靠轮询续命，否则倒计时会跟着刷新跳变。
+   */
+  accounts?: ProxyAccountCooldown[];
 }
 
 /** 「获取模型ID」的结果：客户端 model 字段该填什么。 */

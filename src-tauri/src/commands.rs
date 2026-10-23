@@ -155,7 +155,7 @@ pub async fn detect_codebuddy_cn_ide_account() -> Result<Value, String> {
 }
 
 
-/// DELETE /api/delete —— 删除账号。
+/// POST /api/delete —— 删除账号（账号 id 走请求体；不用 DELETE，免得触发 WebUI 的跨源预检）。
 #[tauri::command]
 pub fn delete_account(account_id: String) -> Result<Value, String> {
     let mut accounts = account::load_accounts();
@@ -522,10 +522,23 @@ pub fn get_rotate_logs() -> Value {
 }
 
 /// POST /api/refresh-token —— 单账号刷新 token。
+/// 手动刷新（API 反代页「刷新」按钮）。
+///
+/// 🔴 这里以前用的是落盘版 `refresh_account_token`，于是**只要上游拒绝一次**
+/// （refresh token 失效 / 拿不到 accessToken），号就被永久打上 `needs_relogin`、
+/// 被反代池与磁盘判定同时跳过 —— 用户点「刷新」本来是想让它恢复，结果反而把它踢出池子，
+/// 之后每次请求都只能 503。
+///
+/// 现在：刷新失败**不落盘**（`refresh_token_only`），界面按返回的 `needs_relogin`
+/// 显示「需要重新登录」，号仍留在池里用旧 token 继续试。只有自动化任务
+/// （签到 / 保活）才会把失败的号记为需要重新登录。
 #[tauri::command]
 pub async fn refresh_account_token(account_id: String) -> Result<Value, String> {
     let acc = account::find_account(&account_id).ok_or("账号不存在")?;
-    let fresh = refresh::refresh_account_token(acc).await;
+    let fresh = refresh::refresh_token_only(acc).await;
+    if fresh.get("needs_relogin").and_then(Value::as_bool) != Some(true) {
+        let _ = account::upsert_account(&fresh);
+    }
     Ok(account::account_meta(&fresh))
 }
 
@@ -689,6 +702,10 @@ pub fn save_proxy_config(config: Value) -> Result<Value, String> {
 }
 
 /// 反代运行状态：哪几个入口在监听、各自生效的配置是什么。
+///
+/// `accounts` 是**冷却快照**：只列正在冷却的号，带原因与绝对恢复时刻
+/// （见 `proxy::cooldown_snapshot`）。反代没在跑时为空数组 —— 池子不存在，
+/// 自然也没有冷却。前端按 `until` 自己做倒计时，不需要轮询续命。
 #[tauri::command]
 pub fn get_proxy_status() -> Value {
     let cfg = proxy::load_proxy_config();
@@ -711,6 +728,7 @@ pub fn get_proxy_status() -> Value {
     json!({
         "running": proxy::proxy_running(),
         "endpoints": endpoints,
+        "accounts": proxy::cooldown_snapshot(),
     })
 }
 
