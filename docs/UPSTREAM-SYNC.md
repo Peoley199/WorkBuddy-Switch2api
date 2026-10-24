@@ -55,7 +55,7 @@
 ## 本仓库独有（上游没有，merge 时不可被覆盖）
 
 - **Anthropic Messages 兼容层**（`/v1/messages`、`/v1/messages/count_tokens`、`anthropic_to_openai`、`anthropic_sse_pump` 等）—— v1.6.17 引入
-- **http_guard 访问校验**（Host/Origin 校验、`WB_SWITCH_ALLOWED_HOSTS`、`/__auth/boot` 口令引导）—— v1.6.20 引入；本次同步又把 `/v1/*` 路由也纳入保护
+- **http_guard 访问校验**（Host/Origin 校验、`WB_SWITCH_ALLOWED_HOSTS`、`/__auth/boot` 口令引导）—— v1.6.20 引入；本次同步又把 `/v1/*` 路由也纳入保护；2026-10-24 起新增 `is_docker_host_name`（`host.docker.internal` / `gateway.docker.internal` 内建放行，容器网关免 421）
 - **流式超时保护**（首包 90s / 帧间隔 240s / 建连 10s，环境变量可覆盖）
 - **国际版 6004 频率超限识别**（英文文案三重判定）与**模型级长冷却**（`mark_model_failed_until`）
 - **API 反代用量接入 Token 统计页**（v1.6.18）

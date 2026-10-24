@@ -98,9 +98,21 @@ pub fn is_loopback_name(host: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Docker 家族的「宿主机」别名（容器视角的本机）。
+///
+/// `host.docker.internal`（Docker Desktop 全平台）与 `gateway.docker.internal`
+/// 只在容器内的嵌入式 DNS 解析；宿主机解析器解析不了它（实测 ping / curl 全失败），
+/// `.internal` 又是 ICANN 保留 TLD，浏览器与外部机器都不可能带着这个 Host 打进来。
+/// 而能连到本机的容器本就能用 IP 字面量当 Host 通过 `check_host` ——
+/// 硬编码放行不扩大攻击面，消除的只是容器网关（CCH 等）无谓的 421。
+pub fn is_docker_host_name(host: &str) -> bool {
+    matches!(host, "host.docker.internal" | "gateway.docker.internal")
+}
+
 /// 主机名（小写）是否被信任：
 ///
 /// - 回环名（`127.x` / `::1` / `localhost` / `*.localhost`）；
+/// - Docker 宿主机别名（见 [`is_docker_host_name`]）；
 /// - 或环境变量 `WB_SWITCH_ALLOWED_HOSTS` 里显式列出的（支持前导 `*.`）。
 pub fn is_trusted_host(host: &str) -> bool {
     let h = normalize_host(host);
@@ -108,6 +120,9 @@ pub fn is_trusted_host(host: &str) -> bool {
         return false;
     }
     if is_loopback_name(&h) {
+        return true;
+    }
+    if is_docker_host_name(&h) {
         return true;
     }
     allowed_hosts().iter().any(|pat| host_matches(pat, &h))
@@ -376,6 +391,32 @@ mod tests {
         assert!(check_host(&evil).is_err());
         let missing = HeaderMap::new();
         assert!(check_host(&missing).is_err());
+    }
+
+    #[test]
+    fn docker_host_aliases_are_trusted() {
+        for ok in ["host.docker.internal", "gateway.docker.internal"] {
+            assert!(is_docker_host_name(ok), "{ok} 应当是 Docker 宿主机别名");
+            assert!(is_trusted_host(&format!("{ok}:16866")), "{ok} 带端口也应当可信");
+        }
+        // CCH 在容器里访问反代时的真实形态：Host 带 Host 头走完整校验。
+        let req = hm(&[(header::HOST, "host.docker.internal:16866")]);
+        assert!(check_host(&req).is_ok());
+    }
+
+    #[test]
+    fn lookalike_docker_names_are_not_trusted() {
+        for evil in [
+            "evil.docker.internal",
+            "host.docker.internal.evil.test",
+            "foo.host.docker.internal",
+            "host.docker.internaln",
+        ] {
+            assert!(!is_docker_host_name(evil), "{evil} 不得放行");
+            assert!(!is_trusted_host(evil), "{evil} 不得进入信任名单");
+        }
+        let req = hm(&[(header::HOST, "host.docker.internal.evil.test:16866")]);
+        assert!(check_host(&req).is_err());
     }
 
     #[test]

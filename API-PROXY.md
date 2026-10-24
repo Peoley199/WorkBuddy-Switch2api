@@ -534,6 +534,10 @@ CCH 本身**不做跨格式转换**（同格式路由），所以要让它把 Cl
   `fetch('http://127.0.0.1:7863/v1/...')`。**脚本 / SDK 不带 `Origin`，完全不受影响**。
 - 容器里监听 `0.0.0.0`、用域名访问时，把域名加进 `WB_SWITCH_ALLOWED_HOSTS`
   （支持逗号分隔与前导 `*.`），否则 `Host` 校验会回 421。
+- **Docker 宿主机别名内建放行**（2026-10-24 起）：`host.docker.internal` /
+  `gateway.docker.internal` 不需要进 `WB_SWITCH_ALLOWED_HOSTS`——它们只在容器内的
+  嵌入式 DNS 解析（宿主机与公网都解析不了，`.internal` 是保留 TLD），浏览器不可能
+  带着这个 `Host` 打进来；CCH 等容器网关因此直接可用，不会再 421。
 
 ### 超时与断线（2026-10-23 起）
 
