@@ -1,12 +1,17 @@
 # WorkBuddy-Switch2api
 
+> **Fork 说明**：本仓库是 [cv-superding/WorkBuddy-Switch2api](https://github.com/cv-superding/WorkBuddy-Switch2api) 的 fork，
+> 在其基础上新增了 Anthropic Messages 兼容层、本地服务访问校验、流式超时保护等能力，
+> 并定期同步上游修复（同步记录见 [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md)）。
+> 桌面安装包与发布以本仓库的 [Releases](https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest) 为准。
+
 <p align="center">
   <img src="docs/images/banner.png" alt="手绘动画风横幅：山坡小屋放出成串绿色与紫色的灯笼，全部汇入右侧一扇发光的石门，标题 WorkBuddy-Switch2api" />
 </p>
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest"><img src="https://img.shields.io/github/v/release/cv-superding/WorkBuddy-Switch2api?label=release" alt="Latest release" /></a>
+  <a href="https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest"><img src="https://img.shields.io/github/v/release/Peoley199/WorkBuddy-Switch2api?label=release" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4b5563.svg" alt="Platforms: Windows / macOS / Linux" />
   <img src="https://img.shields.io/badge/built%20with-Tauri%20%2B%20Rust-24C8DB.svg" alt="Built with Tauri + Rust" />
 </p>
@@ -36,9 +41,9 @@ OpenAI 兼容的本地网关：多账号池轮转、按分组挑选出站账号�
 
 ### 下载
 
-- **桌面 App** —— 从 [GitHub Releases](https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest) 下载 macOS / Windows / Linux 安装包（推荐日常使用）
+- **桌面 App** —— 从 [GitHub Releases](https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest) 下载 macOS / Windows / Linux 安装包（推荐日常使用）
 - **npm / webui** —— 浏览器操作界面，从本仓库自行构建安装，见下方「快速开始」
-- **在线演示** —— [GitHub Pages 只读演示](https://cv-superding.github.io/WorkBuddy-Switch2api/)（账号、积分与请求记录均为虚构数据，所有业务操作已禁用）
+- **在线演示** —— [GitHub Pages 只读演示（上游）](https://cv-superding.github.io/WorkBuddy-Switch2api/)（账号、积分与请求记录均为虚构数据，所有业务操作已禁用）
 
 ## 快速开始
 
@@ -82,9 +87,13 @@ docker compose up -d --build
 
 细节（环境变量、端口、反代怎么对外、容器里哪些功能用不了、安全说明）见 **[docs/DOCKER.md](docs/DOCKER.md)**。
 
+上游怪癖与排障记录：反代侧的行为差异、`11128` 各种变体的对照表、以及「用假模型名当探针」
+的复现手法，见 **[API-PROXY.md](API-PROXY.md)**；一次性排查的完整取证过程见
+**[docs/notes/](docs/notes/)**（已脱敏）。
+
 ### 桌面 App
 
-前往 [GitHub Releases](https://github.com/cv-superding/WorkBuddy-Switch2api/releases/latest) 下载对应平台的安装包：
+前往 [GitHub Releases](https://github.com/Peoley199/WorkBuddy-Switch2api/releases/latest) 下载对应平台的安装包：
 
 | 平台 | 安装包 | 安装方式 |
 | --- | --- | --- |
@@ -426,7 +435,7 @@ WorkBuddy 的更新缓存是**按用户放的、不分产品**：
 
 ## 许可
 
-[MIT](./LICENSE) © 2026 wb-switch / cv-superding
+[MIT](./LICENSE) © 2026 wb-switch / cv-superding；fork 维护：[Peoley199](https://github.com/Peoley199)
 
 第三方声明（上游与参考项目的版权归属）见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
 

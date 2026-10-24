@@ -195,8 +195,11 @@ CodeBuddy CLI / CodeBuddy IDE 并列，可查看总览、每日趋势、活跃�
 
 | 类型 | 触发 | 时长 | 影响范围 |
 |---|---|---|---|
-| 账号短冷却 | 上游 4xx（鉴权 / 额度 / 渠道校验重试 2 次仍被拦）、Token 刷新失败或超时 | 固定 120 秒 | 整个账号 |
-| 模型长冷却 | 上游「使用频率超限」，且响应里带重置时刻（国内版 `60004` 中文文案 / 国际版 `6004` 英文文案） | 到上游声明的时刻 | **仅该账号的该模型**，其他模型照常可用 |
+| 账号短冷却 | 上游 4xx（鉴权 / 额度）、Token 刷新失败或超时 | 固定 120 秒 | 整个账号 |
+| 模型长冷却 | 上游「使用频率超限」，且响应里带重置时刻（国内版 `60004` / 国际版 `6004` / 任意 `429` + 时间串） | 到上游声明的时刻 | **仅该账号的该模型**，其他模型照常可用 |
+
+> `11128` 渠道校验**不再冷却账号**：它拦的是这次请求，不是账号（同号的只读接口照样 200）。
+> 冻号只会把本来能用的号从池子里摘掉 —— 池子小的时候一次 11128 就能让整池空转。
 
 界面上的倒计时由本地计算（后端给的是绝对恢复时刻），不需要轮询续命；页面每 10 秒
 向本进程问一次「有没有新的号进入/退出冷却」，冷却结束会自动从列表里消失。
@@ -307,6 +310,84 @@ x-wb-switch-degraded: system-env
 
 > 取舍：客户端不保证带 system（探针、简单脚本、部分 OpenAI 兼容客户端都不带）。
 > 多一句无害的 system，远好过整条请求被 400 打回。
+
+### 11128 的第三、四种触发：身份声明与客户端身份（2026-10-21 实测补充）
+
+上游的渠道校验规则**会漂**：2026-10-09 判环境注入块、2026-10-17 判 `developer` 角色、
+2026-10-21 复测前者已放行。已确认的触发方式与应对（含前两种）汇总：
+
+| `msg` 文案 | 触发原因 | 该改什么 |
+|---|---|---|
+| `first message is not system prompt` | 首条不是 system（仅国际版） | 反代自动补 system |
+| `Illegal API invocation from an unapproved channel` | **负载**被判非官方客户端：`role:"developer"`（精确字符串比对）、system 里的第三方 agent 身份声明（`DeepSeek Harness` 等） | 反代默认路径已改写角色、抹声明 |
+| `request illegal` | **调用方**被判非官方客户端 | 改负载无用，只能换入口 / 等上游放行 |
+
+第三方身份声明这一种（群友反馈、上游确认）：腾讯风控识别 system prompt 里固定的
+`DeepSeek Harness` 声明，命中即 `11128 unapproved channel`。DSH 用户可关掉原生开关
+`includeHarnessIdentity`。**本仓库与上游处理不同**：上游只在自愈重试时抹，本仓库
+**默认路径就抹**（字符串与多块 content 都覆盖，`degraded` 记 `system-identity`），
+因为这些短语是客户端自动注入的固定声明，不是用户自己写的内容。
+
+### 11128 自愈重试（本仓库的分层实现）
+
+收到 `unapproved channel`（负载变体）时，先做一次自愈重试再退避：
+
+1. **默认层（无损）**：再抹一遍 system 里的身份声明（多块 content 形态也覆盖）。
+   不改变请求形状，图片块原样保留，`degraded` 记 `self-heal-identity`。
+2. **激进层（有损，需 `WB_SWITCH_AGGRESSIVE_HEAL=1`）**：最大强度归一化 ——
+   角色收敛到 system/user/assistant/tool、摘掉 `name`、content 数组拍平成字符串。
+   拍平会丢图片块，且改变了用户请求的形状，所以默认关闭，只作「实在不行就全收敛」的退路。
+
+`request illegal`（客户端身份变体）**不走自愈** —— 改负载对它无效，只退避重试；
+重试耗尽后如实告知「本地无法绕过」。
+
+**冷却口径**：`11128` 不冷却账号（它拦的是请求不是号，同号只读接口照常 200）。
+重试耗尽后的报错文案按两种变体分开给出可执行建议。
+
+## 标准参数透传与 `tool_choice` 归一化
+
+`build_upstream_body` 以前只转 `model / messages / stream / temperature / top_p /
+max_tokens / tools`，**其余全被静默丢弃** —— 客户端设了 JSON 模式 / stop 序列 /
+seed 复现 / 禁止并行工具调用，全部等于没设，且没有任何日志。
+
+2026-10-21 上游用假模型 oracle 逐个验证，下面这些上游**全部接受**，已改为原样透传：
+
+```
+temperature  top_p  max_tokens  stop  frequency_penalty  presence_penalty
+response_format  parallel_tool_calls  seed  stream_options  user
+logprobs  top_logprobs
+```
+
+> `stream_options.include_usage` 会被强制为 `true`：本地用量统计依赖上游回的 usage，
+> 客户端传 `false` 会把统计弄瞎。
+
+### `tool_choice` 必须归一化
+
+上游 `tool_choice` **只吃字符串**。OpenAI 规范允许对象形式，直接发过去会：
+
+```
+{"code":11101,"msg":"Unmarshal chat params failed with error: json: cannot unmarshal object …"}
+```
+
+注意这是 **11101**（参数解析失败），发生在渠道校验**之前** —— 用假模型 oracle 看到
+11101 时，别误以为是模型问题。
+
+函数名字符串 `"f"` 上游是接受的，所以对象形式可以**无损降级**：
+
+| 入站 `tool_choice` | 发上游 |
+|---|---|
+| `{"type":"function","function":{"name":"f"}}` | `"f"` |
+| `{"type":"auto"}` / `{"type":"none"}` / `{"type":"required"}` | 同名字符串 |
+| `{"type":"any"}`（Anthropic） | `"required"` |
+| `{"type":"tool","name":"g"}`（Anthropic） | `"g"` |
+| `{"type":"allowed",…}` | `"auto"` |
+| 认不出的形态 / 函数名为空 | **丢弃**（发过去只会 400），记 `tool-choice-dropped` |
+
+> 与上游的差异：上游在拿不到函数名时兜底成 `"required"`，那会悄悄把「必须调 f」
+> 变成「必须调某个工具」。本仓库选择丢弃并记录，让问题显式暴露。
+
+Anthropic 入口（`/v1/messages`）同理：`{"type":"tool","name":"g"}` 直接翻译成
+字符串 `"g"` —— 以前翻译成对象形式，Claude Code 每逢「指定工具」必 11101。
 
 ## 思考强度（`reasoning_effort`）
 
@@ -430,7 +511,9 @@ CCH 本身**不做跨格式转换**（同格式路由），所以要让它把 Cl
 
 - `/status`、`/usage-stats` 不要 `api_key`，但会**校验 `Host` 与 `Origin`**：伪装域名的
   DNS rebinding、其他网站页面的跨源请求一律拒绝（以前实测可被当同源读走账号列表）。
-- 反代路由本身（`/v1/*`）继续只认 `api_key`；不带 `Origin` 的脚本 / SDK 请求不受影响。
+- 反代路由本身（`/v1/*`，2026-10-24 起同样校验 `Host` 与 `Origin`）：`api_key` 只证明
+  「有口令」，证明不了「请求从哪发起」—— 本机浏览器里任意页面都能
+  `fetch('http://127.0.0.1:7863/v1/...')`。**脚本 / SDK 不带 `Origin`，完全不受影响**。
 - 容器里监听 `0.0.0.0`、用域名访问时，把域名加进 `WB_SWITCH_ALLOWED_HOSTS`
   （支持逗号分隔与前导 `*.`），否则 `Host` 校验会回 421。
 
