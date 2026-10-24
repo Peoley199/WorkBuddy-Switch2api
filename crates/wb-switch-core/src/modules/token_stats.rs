@@ -27,6 +27,51 @@ struct Totals {
     records: u64,
 }
 
+/// 一个用量来源的聚合结果，**额外**按会话（[`session_hash`] 的掩码）拆分。
+///
+/// 用来回答与统计页同口径的问题：「最近这批会话各自命中多少」——
+/// 这是评估「按会话粘滞选号」是否有效所需要的对照数据，本身不影响任何已展示的统计。
+#[derive(Clone, Debug, Default)]
+struct TotalsBundle {
+    usage: Usage,
+    records: u64,
+    by_session: HashMap<u64, Totals>,
+}
+
+impl TotalsBundle {
+    fn add(&mut self, session: u64, usage: Usage) {
+        self.usage.input = self.usage.input.saturating_add(usage.input);
+        self.usage.output = self.usage.output.saturating_add(usage.output);
+        self.usage.read = self.usage.read.saturating_add(usage.read);
+        self.usage.write = self.usage.write.saturating_add(usage.write);
+        self.records = self.records.saturating_add(1);
+        let bucket = self.by_session.entry(session).or_default();
+        bucket.usage.input = bucket.usage.input.saturating_add(usage.input);
+        bucket.usage.output = bucket.usage.output.saturating_add(usage.output);
+        bucket.usage.read = bucket.usage.read.saturating_add(usage.read);
+        bucket.usage.write = bucket.usage.write.saturating_add(usage.write);
+        bucket.records = bucket.records.saturating_add(1);
+    }
+
+    fn totals(&self) -> Value {
+        let mut sessions: Vec<Value> = self
+            .by_session
+            .iter()
+            .map(|(session, totals)| {
+                let mut value = totals.value();
+                value["key"] = json!(format!("0x{session:04x}"));
+                value
+            })
+            .collect();
+        sessions.sort_by_key(|value| std::cmp::Reverse(total_value(value)));
+        json!({
+            "usage": Totals { usage: self.usage, records: self.records }.value(),
+            "sessionCount": self.by_session.len(),
+            "sessions": sessions,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SessionTotals {
     key: String,
@@ -161,6 +206,29 @@ fn usage_fields(object: &Map<String, Value>) -> Usage {
     }
 }
 
+/// A usage object's cache counts may be incomplete even when it carries the
+/// input anchor: WorkBuddyAI CLI writes `message.usage` without any cache
+/// field and keeps the real hit count in `providerData.usage` /
+/// `providerData.rawUsage`. Missing (or zero) counts are therefore filled from
+/// the other candidate objects; populated counts are never overridden.
+fn merge_missing_cache(mut selected: Usage, candidates: &[Option<&Value>]) -> Usage {
+    let object_at = |index: usize| candidates[index].and_then(Value::as_object);
+    if selected.read == 0 {
+        selected.read = (0..candidates.len())
+            .filter_map(object_at)
+            .map(cached_input_field)
+            .find(|read| *read > 0)
+            .unwrap_or(0);
+    }
+    if selected.write == 0 {
+        selected.write = (0..candidates.len())
+            .filter_map(object_at)
+            .find_map(|object| positive_field(object, CACHE_WRITE_KEYS))
+            .unwrap_or(0);
+    }
+    selected
+}
+
 fn usage_object(value: Option<&Value>) -> Option<&Map<String, Value>> {
     value?.as_object().filter(|object| {
         // Input is the required anchor for a usage record. It may legitimately
@@ -170,10 +238,23 @@ fn usage_object(value: Option<&Value>) -> Option<&Map<String, Value>> {
     })
 }
 
+/// 会话标识的 FNV-1a 64 位哈希。
+///
+/// 只用来「分桶」：统计接口里只露出低 16 位的掩码，不出现原始标识
+/// （反代那边上游会话 id 不外泄）。
+pub(crate) fn session_hash(seed: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash & 0xffff
+}
+
 /// Decode one record. Usage precedence is message.usage > providerData.usage >
-/// top-level usage. Cache-write metadata may only exist on a non-selected
-/// usage object or rawUsage, so those objects are consulted without counting
-/// their input/output again.
+/// top-level usage. Input/output come from the selected object only, so they
+/// are never counted twice; missing cache counts (read and write) are filled
+/// from every other candidate object and `providerData.rawUsage`.
 fn usage(value: &Value) -> Option<Usage> {
     let provider = value.get("providerData");
     let candidates = [
@@ -182,27 +263,17 @@ fn usage(value: &Value) -> Option<Usage> {
         value.get("usage"),
     ];
     let selected = candidates.iter().copied().find_map(usage_object)?;
-    let mut result = usage_fields(selected);
-
-    if result.write == 0 {
-        result.write = candidates
-            .iter()
-            .copied()
-            .filter_map(|candidate| candidate.and_then(Value::as_object))
-            .chain(
-                provider
-                    .and_then(|data| data.get("rawUsage"))
-                    .and_then(Value::as_object),
-            )
-            .find_map(|object| positive_field(object, CACHE_WRITE_KEYS))
-            .unwrap_or(0);
-    }
+    let result = usage_fields(selected);
 
     // prompt_cache_miss_tokens is deliberately not a write alias: current
     // WorkBuddy/CodeBuddy logs use it for newly computed (uncached) input,
     // while their explicit cache-write fields may legitimately remain zero.
 
-    Some(result)
+    let raw_usage = provider.and_then(|data| data.get("rawUsage"));
+    Some(merge_missing_cache(
+        result,
+        &[candidates[0], candidates[1], candidates[2], raw_usage],
+    ))
 }
 
 fn timestamp(value: &Value) -> Option<i64> {
@@ -380,20 +451,42 @@ fn proxy_bucket_totals(bucket: &Map<String, Value>) -> Totals {
     }
 }
 
-/// 把 `dailyByModel` 的「模型 → 日期 → 桶」累加回「模型 → 日期 → Totals」。
+/// 把反代用量文档的「模型 → 日期 → 桶」累加回「模型 → 日期 → Totals」。
 ///
 /// summary / models / daily / dailyByModel 全部由它派生，而不是读各版的 `total`
 /// 计数器：total 是逐次请求累加的独立计数器，旧版本迁移/回填后可能与 daily
 /// 对不上，一旦两边不一致，「总览」和「趋势图合计」就会互相矛盾。
-fn proxy_daily_by_model(doc: &Value) -> HashMap<String, HashMap<String, Totals>> {
+///
+/// 取数顺序由 `totals` 决定：
+/// - `false`（趋势视图）：各版的 `dailyByModel`，与界面「今天 / 7 天 / 30 天」按日期
+///   筛选同口径；
+/// - `true`（累计视图）：各版的 `totalDailyByModel` —— 每版**再单独记一份、永不裁剪**
+///   的按天表，用来让「总计」等于「全部历史」，同时保留按天结构（旧版本在
+///   `total` 里只留了合计、没有按天拆分的那些请求无法还原，只能按天保留）。
+///
+/// 老数据文件没有 `totalDailyByModel` 时退回 `dailyByModel`；迁移时会把当时的
+/// `dailyByModel` 快照写进 `totalDailyByModel`（见 `proxy::load_usage`）。
+fn proxy_daily_by_model(
+    doc: &Value,
+    totals: bool,
+) -> HashMap<String, HashMap<String, Totals>> {
     let mut result: HashMap<String, HashMap<String, Totals>> = HashMap::new();
     for edition in crate::modules::edition::Edition::ALL {
-        let Some(models) = doc
+        let Some(bucket) = doc
             .get("byEdition")
             .and_then(|value| value.get(edition.key()))
-            .and_then(|value| value.get("dailyByModel"))
-            .and_then(Value::as_object)
         else {
+            continue;
+        };
+        let per_model = if totals {
+            bucket.get("totalDailyByModel").or_else(|| {
+                // 首次升级：还没有快照 ⇒ 用当前按天表作起点（之后的裁剪不影响它）。
+                bucket.get("dailyByModel")
+            })
+        } else {
+            bucket.get("dailyByModel")
+        };
+        let Some(models) = per_model.and_then(Value::as_object) else {
             continue;
         };
         for (model_name, days) in models {
@@ -418,10 +511,13 @@ fn proxy_daily_by_model(doc: &Value) -> HashMap<String, HashMap<String, Totals>>
 
 /// 构造 `api-proxy` 来源。拆成纯函数（只读传入的 Value）是为了单测合并/整形逻辑，
 /// 不必依赖真实 home 目录里的 `proxy-usage.json`。
-fn proxy_source_from(doc: &Value) -> Value {
+///
+/// `totals_only` 为真时只返回累计视图（`summary` / `models` / `projects` 以及
+/// 命中率所需的按天结构），供「反代页 / 用量视图」使用；为假时返回统计页的完整结构。
+fn proxy_source_from(doc: &Value, totals_only: bool) -> Value {
     // 两个版本合并成一个来源：用户看到的是一条完整的反代用量曲线，
     // 不关心请求是从国内版还是国际版账号发出去的。
-    let by_model = proxy_daily_by_model(doc);
+    let by_model = proxy_daily_by_model(doc, true);
 
     let mut summary = Totals::default();
     let mut daily_totals: HashMap<String, Totals> = HashMap::new();
@@ -480,15 +576,82 @@ fn proxy_source_from(doc: &Value) -> Value {
         .filter_map(|day| local_day_bounds(day).map(|(_, end)| end))
         .max();
 
+    let cumulative = json!({
+        "summary": summary.value(),
+        "models": models,
+        "projects": projects,
+        "dailyByModel": daily_by_model,
+    });
+    if totals_only {
+        return json!({
+            "source": "api-proxy",
+            "cumulative": cumulative,
+            "coverageStartAt": coverage_start_at,
+            "coverageEndAt": coverage_end_at,
+        });
+    }
+
+    // 趋势视图：与界面「今天 / 7 天 / 30 天」筛选同口径，只取各版的 `dailyByModel`。
+    let trend_by_model = proxy_daily_by_model(doc, false);
+    let mut trend_summary = Totals::default();
+    let mut trend_daily: HashMap<String, Totals> = HashMap::new();
+    for days in trend_by_model.values() {
+        for (day, point) in days {
+            trend_summary.merge(point);
+            trend_daily.entry(day.clone()).or_default().merge(point);
+        }
+    }
+    let mut daily: Vec<Value> = trend_daily
+        .iter()
+        .map(|(day, totals)| totals.value_with_key(day))
+        .collect();
+    // 与 groups() 一致按 total 降序；面板自己会再按日期排序。
+    daily.sort_by(|left, right| total_value(right).cmp(&total_value(left)));
+    let trend_daily_by_model = trend_by_model
+        .iter()
+        .map(|(model_name, days)| {
+            let mut points: Vec<Value> = days
+                .iter()
+                .map(|(day, totals)| totals.value_with_key(day))
+                .collect();
+            points.sort_by(|left, right| total_value(right).cmp(&total_value(left)));
+            (model_name.clone(), Value::Array(points))
+        })
+        .collect::<Map<String, Value>>();
+    let trend_models = trend_by_model
+        .iter()
+        .map(|(model_name, days)| {
+            let mut totals = Totals::default();
+            for point in days.values() {
+                totals.merge(point);
+            }
+            totals.value_with_key(model_name)
+        })
+        .collect::<Vec<Value>>();
+    let trend_projects = if trend_by_model.is_empty() {
+        Vec::new()
+    } else {
+        vec![trend_summary.value_with_key("API 反代")]
+    };
+
     json!({
         "source": "api-proxy",
+        // 「总计」= 累计投影（全部按天历史）；趋势与热力图用 `daily` / `dailyByModel`。
         "summary": summary.value(),
         "models": models,
         "projects": projects,
         // 反代没有会话与小时桶，这两个数组保持为空。
         "sessions": [],
         "daily": daily,
-        "dailyByModel": daily_by_model,
+        "dailyByModel": trend_daily_by_model,
+        "trend": {
+            "summary": trend_summary.value(),
+            "models": trend_models,
+            "projects": trend_projects,
+        },
+        "cumulative": cumulative,
+        // 最近请求按会话（掩码）拆分：用来对照「同一会话换号 / 粘号」时的命中率。
+        "bySession": if totals_only { Value::Null } else { proxy_recent_by_session(doc) },
         "hours": [],
         "filesScanned": 0,
         "parseErrors": 0,
@@ -499,12 +662,49 @@ fn proxy_source_from(doc: &Value) -> Value {
 
 /// 读取 `~/.wb-switch/proxy-usage.json` 并合并两版，产出与 [`source`] 同构的 Value。
 fn proxy_source() -> Value {
-    proxy_source_from(&crate::modules::proxy::load_usage())
+    proxy_source_from(&crate::modules::proxy::load_usage(), false)
+}
+
+/// 反代 `recent`（每版最多 100 条）按会话掩码拆分。
+///
+/// 只统计带会话标识请求的**同口径**用量：同一个会话在粘滞前后各自命中多少。
+/// 没带会话标识的请求（纯轮转）不进这里，避免把两种调度混在一起比。
+fn proxy_recent_by_session(doc: &Value) -> Value {
+    let mut bundle = TotalsBundle::default();
+    for edition in crate::modules::edition::Edition::ALL {
+        let Some(recent) = doc
+            .get("byEdition")
+            .and_then(|value| value.get(edition.key()))
+            .and_then(|value| value.get("recent"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for item in recent.iter().filter_map(Value::as_object) {
+            let Some(session) = field(item, &["session"]) else {
+                continue;
+            };
+            if item.get("ok").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            bundle.add(
+                session,
+                Usage {
+                    input: field(item, &["promptTokens"]).unwrap_or(0),
+                    output: field(item, &["completionTokens"]).unwrap_or(0),
+                    read: field(item, &["cacheReadTokens"]).unwrap_or(0),
+                    write: field(item, &["cacheWriteTokens"]).unwrap_or(0),
+                },
+            );
+        }
+    }
+    bundle.totals()
 }
 
 #[derive(Default)]
 struct SourceCollector {
     total: Totals,
+    bundles: TotalsBundle,
     models: HashMap<String, Totals>,
     projects: HashMap<String, Totals>,
     sessions: Vec<SessionTotals>,
@@ -522,8 +722,9 @@ impl SourceCollector {
         self.parse_errors = self.parse_errors.saturating_add(1);
     }
 
-    fn add(&mut self, usage: Usage, value: &Value, project: &str) {
+    fn add(&mut self, usage: Usage, value: &Value, project: &str, session: u64) {
         self.total.add(usage);
+        self.bundles.add(session, usage);
         let model_name = model(value);
         self.models
             .entry(model_name.clone())
@@ -603,6 +804,8 @@ impl SourceCollector {
             "parseErrors": self.parse_errors,
             "coverageStartAt": self.coverage_start_at,
             "coverageEndAt": self.coverage_end_at,
+            // 按会话（掩码）拆分的同口径统计，供「粘滞选号是否有效」的对照评估。
+            "bySession": self.bundles.totals(),
         })
     }
 }
@@ -663,7 +866,7 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
                 session_project = Some(project.clone());
             }
             session_totals.add(usage);
-            collector.add(usage, &value, &project);
+            collector.add(usage, &value, &project, session_hash(&session_id));
         }
 
         collector.push_session(
@@ -926,11 +1129,12 @@ fn ide_file_weight(path: &Path) -> Option<(String, usize, u64)> {
 /// 既不会把历史日期重复抬高，也不会丢掉各副本复制后各自追加的请求。指纹缺失的记录
 /// 一律计入。
 fn collect_ide_requests(
-    collector: &mut SourceCollector,
+    #[allow(clippy::too_many_arguments)] collector: &mut SourceCollector,
     requests: &[Value],
     cutoff: Option<i64>,
     model_name: &str,
     project: &str,
+    session: u64,
     seen: &mut HashSet<String>,
     session_totals: &mut Totals,
 ) {
@@ -956,6 +1160,7 @@ fn collect_ide_requests(
                 "providerData": { "model": model_name },
             }),
             project,
+            session,
         );
     }
 }
@@ -1041,6 +1246,7 @@ fn ide_source(
                 cutoff,
                 &model_name,
                 &project,
+                session_hash(&lead_session_id),
                 &mut seen,
                 &mut session_totals,
             );
@@ -1055,6 +1261,13 @@ fn ide_source(
 /// Return independent WorkBuddy (domestic), WorkBuddyAI (international),
 /// CodeBuddy CLI, CodeBuddy IDE, and API proxy aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
+/// 只取 `api-proxy` 来源的**累计视图**（全部按天历史，不套 7/30/90 天裁剪）。
+///
+/// 给「反代页 / 用量视图」用：那里的数字表示全部历史，与本文件顶部按天累积的口径一致。
+pub fn proxy_usage_totals() -> Value {
+    proxy_source_from(&crate::modules::proxy::load_usage(), true)
+}
+
 pub fn get_statistics(days: Option<i64>) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let generated_at = crate::modules::config::now_ms();
@@ -1618,7 +1831,7 @@ mod tests {
             ),
         ]);
 
-        let source = proxy_source_from(&doc);
+        let source = proxy_source_from(&doc, false);
         assert_eq!(source["source"], "api-proxy");
         assert_eq!(source["daily"].as_array().map(Vec::len), Some(1));
 
@@ -1671,7 +1884,7 @@ mod tests {
             ),
         ]);
 
-        let source = proxy_source_from(&doc);
+        let source = proxy_source_from(&doc, false);
         let models = source["models"].as_array().expect("models");
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["key"], "model-large");
@@ -1696,8 +1909,135 @@ mod tests {
     }
 
     #[test]
+    fn cache_read_falls_back_to_provider_data_when_message_usage_omits_it() {
+        // WorkBuddyAI 国际版 CLI 的真实形态：message.usage 只有 input/output，
+        // 命中数在 providerData.usage.inputTokensDetails[].cached_tokens。
+        let value = json!({
+            "message": { "usage": { "input_tokens": 37091, "output_tokens": 250 } },
+            "providerData": {
+                "model": "deepseek-v4.1-flash",
+                "usage": {
+                    "inputTokens": 37091,
+                    "outputTokens": 250,
+                    "inputTokensDetails": [{ "cached_tokens": 35200 }]
+                },
+                "rawUsage": {
+                    "prompt_tokens": 37091,
+                    "prompt_cache_hit_tokens": 35200,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        });
+        assert_eq!(
+            usage(&value),
+            Some(Usage {
+                input: 37091,
+                output: 250,
+                read: 35200,
+                write: 0,
+            })
+        );
+
+        // message.usage 自带命中数时以它为准，不被 providerData 覆盖。
+        let populated = json!({
+            "message": { "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 60
+            }},
+            "providerData": { "usage": {
+                "inputTokens": 100,
+                "outputTokens": 5,
+                "inputTokensDetails": [{ "cached_tokens": 99 }]
+            }}
+        });
+        assert_eq!(usage(&populated).map(|u| u.read), Some(60));
+    }
+
+    /// 累计口径：`totalDailyByModel` 不被 `dailyByModel` 的裁剪影响。
+    ///
+    /// 老文件没有这个快照时退回 `dailyByModel`，否则「总计」永远从升级那天算起。
+    #[test]
+    fn proxy_cumulative_projection_survives_daily_pruning() {
+        let doc = json!({
+            "byEdition": {
+                "domestic": {
+                    "total": {"requests": 3, "errors": 0, "promptTokens": 300,
+                              "completionTokens": 0, "credit": 0},
+                    "daily": {},
+                    // 「今天」只剩一个窗口，之前的日期已被裁掉。
+                    "dailyByModel": {
+                        "m": {"2026-10-24": proxy_usage_bucket(100, 0, 50, 0, 1)}
+                    },
+                    // 累计投影仍保留全部三天。
+                    "totalDailyByModel": {
+                        "m": {
+                            "2026-10-22": proxy_usage_bucket(50, 0, 10, 0, 1),
+                            "2026-10-23": proxy_usage_bucket(150, 0, 90, 0, 1),
+                            "2026-10-24": proxy_usage_bucket(100, 0, 50, 0, 1)
+                        }
+                    }
+                }
+            }
+        });
+        let source = proxy_source_from(&doc, false);
+        assert_eq!(source["summary"]["input"], 300);
+        assert_eq!(source["summary"]["cacheRead"], 150);
+        // 「近 30 天」的实际驱动数据只有今天这个窗口。
+        assert_eq!(source["daily"].as_array().map(Vec::len), Some(1));
+        assert_eq!(source["trend"]["summary"]["input"], 100);
+
+        // 老文件：没有 totalDailyByModel ⇒ 累计视图退回 dailyByModel。
+        let mut legacy = doc.clone();
+        legacy["byEdition"]["domestic"]
+            .as_object_mut()
+            .unwrap()
+            .remove("totalDailyByModel");
+        let source = proxy_source_from(&legacy, false);
+        assert_eq!(source["summary"]["input"], 100);
+    }
+
+    #[test]
+    fn by_session_buckets_use_hashed_keys() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-sessions-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = |input| {
+            json!({
+                "timestamp": now,
+                "message": { "usage": { "input_tokens": input, "output_tokens": 1 } }
+            })
+        };
+        fs::write(
+            project.join("session-a.jsonl"),
+            format!("{}\n{}\n", record(10), record(20)),
+        )
+        .expect("write fixture a");
+        fs::write(project.join("session-b.jsonl"), format!("{}\n", record(30)))
+            .expect("write fixture b");
+
+        let result = source(root.clone(), "fixture", None);
+        let bundle = &result["bySession"];
+        assert_eq!(bundle["usage"]["input"], 60);
+        assert_eq!(bundle["sessionCount"], 2);
+        let sessions = bundle["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["input"], 30, "按总量降序");
+        // key 是掩码（0x + 4 位 hex），不出现原始会话 id。
+        for session in sessions {
+            let key = session["key"].as_str().expect("key");
+            assert!(key.starts_with("0x") && key.len() == 6, "{key}");
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn proxy_source_stays_available_when_document_is_empty() {
-        let source = proxy_source_from(&json!({}));
+        let source = proxy_source_from(&json!({}), false);
         assert_eq!(source["source"], "api-proxy");
         assert_eq!(source["summary"]["total"], 0);
         assert_eq!(source["summary"]["records"], 0);
@@ -1725,7 +2065,7 @@ mod tests {
             }),
         )]);
 
-        let source = proxy_source_from(&doc);
+        let source = proxy_source_from(&doc, false);
         let point = &source["daily"][0];
         assert_eq!(point["input"], 100);
         assert_eq!(point["cacheRead"], 60);
@@ -1735,12 +2075,15 @@ mod tests {
         assert_eq!(source["models"][0]["total"], 115);
 
         // 缓存命中量比输入还大时，uncachedInput 饱和为 0，不会出现负数。
-        let overshoot = proxy_source_from(&proxy_usage_doc(&[(
-            "domestic",
-            json!({
-                "model-b": { "2026-10-04": proxy_usage_bucket(10, 1, 99, 0, 1) },
-            }),
-        )]));
+        let overshoot = proxy_source_from(
+            &proxy_usage_doc(&[(
+                "domestic",
+                json!({
+                    "model-b": { "2026-10-04": proxy_usage_bucket(10, 1, 99, 0, 1) },
+                }),
+            )]),
+            false,
+        );
         assert_eq!(overshoot["daily"][0]["uncachedInput"], 0);
         assert_eq!(overshoot["daily"][0]["total"], 11);
     }

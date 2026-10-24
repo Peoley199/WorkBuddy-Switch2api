@@ -537,6 +537,24 @@ impl Pool {
         None
     }
 
+    /// 某个 uid 在本轮能否直接使用（版本对、不在冷却、该模型未被长冷却）。
+    /// 供会话粘滞判断「绑定的号还能不能继续用」。
+    fn lease_usable(&self, uid: &str, want: Option<Edition>, model: Option<&str>) -> bool {
+        let now = now_ms_i64();
+        self.leases.iter().any(|slot| {
+            let Ok(lease) = slot.lock() else { return false };
+            lease.uid == uid
+                && want.is_none_or(|e| lease.edition == e)
+                && !lease.failed_until_ms.is_some_and(|t| t > now)
+                && !model.is_some_and(|m| {
+                    lease
+                        .model_cooldowns
+                        .get(m)
+                        .is_some_and(|c| c.until_ms > now)
+                })
+        })
+    }
+
     /// 某一档里还有没有号（用于给出更准确的报错）。
     fn has_edition(&self, edition: Edition) -> bool {
         self.leases.iter().any(|slot| {
@@ -566,6 +584,13 @@ impl Pool {
             if lease.uid == uid {
                 lease.failed_until_ms = Some(until_ms);
                 lease.failed_reason = Some(reason.to_string());
+            }
+        }
+        // 号被判失败：把粘在它上面的会话都放开，下一轮它们才能换号，
+        // 而不是一直撞冷却（会话粘滞只负责「黏」，不负责「黏死」）。
+        if let Ok(sticky) = current_sticky().lock() {
+            for stick in sticky.values() {
+                stick.unbind_uid(uid);
             }
         }
     }
@@ -843,11 +868,15 @@ impl Drop for PumpBody {
 /// 取一个可用的账号（必要时先刷新 token）。
 ///
 /// `model` 用于跳过「该模型正在长冷却」的号 —— 60004 只冻模型，不冻账号。
+///
+/// `sticky`：会话粘滞（见 [`SessionStick`]）。绑定中的号**冷却/标签不合格时直接解绑**，
+/// 本轮重新轮转；成功选出后把会话绑到它上面。没有会话标识时行为与纯轮转完全一致。
 async fn take_account(
     pool: &Pool,
     _cfg: &ProxyConfig,
     want: Option<Edition>,
     model: Option<&str>,
+    sticky: Option<(&SessionStick, &str)>,
 ) -> Option<Value> {
     // 🔴 挑号与「从磁盘取明文」必须绑在一起重试。
     //
@@ -862,13 +891,43 @@ async fn take_account(
     let failed: Vec<String> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
     let mut skipped: Option<Value> = None;
+    // 先看会话是否已粘在某个号上：**只有冷却/不可用时才解绑**，其余情况固定用它。
+    let mut take_sticky = sticky.is_some();
     loop {
-        let Some(uid) = pool.next_uid_of(want, model, &failed) else {
-            // 本轮所有号都被略过了：放过一个（「刷新失败但可能还能用」的）再试一次，
-            // 免得单个号的问题把整池拖空；连一个都没有才真的 503。
-            let acc = skipped?;
-            pool.clear_cooldown(&uid_of(&acc));
-            return Some(acc);
+        let bound = match (take_sticky, sticky) {
+            (true, Some((stick, session))) => {
+                take_sticky = false;
+                stick.lookup(session, now_ms_i64())
+            }
+            _ => None,
+        };
+        let picked = match bound {
+            Some(bound) => {
+                let usable = pool.lease_usable(&bound, want, model);
+                if usable {
+                    Some(bound)
+                } else {
+                    // 绑定中的号不可用（冷却 / 别版 / 需重新登录）⇒ 解绑，走正常轮转。
+                    if let Some((stick, session)) = sticky {
+                        stick.unbind_session(session);
+                    }
+                    None
+                }
+            }
+            None => None,
+        };
+        let uid = match picked {
+            Some(uid) => uid,
+            None => match pool.next_uid_of(want, model, &failed) {
+                Some(uid) => uid,
+                None => {
+                    // 本轮所有号都被略过了：放过一个（「刷新失败但可能还能用」的）再试一次，
+                    // 免得单个号的问题把整池拖空；连一个都没有才真的 503。
+                    let acc = skipped?;
+                    pool.clear_cooldown(&uid_of(&acc));
+                    return Some(acc);
+                }
+            },
         };
         // 同一个号本轮已经试过（理论走不到，兜底防空转）。
         if tried.contains(&uid) {
@@ -906,7 +965,12 @@ async fn take_account(
             continue;
         };
         match try_prepare(pool, acc).await {
-            Prepared::Ready(acc) => return Some(acc),
+            Prepared::Ready(acc) => {
+                if let Some((stick, session)) = sticky {
+                    stick.bind(session, &uid_of(&acc), now_ms_i64());
+                }
+                return Some(acc);
+            }
             Prepared::Fallback(acc) => {
                 // 刷新失败：不再纠结直接出站（token 真失效上游会回 401 并冷却该号），
                 // 但记下来 —— 整池都落到这一档时选它，好过回 503。
@@ -1126,7 +1190,27 @@ fn owner_tag(edition: Edition) -> &'static str {
 /// **国际版必须用 `https://www.workbuddy.ai`**——把国际版 token 发到
 /// `codebuddy.cn` 会被网关拒掉。对照上游 `WbVariant::api_endpoint`。
 fn upstream_endpoint(acc: &Value) -> &'static str {
+    // 端到端测试的唯一注入点：只有 `WB_SWITCH_ENABLE_TEST_UPSTREAM=1` 时才认
+    // `WB_SWITCH_TEST_UPSTREAM=http://127.0.0.1:<port>`（同时拒绝非回环地址）。
+    // 默认构建里这两个变量都不存在，行为与以前完全一致。
+    if let Some(port) = test_upstream_port() {
+        return match edition_of(acc) {
+            Edition::Domestic | Edition::International => {
+                format!("http://127.0.0.1:{port}").leak()
+            }
+        };
+    }
     edition_of(acc).api_endpoint()
+}
+
+/// 端到端演练用的上游端口（见 [`upstream_endpoint`]）。生产环境恒为 `None`。
+fn test_upstream_port() -> Option<u16> {
+    if std::env::var("WB_SWITCH_ENABLE_TEST_UPSTREAM").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let url = std::env::var("WB_SWITCH_TEST_UPSTREAM").ok()?;
+    let port = url.rsplit(':').next()?.trim_end_matches('/').parse::<u16>().ok()?;
+    url.starts_with("http://127.0.0.1:").then_some(port)
 }
 
 fn hex_id() -> String {
@@ -1971,6 +2055,106 @@ struct AppState {
     /// 现在全局一份，带 [`CONNECT_TIMEOUT`]；流式响应的「停滞」由泵里的
     /// [`StreamGuard`] 兜（整体超时会误杀长回复）。
     stream_upstream: Arc<reqwest::Client>,
+    /// 会话粘滞：会话 → 账号。**按入口（版本）各一份**，两个入口的号池虽然共享，
+    /// 但一个入口的会话不应该把另一个入口的号粘住。
+    sticky: Arc<SessionStick>,
+}
+
+/// 会话与账号的粘滞表。
+///
+/// 上游的 prompt 缓存**按账号隔离**：同一个对话被轮转分散到 5 个号上，每个号都要
+/// 各自重建一遍上下文。把同一会话的连续请求固定到同一个号，能少建 4 份。
+///
+/// 键是入站 `X-Conversation-ID`（官方桌面端 = sessionId），没有就不粘滞（不猜）。
+/// 与上游**原样转发**这个请求头（不吞、不改、不新增），只是自己多看一眼。
+struct SessionStick {
+    ttl_ms: i64,
+    entries: Mutex<HashMap<String, (String, i64)>>,
+}
+
+impl SessionStick {
+    fn new() -> Self {
+        Self {
+            ttl_ms: SESSION_STICK_TTL.as_millis() as i64,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lookup(&self, session: &str, now: i64) -> Option<String> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // 顺手清掉过期的；条数有上限，不会无限涨。
+        if entries.len() > SESSION_STICK_MAX {
+            entries.retain(|_, (_, expires)| *expires > now);
+        }
+        match entries.get(session) {
+            Some((uid, expires)) if *expires > now => Some(uid.clone()),
+            Some(_) => {
+                entries.remove(session);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn bind(&self, session: &str, uid: &str, now: i64) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() >= SESSION_STICK_MAX {
+            entries.retain(|_, (_, expires)| *expires > now);
+        }
+        entries.insert(session.to_string(), (uid.to_string(), now + self.ttl_ms));
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> HashMap<String, String> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .map(|(session, (uid, _))| (session.clone(), uid.clone()))
+            .collect()
+    }
+
+    fn unbind_session(&self, session: &str) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.remove(session);
+    }
+
+    /// 账号被判失败时，解绑所有粘在它上面的会话 —— 否则这些会话会一直撞冷却。
+    fn unbind_uid(&self, uid: &str) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|_, (bound, _)| bound != uid);
+    }
+}
+
+/// 会话粘滞的有效期：上游缓存几分钟不用就失效，超过它再坚持粘滞没有意义，
+/// 反而让会话只能等一个号。
+const SESSION_STICK_TTL: Duration = Duration::from_secs(10 * 60);
+/// 粘滞表最多记多少个会话；超出时先清过期项。
+const SESSION_STICK_MAX: usize = 4096;
+
+/// 当前在跑的入口各自的粘滞表（按版本各一份）。
+///
+/// 放在全局是为了让 [`Pool::mark_until`] 在账号失败时能解绑粘在它上面的会话 ——
+/// 池子读冷却状态时不必再额外传参，也不会在两处维护两份状态。
+fn current_sticky() -> &'static Mutex<HashMap<Edition, Arc<SessionStick>>> {
+    static STICKY: std::sync::OnceLock<Mutex<HashMap<Edition, Arc<SessionStick>>>> =
+        std::sync::OnceLock::new();
+    STICKY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 为某个入口取（或建）一份粘滞表。
+fn sticky_for(edition: Edition) -> Arc<SessionStick> {
+    let mut all = current_sticky().lock().unwrap_or_else(|e| e.into_inner());
+    all.entry(edition).or_insert_with(|| Arc::new(SessionStick::new())).clone()
+}
+
+/// 入站请求里的会话标识（只认 `X-Conversation-ID`，与官方桌面端的语义一致）。
+fn inbound_session(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-conversation-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_string)
 }
 
 fn unauthorized() -> Response {
@@ -2273,6 +2457,9 @@ struct UsageMeta {
     nickname: String,
     model: String,
     stream: bool,
+    /// 入站请求带的会话标识（`X-Conversation-ID`，官方桌面端值 = sessionId）。
+    /// 只用于「会话粘滞选号」与按会话评估命中率；存盘时只留掩码，不落原始值。
+    session: Option<String>,
     /// 🔴 统计必须**按版本分开**：国内版入口只算国内版的量，国际版只算国际版的。
     /// 之前没有这个字段，两版混在同一个 `total` 里，界面上国际版页会显示国内号的用量。
     edition: Edition,
@@ -2319,6 +2506,11 @@ fn empty_edition_usage() -> Value {
         // 模型 → 日期 → 桶。总量曲线看不出是哪个模型在烧额度，
         // 但把模型维度塞进 daily 的桶里会让前端结构变复杂，故单独一张表。
         "dailyByModel": {},
+        // 累计口径的按天表：与 `dailyByModel` 形状相同，但 **total 桶同步、从不按窗口
+        // 裁剪**。页面上的「今天 / 7 / 30 天」用 `dailyByModel`，而「总计」必须等于
+        // `total` 的全部历史 —— 两件事用两张表，才不会因为裁剪让总计凭空缩水。
+        // 首次升级时由当时已有的 `dailyByModel` 快照迁移（见 backfill_edition_usage）。
+        "totalDailyByModel": {},
         "byAccount": {},
         "byModel": {},
         "recent": [],
@@ -2607,6 +2799,23 @@ fn bump_usage_bucket(
     o.insert("credit".to_string(), json!(credit));
 }
 
+/// 给「模型 → 日期 → 桶」表加一笔（`dailyByModel` 与 `totalDailyByModel` 共用）。
+fn bump_model_day(doc: &mut Value, key: &str, model: &str, date: &str, usage: ([i64; 4], f64, bool)) {
+    ensure_object(&mut doc[key]);
+    let model_days = doc[key]
+        .as_object_mut()
+        .unwrap()
+        .entry(model.to_string())
+        .or_insert_with(|| json!({}));
+    ensure_object(model_days);
+    let day = model_days
+        .as_object_mut()
+        .unwrap()
+        .entry(date.to_string())
+        .or_insert_with(empty_usage_bucket);
+    bump_usage_bucket(day, usage.0[0], usage.0[1], usage.0[2], usage.0[3], usage.1, usage.2);
+}
+
 /// 把一次请求累加进**某一版**的用量文档。
 ///
 /// 抽成纯函数（只碰传入的 Value，不读盘、不看 home 目录）是为了能直接单测
@@ -2699,7 +2908,7 @@ fn bump_usage_doc(doc: &mut Value, meta: &UsageMeta, usage: Option<&Value>, ok: 
     let day = model_days
         .as_object_mut()
         .unwrap()
-        .entry(date)
+        .entry(date.clone())
         .or_insert_with(empty_usage_bucket);
     bump_usage_bucket(
         day,
@@ -2710,6 +2919,10 @@ fn bump_usage_doc(doc: &mut Value, meta: &UsageMeta, usage: Option<&Value>, ok: 
         credit,
         ok,
     );
+
+    // 累计投影与 `dailyByModel` 逐笔同写；页面裁剪 `dailyByModel` 不影响它。
+    let values = [prompt, completion, cache_read, cache_write];
+    bump_model_day(doc, "totalDailyByModel", &meta.model, &date, (values, credit, ok));
 
     if doc.get("recent").map_or(true, |v| !v.is_array()) {
         doc["recent"] = json!([]);
@@ -2729,6 +2942,8 @@ fn bump_usage_doc(doc: &mut Value, meta: &UsageMeta, usage: Option<&Value>, ok: 
                 "cacheReadTokens": cache_read,
                 "cacheWriteTokens": cache_write,
                 "credit": credit,
+                // 会话只存掩码：用来按会话对照命中率，原始 id 不落盘。
+                "session": meta.session.as_deref().map(crate::modules::token_stats::session_hash),
             }),
         );
         arr.truncate(USAGE_RECENT_MAX);
@@ -2841,6 +3056,32 @@ fn backfill_edition_usage(bucket: &mut Value, force_backfill: bool) {
             }
         }
     }
+
+    // 累计投影的**一次性快照**：老文件里没有 `totalDailyByModel` 时，用此刻的
+    // `dailyByModel` 作起点（之后页面再裁剪 `dailyByModel` 也不影响它）。
+    //
+    // 🔴 只在**缺失**时快照：已有快照就说明它从升级那天起逐笔累加、与 `total`
+    // 同口径，再拿 `dailyByModel` 覆盖会把已被裁掉的日期弄丢。
+    let missing_snapshot = bucket.get("totalDailyByModel").is_none();
+    if missing_snapshot {
+        let snapshot = bucket
+            .get("dailyByModel")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        bucket["totalDailyByModel"] = snapshot;
+    }
+    if let Some(models) = bucket
+        .get_mut("totalDailyByModel")
+        .and_then(Value::as_object_mut)
+    {
+        for days in models.values_mut() {
+            if let Some(days) = days.as_object_mut() {
+                for b in days.values_mut() {
+                    ensure_cache_fields(b);
+                }
+            }
+        }
+    }
 }
 
 /// 给整份统计文档补齐新字段（幂等，可放心在每次 load 时调用）。
@@ -2879,6 +3120,11 @@ fn usage_from_sse(text: &str) -> Option<Value> {
 ///
 /// 这里只负责加锁、读盘、调用纯函数 [`bump_usage_doc`]、写盘；
 /// 累加逻辑全部在那个纯函数里，便于单测。
+///
+/// 写盘走 [`atomic_write`]（临时文件 + rename）：Windows 上对正在被其它进程读的
+/// 文件直接覆盖会偶发 `os error 5`，一旦发生在「统计页正在读」的同一时刻，
+/// 这一笔就会被静默吞掉（旧实现写失败只 `let _ =`）。rename 只在目标被占用时失败，
+/// 而且失败时原文件仍完整 —— 统计不会出现半截 JSON。
 fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
     let now = now_ms();
     let _g = USAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2893,8 +3139,35 @@ fn record_usage(meta: &UsageMeta, usage: Option<&Value>, ok: bool) {
 
     doc["updatedAt"] = json!(now);
     if let Ok(text) = serde_json::to_string_pretty(&doc) {
-        let _ = std::fs::write(usage_path(), text);
+        if let Err(error) = write_usage_atomically(&usage_path(), &text) {
+            // 失败时不隐瞒：下一次请求读到的仍是上一份完整文件，打印出来便于排查磁盘/权限。
+            eprintln!("[反代] 用量统计写盘失败（本次不落盘，历史不受影响）: {error}");
+        }
     }
+}
+
+/// 原子写用量文件：先写同目录临时文件，再 rename 覆盖；**失败时收拾临时文件**。
+///
+/// 用量文件每请求写一次，Windows 上目标被统计页读占用时 rename 会偶发失败，
+/// 不清理就会在 `~/.wb-switch/` 下留一堆 `.tmp-*`。
+fn write_usage_atomically(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(
+        "{file_name}.tmp-{}",
+        crate::modules::config::now_ms()
+    ));
+    if let Err(error) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// 边转发边累积 SSE 原文，流结束时把用量记进统计。
@@ -3296,7 +3569,23 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         }
     }
 
-    let Some(acc) = take_account(&st.pool, &st.cfg, Some(st.edition), Some(model.as_str())).await else {
+    // 会话粘滞：官方桌面端发 `X-Conversation-ID`（= sessionId），把同一会话的连续
+    // 请求固定到同一个号，避免每个号都重建一遍上游缓存。没有该头就纯轮转。
+    let session = inbound_session(headers);
+    let picked = match session.as_deref() {
+        Some(session) => {
+            take_account(
+                &st.pool,
+                &st.cfg,
+                Some(st.edition),
+                Some(model.as_str()),
+                Some((st.sticky.as_ref(), session)),
+            )
+            .await
+        }
+        None => take_account(&st.pool, &st.cfg, Some(st.edition), Some(model.as_str()), None).await,
+    };
+    let Some(acc) = picked else {
         // 报错要说清楚是「冷却中」还是「号在磁盘上已经不可用（被删 / 需重新登录）」——
         // 以前两者共用一句「都不可用」，用户修完重新登录还以为没生效。
         let eligible = eligible_on_disk(&st.cfg, st.edition);
@@ -3336,6 +3625,7 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         nickname,
         model: model.clone(),
         stream: want_stream,
+        session,
         edition: st.edition,
     };
 
@@ -3376,6 +3666,11 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         let mut req = client.post(chat_url(&acc));
         for (k, v) in chat_headers(&acc) {
             req = req.header(k, v);
+        }
+        // 透传入站的会话标识（原样，不新增、不修改）：官方桌面端自己也会发，
+        // 但经 Anthropic 兼容层等中转时可能只剩我们看得见 —— 转发给上游保持一致。
+        if let Some(session) = meta.session.as_deref() {
+            req = req.header("X-Conversation-ID", session);
         }
         let r = match req.json(&send_body).send().await {
             Ok(r) => r,
@@ -4910,6 +5205,7 @@ async fn run_endpoint_until(
                 .build()
                 .expect("reqwest client 构建失败只在 TLS 后端异常时发生"),
         ),
+        sticky: sticky_for(edition),
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -5360,8 +5656,110 @@ mod tests {
             nickname: "测试号".into(),
             model: model.into(),
             stream: false,
+            session: None,
             edition: Edition::Domestic,
         }
+    }
+
+    /// 累计投影：每一笔都与 `dailyByModel` 同写；升级时只快照一次，之后不再被覆盖。
+    #[test]
+    fn cumulative_projection_tracks_every_bump_and_snapshots_once() {
+        let t1 = 1_760_000_000_000i64;
+        let date = local_date_of_ms(t1);
+        let usage = json!({"prompt_tokens": 100, "completion_tokens": 10, "cached_tokens": 70});
+        let mut doc = empty_edition_usage();
+        bump_usage_doc(&mut doc, &test_meta("m"), Some(&usage), true, t1);
+        // 新文档：累计投影与按天表逐笔一致。
+        assert_eq!(doc["totalDailyByModel"]["m"][date.as_str()]["requests"], 1);
+        assert_eq!(doc["totalDailyByModel"]["m"][date.as_str()]["promptTokens"], 100);
+        assert_eq!(doc["totalDailyByModel"]["m"][date.as_str()]["cacheReadTokens"], 70);
+
+        // 老文件（升级前写的）：没有快照，只有当天的 dailyByModel。
+        let mut legacy = json!({
+            "total": {"requests": 5, "errors": 0, "promptTokens": 500,
+                      "completionTokens": 5, "credit": 0.0},
+            "daily": {},
+            "dailyByModel": {"m": {date.clone(): {"requests": 1, "errors": 0,
+                "promptTokens": 100, "completionTokens": 1, "credit": 0.0}}},
+            "byAccount": {},
+            "byModel": {},
+            "recent": [],
+        });
+        backfill_edition_usage(&mut legacy, false);
+        assert_eq!(
+            legacy["totalDailyByModel"]["m"][date.as_str()]["promptTokens"], 100,
+            "升级时用当时的 dailyByModel 作起点"
+        );
+        // 之后 dailyByModel 被裁剪 / 改写，再 load 也不能覆盖已有快照。
+        legacy["dailyByModel"] = json!({});
+        backfill_edition_usage(&mut legacy, false);
+        assert_eq!(
+            legacy["totalDailyByModel"]["m"][date.as_str()]["promptTokens"], 100,
+            "已有快照绝不被 dailyByModel 覆盖"
+        );
+    }
+
+    /// 会话粘滞：同一会话固定到同一个号；绑定的号冷却后解绑、换号；过期失效。
+    ///
+    /// 这里的「号」用 `lease_usable` 的真实判据（不在冷却、版本对、模型未长冷却），
+    /// 所以测的是生产路径上的同一套条件，而不是另写一份。
+    #[test]
+    fn session_stick_binds_unbinds_and_expires() {
+        let pool = Pool::new(vec![
+            ("u1".to_string(), Edition::Domestic),
+            ("u2".to_string(), Edition::Domestic),
+        ]);
+        let stick = SessionStick::new();
+        let now = now_ms_i64();
+
+        assert_eq!(stick.lookup("s1", now), None);
+        stick.bind("s1", "u1", now);
+        assert_eq!(stick.lookup("s1", now + 1), Some("u1".to_string()));
+        // 别的会话不受影响。
+        assert_eq!(stick.lookup("s2", now), None);
+        // 过期（TTL 之后）⇒ 视为没有绑定。
+        assert_eq!(stick.lookup("s1", now + stick.ttl_ms + 1), None);
+        assert_eq!(stick.lookup("s1", now + 2), None, "过期项已被清掉");
+
+        // 绑定的号在冷却 ⇒ 不可用；解绑后不再返回它。
+        stick.bind("s3", "u2", now);
+        stick.bind("s4", "u2", now);
+        pool.mark_failed("u2", "上游返回 401");
+        assert!(!pool.lease_usable("u2", Some(Edition::Domestic), None));
+        assert!(pool.lease_usable("u1", Some(Edition::Domestic), None));
+        // 别的版本 / 其他版本的号不可用。
+        assert!(!pool.lease_usable("u1", Some(Edition::International), None));
+        // 模型长冷却同样让该号在这条会话上不可用。
+        pool.mark_model_failed_until("u1", "m", now + 60_000, "频率超限");
+        assert!(!pool.lease_usable("u1", Some(Edition::Domestic), Some("m")));
+        assert!(pool.lease_usable("u1", Some(Edition::Domestic), Some("other")));
+
+        // 账号失败会把粘在它上面的会话全部解绑，避免一直撞冷却。
+        // （`mark_failed` 作用于**当前入口**的粘滞表；这里把本测试的表登记进去，
+        // 走的就是生产路径上的同一条解绑逻辑。）
+        current_sticky()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Edition::Domestic, Arc::new(SessionStick::new()));
+        let registered = current_sticky()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Edition::Domestic)
+            .cloned()
+            .expect("registered");
+        registered.bind("s3", "u2", now);
+        registered.bind("s4", "u2", now);
+        registered.bind("s6", "u1", now);
+        pool.mark_failed("u2", "再次失败");
+        let after = registered.snapshot();
+        assert!(!after.contains_key("s3"), "u2 的会话要解绑");
+        assert!(!after.contains_key("s4"), "u2 的会话要解绑");
+        // 其它号的绑定不受影响。
+        assert_eq!(after.get("s6").map(String::as_str), Some("u1"));
+        current_sticky()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&Edition::Domestic);
     }
 
     /// 同一天两次请求要合并进同一个 daily 桶；不同模型各记各的 dailyByModel。
