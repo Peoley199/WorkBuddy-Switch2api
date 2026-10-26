@@ -886,6 +886,24 @@ fn chat_headers(acc: &Value) -> HashMap<String, String> {
     // 会话头族（一次对话轮复用同一个聚合主键）。
     let conv_req = hex_id();
     let msg = hex_id();
+    // 🔴🔴 `X-Conversation-ID` 是国际版渠道校验的**必需头**，缺它必被 11128 打回。
+    //
+    // 2026-10-26 对照实验（国际版 `www.workbuddy.ai`，同一个号、同一套其余头、
+    // 同一个 payload，只有头数不同）：
+    //
+    // | 请求 | 结果 |
+    // |---|---|
+    // | `/v2/chat/completions` + 原有 2 个会话头 | **11128 `request illegal`** |
+    // | `/v2/chat/completions` + 补上 `X-Conversation-ID` | **200 ✅** |
+    //
+    // 这正是 10-17~10-26 期间「国际版 5/5 号全挂、换 4 种 UA 全挂、同 token 读
+    // 模型清单却 200」的原因 —— 当时据此判定「上游按调用方身份封禁、本地无解」，
+    // **结论是错的**：它只是一道「头存在性」检查，补上就过。
+    // 上游只查**存在性**，不校验值，所以复用同一个会话主键即可。
+    //
+    // （另一说国际版 chat 路由已迁到 `/console/chat/completions`；实测旧 `/v2`
+    //  补齐三个头同样 200，故不切换路由，免得撞上 console 侧的另一道限流闸门。）
+    h.insert("X-Conversation-ID".into(), conv_req.clone());
     h.insert("X-Conversation-Request-ID".into(), conv_req.clone());
     h.insert("X-Conversation-Message-ID".into(), msg.clone());
     h.insert("X-Request-ID".into(), msg.clone());
@@ -3249,6 +3267,38 @@ mod tests {
         assert!(!is_transient_model_error(r#"{"code":60004,"msg":"频率限制"}"#));
         assert!(!is_transient_model_error(r#"{"code":11102}"#));
         assert_eq!(transient_code(r#"{"code":11102}"#), None);
+    }
+
+    /// 🔴🔴 出站头必须同时带齐三个会话 ID。
+    ///
+    /// 国际版渠道校验只查**存在性**：缺 `X-Conversation-ID` 时，同一个号、同一套
+    /// 其余头、同一个 payload 会被稳定判成 `11128 request illegal`；
+    /// 补上它立刻 200（2026-10-26 实测，见 chat_headers 里的对照表）。
+    ///
+    /// 这条测试就是为了防止将来「精简头族」时又把它删掉 —— 这个缺失曾让
+    /// 国际版整整 9 天全线不可用，而且现场表现极易被误读成「上游封号」。
+    #[test]
+    fn chat_headers_carry_all_three_conversation_ids() {
+        let acc = json!({
+            "access_token": "t",
+            "uid": "u",
+            "domain": "www.workbuddy.ai",
+            "edition": "international"
+        });
+        let h = chat_headers(&acc);
+        for key in [
+            "X-Conversation-ID",
+            "X-Conversation-Request-ID",
+            "X-Conversation-Message-ID",
+        ] {
+            let v = h.get(key).unwrap_or_else(|| panic!("{key} 必须存在"));
+            assert!(!v.is_empty(), "{key} 不能为空");
+        }
+        // 会话键与消息键语义不同，不该是同一个值
+        assert_ne!(
+            h["X-Conversation-Request-ID"], h["X-Conversation-Message-ID"],
+            "会话请求 ID 与消息 ID 不应相同"
+        );
     }
 
     #[test]
