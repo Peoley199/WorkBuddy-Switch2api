@@ -49,6 +49,12 @@ const COOLDOWN: Duration = Duration::from_secs(120);
 /// 长冻只会让「修好了还要等」；短冻足以避免每个请求都去磁盘上重新判定一遍。
 const SKIP_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// 429 但响应里没有重置时刻时的**逐模型兜底冷却**。
+///
+/// 没有它就只能退回整账号 120 秒短冷却：同账号其他模型被无谓停掉，120 秒后大概率
+/// 立刻再 429。与 [`COOLDOWN`] 同量级：恢复要快，但也不该比它更短地空转上游。
+const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(120);
+
 /// 上游「渠道校验」软拦截（`11128`）的最大重试次数。
 ///
 /// 🔴 这个码**不是请求内容的问题，也不是账号的问题**：同一个 payload、同一个号、
@@ -1651,6 +1657,22 @@ fn is_channel_block(text: &str) -> bool {
     text.contains("11128") || text.contains("unapproved channel")
 }
 
+/// 上游「模型不存在 / 该账号无权使用该模型」（`11102`）。
+///
+/// 实测语义：请求**已通过渠道校验**，只是 model 解析不到（`service info not found`）
+/// 或当前账号无权使用（`only available for authorized users`）。这不是账号故障 ——
+/// 拿它 `mark_failed` 会把整个账号冻 120 秒，一次写错的模型名就白冻一个好号。
+/// 判据基于响应体而非状态码：仓库未记录该码固定伴随哪个 HTTP 状态。
+fn is_model_not_found(text: &str) -> bool {
+    const MARKS: [&str; 4] = [
+        "\"code\":11102",
+        "code\\\":11102",
+        "service info not found",
+        "only available for authorized users",
+    ];
+    MARKS.iter().any(|m| text.contains(m))
+}
+
 /// 11128 重试耗尽后给客户端的人话。
 ///
 /// 两种变体成因不同，提示必须分开 —— 混在一起用户无从下手：
@@ -1739,6 +1761,26 @@ fn rate_limit_reset_ms(text: &str) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// 频率超限的**实际暂停时刻**（毫秒），`None` = 不按频率超限处理。
+///
+/// 上游给了重置时刻就用它（[`rate_limit_reset_ms`]，或 429 时直接扫时间串）；
+/// 429 却没给时刻时退到本地兜底（[`RATE_LIMIT_FALLBACK`]）—— 那之前这里返回
+/// `None`，调用方只能走整账号 120 秒短冷却，同账号其他模型被一起停掉，
+/// 且回池大概率立刻再 429。
+///
+/// 非 429 的失败一律 `None`：不能把 400 也塞进这个兜底里。
+fn rate_limit_until(text: &str, status: u16, now_ms: i64) -> Option<i64> {
+    let declared_reset = rate_limit_reset_ms(text).or_else(|| {
+        if status == 429 {
+            find_reset_datetime(text)
+        } else {
+            None
+        }
+    });
+    declared_reset
+        .or_else(|| (status == 429).then(|| now_ms + RATE_LIMIT_FALLBACK.as_millis() as i64))
 }
 
 /// 调试落盘开关：`~/.wb-switch/DEBUG_DUMP` **存在**时，把发往上游的真实请求体
@@ -3759,7 +3801,9 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         //
         // 429 是限流的通用状态码，不同上游的错误码不一定都是 6004 / 60004；
         // 「429 + 能解析出重置时间」同样按频率超限处理。
-        let rate_limited_until = rate_limit_reset_ms(&text).or_else(|| {
+        let rate_limited_until = rate_limit_until(&text, raw_status.as_u16(), now_ms_i64());
+        // 上游自己声明的重置时刻（与兜底档区分，用于文案与 reason）。
+        let declared_reset = rate_limit_reset_ms(&text).or_else(|| {
             if raw_status.as_u16() == 429 {
                 find_reset_datetime(&text)
             } else {
@@ -3767,13 +3811,30 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
             }
         });
         if let Some(until_ms) = rate_limited_until {
+            let reason = if declared_reset.is_some() {
+                "上游频率超限（6004/60004）"
+            } else {
+                "上游 429（无重置时刻，兜底冷却）"
+            };
             st.pool
-                .mark_model_failed_until(&uid, &model, until_ms, "上游频率超限（6004/60004）");
-            let reset_at = Local
-                .timestamp_millis_opt(until_ms)
-                .single()
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "稍后".to_string());
+                .mark_model_failed_until(&uid, &model, until_ms, reason);
+            // 兜底档的恢复时刻是本地估算的（上游没说何时恢复），加「约」提示这不是上游声明。
+            let reset_at = if let Some(declared) = declared_reset {
+                Local
+                    .timestamp_millis_opt(declared)
+                    .single()
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "稍后".to_string())
+            } else {
+                format!(
+                    "约 {}",
+                    Local
+                        .timestamp_millis_opt(until_ms)
+                        .single()
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "稍后".to_string())
+                )
+            };
             eprintln!(
                 "[反代] 账号「{account_name}」的模型 {model} 频率超限，已停止对该账号使用该模型至 {reset_at} (uid={uid})"
             );
@@ -3795,6 +3856,8 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                 .into_response();
         }
         let blocked = is_channel_block(&text);
+        // 11102「模型不存在 / 账号无权使用该模型」也不是账号故障，判据见 is_model_not_found。
+        let model_missing = is_model_not_found(&text);
         if raw_status.is_client_error() {
             if blocked {
                 // 🔴 11128 渠道校验**不能冷却账号**。
@@ -3806,6 +3869,12 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                 eprintln!(
                     "[反代] 渠道校验重试 {channel_retry} 次后仍被拦，**不冷却账号** \
                      (model={model}, uid={uid})"
+                );
+            } else if model_missing {
+                // 与 11128 同理：请求已经过了渠道校验，只是这个模型在这个号上不存在
+                // （或该号无权用）。模型名写错是客户端的事，冻号只会白冻一个好号。
+                eprintln!(
+                    "[反代] 上游无此模型（11102，**不冷却账号**）(model={model}, uid={uid})"
                 );
             } else {
                 st.pool
@@ -3822,6 +3891,10 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         // 两种变体成因不同，提示也要分开（见 API-PROXY.md）。
         let message = if blocked {
             channel_block_message(&text, st.edition.label(), channel_retry)
+        } else if model_missing {
+            format!(
+                "上游没有模型 `{model}`，或当前账号无权使用该模型（11102）。这不影响账号本身，换一个模型即可。"
+            )
         } else if raw_status.as_u16() == 429 {
             // 429 但解析不出重置时刻：别把原始 JSON 糊给客户端。
             format!("账号「{account_name}」请求过于频繁（HTTP 429），请稍后重试。")
@@ -5543,6 +5616,45 @@ mod tests {
         assert_eq!(until, utc8_ms("2026-10-17 11:46:56"));
     }
 
+    /// 🔴 429 但上游没给重置时刻：必须退到**逐模型**兜底冷却（RATE_LIMIT_FALLBACK），
+    /// 而不是 None —— 否则调用方退化成整账号 120 秒短冷却，把同账号还能用的模型
+    /// 一起停掉，且回池立刻再 429。
+    #[test]
+    fn rate_limit_fallback_applies_to_429_without_reset() {
+        let now = 1_800_000_000_000;
+        let until = rate_limit_until(r#"{"error":"too many requests"}"#, 429, now)
+            .expect("429 无时间体也必须有兜底冷却");
+        assert_eq!(
+            until - now,
+            RATE_LIMIT_FALLBACK.as_millis() as i64,
+            "兜底档的恢复时刻必须是 now + RATE_LIMIT_FALLBACK"
+        );
+
+        // 有上游声明的重置时刻时优先用它，不叠加兜底。
+        let declared = rate_limit_until(
+            r#"{"code":6004,"msg":"usage will reset at 2026-10-23 21:59:54 UTC+8"}"#,
+            429,
+            now,
+        )
+        .expect("6004 体应解析出重置时刻");
+        assert_eq!(declared, utc8_ms("2026-10-23 21:59:54"));
+    }
+
+    /// 兜底冷却只属于 429：别的 4xx（400 等）即使体里没有时间串也必须是 None，
+    /// 否则普通请求错误会被错误地长时间冻掉该模型。
+    #[test]
+    fn rate_limit_fallback_skips_other_4xx() {
+        let now = 1_800_000_000_000;
+        assert!(rate_limit_until(r#"{"error":"bad request"}"#, 400, now).is_none());
+        assert!(rate_limit_until("", 500, now).is_none());
+        // 非 429 但体里带频率关键词 + 时间串 → 仍按上游声明处理（既有行为不变）。
+        let body = r#"{"message":"{\"code\":60004,\"msg\":\"将在 2026-10-17 11:46:56 UTC+8 重置\"}"}"#;
+        assert_eq!(
+            rate_limit_until(body, 400, now),
+            Some(utc8_ms("2026-10-17 11:46:56"))
+        );
+    }
+
     /// `find_reset_datetime` 只认完整的日期时间形状，不能把乱码当时间。
     #[test]
     fn find_reset_datetime_validates_shape() {
@@ -5933,6 +6045,32 @@ mod tests {
         assert!(!is_channel_block(""));
     }
 
+    /// 「模型不存在 / 账号无权使用该模型」（11102）要能被认出来 —— 认错的话
+    /// 一次写错的模型名会把整个账号冻 120 秒。
+    #[test]
+    fn detects_model_not_found_from_upstream_body() {
+        // 正例：扁平体 / 双层转义体 / 只有 msg 的变体。
+        assert!(is_model_not_found(
+            r#"{"code":11102,"msg":"service info not found"}"#
+        ));
+        assert!(is_model_not_found(
+            r#"{"message":"{\"code\":11102,\"msg\":\"model [x] service info not found\"}"}"#
+        ));
+        assert!(is_model_not_found("only available for authorized users"));
+
+        // 🔴 反例：11128 的体、空体都不算。
+        assert!(!is_model_not_found(
+            r#"{"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\"}"}"#
+        ));
+        assert!(!is_model_not_found(""));
+
+        // 🔴 不能误判：requestId 里恰好含 11102 不算 —— 所以判据是 `"code":11102`
+        // 而不是裸 `11102` 子串。
+        assert!(!is_model_not_found(
+            r#"{"code":0,"msg":"ok","requestId":"abc11102def"}"#
+        ));
+    }
+
     /// 净化只作用于 system 消息，user / assistant 的内容一个字都不能少。
     #[test]
     fn env_strip_only_touches_system_role() {
@@ -6207,6 +6345,32 @@ mod tests {
                 .next_uid_of(Some(Edition::Domestic), Some("model-a"), &[])
                 .as_deref(),
             Some("u1")
+        );
+    }
+
+    /// 🔴 11102「模型不存在 / 无权使用」**不得污染账号**：该模型被冻后，
+    /// 同一账号对**其它模型**必须照常被选中 —— 一次写错的模型名不能把好号
+    /// 从池里摘掉（实现上就是「只冻模型、不 mark_failed」，此测试锁住该契约）。
+    #[test]
+    fn model_not_found_does_not_poison_the_account() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        // 模拟 11102 的处理路径：只把该模型冻起来（兜底长冷却），账号本身不动。
+        pool.mark_model_failed_until(
+            "u1",
+            "model-x",
+            now_ms_i64() + 3_600_000,
+            "上游 429（无重置时刻，兜底冷却）",
+        );
+
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), Some("model-x"), &[]),
+            None,
+            "被冻的模型不应再选中该号"
+        );
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), Some("model-y"), &[]).as_deref(),
+            Some("u1"),
+            "11102 不应把账号整个冻掉：其它模型必须照常可用"
         );
     }
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Check, Clock3, Copy, ListPlus, Loader2, RefreshCw, Save, Trash2, Users } from "lucide-react";
 import { toast } from "sonner";
@@ -113,6 +113,21 @@ function EndpointSection({
       : "使用 .workbuddy-ai 的账号 · www.workbuddy.ai";
   const listenPlaceholder = edition === "domestic" ? "127.0.0.1:7863" : "127.0.0.1:7864";
 
+  // 「额外放行模型」是受控输入：直接拿 parseModels 的结果 join 回显，
+  // 会把用户正在输入的分隔符当场吞掉（多个名字粘成一个）。这里维护一份原始草稿，
+  // 只有外部真的改了配置才同步进来。
+  const [extraDraft, setExtraDraft] = useState(() => endpoint.extra_models.join(", "));
+  const lastPushedRef = useRef(endpoint.extra_models.join(", "));
+  const joined = endpoint.extra_models.join(", ");
+  useEffect(() => {
+    if (joined !== lastPushedRef.current && joined !== extraDraft) {
+      lastPushedRef.current = joined;
+      setExtraDraft(joined);
+    }
+    // 只在 joined 变化时同步；自己敲的内容不会被外部值覆盖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joined]);
+
   return (
     <>
       <div className="mx-4 flex items-center justify-between gap-3 border-b border-border/50 py-3 sm:mx-5">
@@ -189,8 +204,13 @@ function EndpointSection({
         </div>
         <Input
           id={`proxy-extra-${edition}`}
-          value={endpoint.extra_models.join(", ")}
-          onChange={(e) => onChange({ ...endpoint, extra_models: parseModels(e.target.value) })}
+          value={extraDraft}
+          onChange={(e) => {
+            const next = e.target.value;
+            setExtraDraft(next);
+            lastPushedRef.current = parseModels(next).join(", ");
+            onChange({ ...endpoint, extra_models: parseModels(next) });
+          }}
           className="h-8 w-full sm:w-56"
           placeholder="如 deepseek-v4.1-flash"
         />
@@ -436,12 +456,23 @@ export default function ApiProxyPage({
    */
   useEffect(() => {
     if (!st?.running) return;
-    const timer = window.setInterval(() => {
+    let cancelled = false;
+    const poll = () => {
       // 窗口隐藏时不打扰后端。
       if (document.visibilityState === "hidden") return;
-      void api.getProxyStatus().then(setSt).catch(() => {});
-    }, 10_000);
-    return () => window.clearInterval(timer);
+      void api.getProxyStatus().then((s) => !cancelled && setSt(s)).catch(() => {});
+    };
+    const timer = window.setInterval(poll, 10_000);
+    // 隐藏期间浏览器会把定时器压到很慢，回前台时补拉一次，避免带着过期的冷却数据。
+    const onVisible = () => {
+      if (document.visibilityState !== "hidden") poll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [st?.running]);
 
   async function load() {
