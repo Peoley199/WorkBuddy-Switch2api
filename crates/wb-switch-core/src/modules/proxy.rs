@@ -53,7 +53,7 @@ const COOLDOWN: Duration = Duration::from_secs(120);
 /// （理由与判据见 4xx 分支里 `is_channel_block` 那段注释）。
 const MAX_CHANNEL_RETRY: usize = 2;
 
-/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
+/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒绝 / TLS 重置）的最大重试次数。
 ///
 /// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
 /// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
@@ -61,7 +61,19 @@ const MAX_CHANNEL_RETRY: usize = 2;
 /// `503 国际版的账号当前都不可用（冷却中，或需要重新登录）`，过两分钟又好了，
 /// 然后网络再抖 → 再冻 —— 表现为「一会儿报错停下来、一会儿又能用」反复横跳。
 /// （2026-10-11 与 `refresh.rs` 里 `code=-1` 那个坑同源。）
-const MAX_TRANSPORT_RETRY: usize = 1;
+///
+/// 2026-10-26 从 **1 次** 提到 3 次：用户看到客户端打出
+/// `502: error sending request for url (https://www.workbuddy.ai/v2/chat/completions)`
+/// 连续 5 次，以为账号被封了 —— 其实只是直连线路在抖（当时 socket 探测 191ms 正常，
+/// 过几分钟自行恢复）。反代**走直连、不读系统代理**，线路一抖就只有这一条路可走，
+/// 只重试 1 次太浅，容易把瞬时抖动放大成「全线故障」的观感。
+const MAX_TRANSPORT_RETRY: usize = 3;
+
+/// 连接层失败的退避梯度：400ms → 1s → 2s。
+///
+/// 不取更长：这是在**等网络**，不是等上游处理；客户端（ARTEX / zcode / DSH）
+/// 自己还有外层重试，反代这边拖太久只会让用户觉得「卡住了」。
+const TRANSPORT_RETRY_BACKOFF_MS: [u64; MAX_TRANSPORT_RETRY] = [400, 1_000, 2_000];
 
 /// 入站「思考强度」相关字段名，原样透传给上游。
 ///
@@ -2382,6 +2394,8 @@ async fn chat_completions(
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
     let mut model_retry = 0usize;
+    // 版本名在多处文案里要用（传输失败 / 渠道校验），提前取一次。
+    let edition_label = st.edition.label();
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，
     // 用最大强度归一化重造一份请求再试 —— 见 sanitize_messages_aggressive。
     let mut self_healed = false;
@@ -2395,15 +2409,16 @@ async fn chat_completions(
             Ok(r) => r,
             Err(e) => {
                 // 🔴 连接层失败：**不冷却账号**（原因见 MAX_TRANSPORT_RETRY）。
-                // 只重试一次应对瞬时抖动；仍失败就把 502 如实回给客户端，
+                // 退避重试几次应对瞬时抖动；仍失败就回 **502 + 可读原因**，
                 // 由客户端自己决定要不要再发 —— 号本身没坏，别把它冻掉。
                 if transport_retry < MAX_TRANSPORT_RETRY {
+                    let wait = TRANSPORT_RETRY_BACKOFF_MS[transport_retry];
                     transport_retry += 1;
                     eprintln!(
-                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试 \
-                         (model={model}, uid={uid}): {e}"
+                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试，\
+                         等待 {wait}ms (model={model}, uid={uid}): {e}"
                     );
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
                     continue;
                 }
                 debug_dump(
@@ -2414,7 +2429,31 @@ async fn chat_completions(
                     ),
                 );
                 record_usage(&meta, None, false);
-                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+                // 🔴 别把裸的 reqwest 原文回给客户端。
+                // 原文形如 `error sending request for url (https://www.workbuddy.ai/...)`，
+                // 客户端会原样打给用户看，而用户看到「workbuddy.ai + 502」第一反应就是
+                // 「我的号是不是被封了」（2026-10-26 真实发生过）。
+                // 这里明确写清：连不上 ≠ 被拒，账号没坏，怎么处理。
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": {
+                            "message": format!(
+                                "连不上上游（{edition_label}），已重试 {transport_retry} 次。\
+                                 这是**网络层**失败：DNS、超时、TLS 重置或线路抖动，\
+                                 不是账号被封、不是鉴权失败、也不是频率超限 —— 账号本身是好的。\n\
+                                 反代走**直连**（不读系统代理），线路一抖就会落到这里。\
+                                 处理办法：① 稍等几秒重发；② 若长期频繁出现，检查本机到 www.workbuddy.ai 的网络；\
+                                 ③ 换国内版入口可绕开这条国际线路。\n\
+                                 原始错误：{e}"
+                            ),
+                            "type": "upstream_unreachable",
+                            "edition": edition_label,
+                            "retries": transport_retry,
+                        }
+                    })),
+                )
+                    .into_response();
             }
         };
         if r.status().is_success() {
@@ -2479,7 +2518,7 @@ async fn chat_completions(
         // 与连接层失败是同一类误判，会让整池无谓地空掉。
         let status = StatusCode::from_u16(raw_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let account_name = meta.nickname.clone();
-        let edition_label = st.edition.label();
+        // edition_label 已在循环外取好，这里不再重复定义。
         // 🔴 60004 频率超限：按上游声明的重置时刻把**整个账号**暂停出池 ——
         // 120 秒的短冷却只会让它回池后立刻再 429，循环空转。同时给客户端一句
         // 人话：哪个账号、哪个模型、什么时候恢复、怎么继续用，
@@ -3235,7 +3274,6 @@ mod tests {
     /// 真实响应体长这样（上游把内层 JSON 当字符串塞进 `message`）：
     /// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an
     /// unapproved channel\",...}","type":"upstream_error"}`
-    #[test]
     /// 🔴 业务码必须锚在 `"code":` 上。
     ///
     /// `requestId` 是 32 位十六进制，天然可能撞出 `11128` / `11133` 之类的子串；
@@ -3533,7 +3571,6 @@ mod tests {
     }
 
     /// 账号池按版本取号：只要国内版时不该给出国际版的号。
-    #[test]
     /// 🔴 11128 渠道校验**不得冷却账号**。
     ///
     /// 2026-10-17 实测：同一个号的只读接口 200、chat 端点稳定 11128，
@@ -3743,7 +3780,6 @@ mod tests {
         assert!(degraded.is_empty());
     }
 
-    #[test]
     /// 🔴 `tool_choice` 对象形式必须归一成字符串。
     ///
     /// 上游只吃字符串，收到 OpenAI 规范的 `{"type":"function","function":{"name":"f"}}`
