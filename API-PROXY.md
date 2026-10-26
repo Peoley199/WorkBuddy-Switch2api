@@ -329,6 +329,47 @@ DSH 自带原生开关 **`includeHarnessIdentity`**，关掉它（或把那段�
 > 设计取舍：默认路径绝不改写用户提示词内容（那是用户资产），
 > 只有在「已经被拦、反正也发不出去」的前提下才做破坏性归一化。
 
+## 模型侧瞬时故障 11133 / 11134 / 14003（v1.6.21）
+
+```text
+{"code":11133,"msg":"the request parameters were rejected by the model provider",
+ "extError":{"code":"1210","type":"invalid_request_error","StatusCode":400},
+ "displayTips":{"zh":"模型无法处理此请求，请重试"}}
+```
+
+**这条容易误判成「参数写错了」** —— 它有 `invalid_request_error` 和 `param` 字段，
+看起来像校验失败。但腾讯官方《错误码处理说明》把它归为「**多与模型侧状态有关**」，
+处理建议是「新开会话或切换模型重试」，不是让你改参数。
+
+2026-10-26 在 `glm-5.3-flash` 上逐个排除（全部 200，单参数复现不出来）：
+
+| 变量 | 结果 |
+|---|---|
+| `stop` / `response_format` / `logprobs` / `seed` / `reasoning_effort` / `stream_options` / `parallel_tool_calls` / `user` | ✅ 200 |
+| 图片输入（`image_url` data URI） | ✅ 200 |
+| `tools` 80 个 / `tool_choice` 引用不存在的函数 / `tool_choice` 无 `tools` | ✅ 200 |
+| system 约 7.5 万字 | ✅ 200 |
+| `tool_call` 配对断裂（id 不匹配 / 孤儿 tool 消息 / 非标准 id 前缀） | ✅ 200 |
+
+对照开源实现 `opencode-codebuddy-oauth` 的做法：把 11133 当「服务端侧故障窗口」，
+按 1s→4s→10s→25s **退避幂等重发**（最多 4 次），同构请求稍后即成功。
+
+**反代处理（v1.6.21）**：
+
+- `is_transient_model_error()` 识别 `11133` / `11134` / `14003`
+- 退避重试 3 次（1s → 3s → 8s，合计 12s）。比参考实现的 ≤40s 短：
+  反代是同步阻塞客户端的，拖太久客户端会先超时断开
+- 🔴 **重试耗尽也不冷却账号** —— 账号和请求都没问题，冻号只会让下一次请求
+  换到一个同样会撞故障窗口的号
+- 仍失败时返回可读文案，提示「换模型 / 新开会话 / 稍等重试」
+
+### 🔴 顺带修掉一个误判隐患：业务码必须锚在 `"code":` 上
+
+`requestId` 是 32 位十六进制，天然可能撞出 `11128` / `11133` 这类子串。
+原来用裸 `text.contains("11128")`，一旦 `requestId` 里出现该子串，
+就会把 11133 的失败误判成渠道校验（或反过来）。
+现在统一走 `has_upstream_code()`，锚 `"code":<码>`，单测里有专门的撞码用例。
+
 ## 标准参数透传与 `tool_choice` 归一化（v1.6.20）
 
 `build_upstream_body` 以前只转 `model` / `messages` / `stream` /

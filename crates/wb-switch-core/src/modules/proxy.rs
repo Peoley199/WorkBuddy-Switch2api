@@ -1003,6 +1003,46 @@ fn strip_env_injection(text: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
+/// 上游失败体里是否带某个业务码（形如 `"code":11133` 或 `"code": 11133`）。
+///
+/// 🔴 不要直接 `text.contains("11128")`：`requestId` 是 32 位十六进制，
+/// 天然可能撞出 `11128` / `11133` 这样的子串 —— 那样会把正常失败误判成特定错误码。
+/// 锚在 `"code":` 上才可靠。
+fn has_upstream_code(text: &str, code: &str) -> bool {
+    text.contains(&format!("\"code\":{code}")) || text.contains(&format!("\"code\": {code}"))
+}
+
+/// 上游「模型侧瞬时故障」——官方文档把 `11133` / `11134` / `14003` 都归为
+/// 「多与模型侧状态有关」，处理建议是「新开会话或切换模型重试」。
+///
+/// 🔴 这一类**不是**参数错误：2026-10-26 用 `glm-5.3-flash` 逐个试过
+/// `stop` / `response_format` / `logprobs` / `seed` / `reasoning_effort` /
+/// `stream_options` / `parallel_tool_calls` / 图片输入 / 80 个 tools /
+/// 7.5 万字 system / `tool_call` 配对断裂，**全部 200**，单参数复现不出来。
+/// 对照开源实现 `opencode-codebuddy-oauth`：它把 11133 当「服务端侧故障窗口」，
+/// 按 1s→4s→10s→25s 退避幂等重发，同构请求稍后即成功。
+///
+/// ⇒ 正确处置是**重试**，而不是冷却账号 —— 账号和请求都没问题。
+fn is_transient_model_error(text: &str) -> bool {
+    transient_code(text).is_some()
+}
+
+/// 命中时返回具体是哪个业务码（用于给用户看「是哪个码」）。
+fn transient_code(text: &str) -> Option<&'static str> {
+    ["11133", "11134", "14003"]
+        .into_iter()
+        .find(|code| has_upstream_code(text, code))
+}
+
+/// 模型侧瞬时故障的重试次数（退避见 [`MODEL_RETRY_BACKOFF_MS`]）。
+const MAX_MODEL_RETRY: usize = 3;
+/// 退避梯度：1s → 3s → 8s（合计 12s）。
+///
+/// 参考实现用的是 1/4/10/25s（总预算 ≤40s）。这里取更短的一档：
+/// 反代是**同步阻塞**客户端的，压到 12s 以免客户端先超时断开，
+/// 而实测这类故障窗口通常几秒内就恢复。
+const MODEL_RETRY_BACKOFF_MS: [u64; MAX_MODEL_RETRY] = [1_000, 3_000, 8_000];
+
 /// 上游的失败响应体是不是「渠道校验」拦截（`11128`）。
 ///
 /// 只看响应体里有没有这个码 / 这句 msg —— 上游把它包在 `message` 字符串里再套一层
@@ -1011,7 +1051,10 @@ fn strip_env_injection(text: &str) -> Option<String> {
 /// 判定成它之后**绝不能冷却账号** —— 号是好的（读接口照样 200），
 /// 冻它只会把整个账号池拖空。理由见 4xx 分支里的实测记录。
 fn is_channel_block(text: &str) -> bool {
-    text.contains("11128") || text.contains("unapproved channel")
+    // 锚 `"code":` 而不是裸子串 —— `requestId` 是十六进制，可能撞出 11128。
+    has_upstream_code(text, "11128")
+        || text.contains("unapproved channel")
+        || text.contains("request illegal")
 }
 
 /// 在上游原文里扫第一个 `YYYY-MM-DD HH:MM:SS`（按 UTC+8 解释）。
@@ -2320,6 +2363,7 @@ async fn chat_completions(
     // 免得同一个 request id 被上游当成重复包直接判掉。
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
+    let mut model_retry = 0usize;
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，
     // 用最大强度归一化重造一份请求再试 —— 见 sanitize_messages_aggressive。
     let mut self_healed = false;
@@ -2360,6 +2404,18 @@ async fn chat_completions(
         }
         let raw_status = r.status();
         let text = r.text().await.unwrap_or_default();
+        // 🔴 模型侧瞬时故障（11133/11134/14003）：官方归类「模型侧状态」，
+        // 重发即可能成功。**绝不能冷却账号** —— 见 is_transient_model_error。
+        if is_transient_model_error(&text) && model_retry < MAX_MODEL_RETRY {
+            let wait = MODEL_RETRY_BACKOFF_MS[model_retry];
+            model_retry += 1;
+            eprintln!(
+                "[反代] 上游模型侧瞬时故障，第 {model_retry}/{MAX_MODEL_RETRY} 次重试，\
+                 等待 {wait}ms (model={model}, uid={uid})"
+            );
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            continue;
+        }
         if is_channel_block(&text) {
             // 🔴 先试「自愈」：`unapproved channel` 是**负载**被判成非官方客户端，
             // 用最大强度归一化重造请求往往能直接过（`request illegal` 是客户端身份
@@ -2464,10 +2520,18 @@ async fn chat_completions(
             //   以前一次坏请求就能把 5 个国际版号全冻 120 秒，
             //   客户端随即收到「国际版的账号当前都不可用」，而这 5 个号其实一个都没坏。
             let blocked = is_channel_block(&text);
+            let transient = is_transient_model_error(&text);
             if blocked {
                 eprintln!(
                     "[反代] 上游 chat 端点拒绝该请求（11128 渠道校验），**不冷却账号** \
                      —— 这是端点级策略拦截，账号本身有效 (model={model}, uid={uid})"
+                );
+            } else if transient {
+                // 模型侧状态问题：重试 {MAX_MODEL_RETRY} 次仍失败，号还是好的，
+                // 冻它只会让下一次请求换到一个同样会撞故障窗口的号。
+                eprintln!(
+                    "[反代] 上游模型侧故障（11133/11134/14003）重试 {model_retry} 次仍未恢复，\
+                     **不冷却账号** (model={model}, uid={uid})"
                 );
             } else {
                 st.pool.mark_failed(&uid);
@@ -2485,6 +2549,16 @@ async fn chat_completions(
         let message = if raw_status.as_u16() == 429 {
             format!(
                 "账号「{account_name}」请求过于频繁（HTTP 429），已临时冷却该账号，请稍后重试。"
+            )
+        } else if is_transient_model_error(&text) {
+            // 官方文档对 11133/11134/14003 的处置建议就是「新开会话或切换模型重试」。
+            // 我们已经退避重试过 {model_retry} 次，仍未恢复。
+            let code_label = transient_code(&text).unwrap_or("11133");
+            format!(
+                "上游模型侧暂时异常（code {code_label}），已自动退避重试 {model_retry} 次仍未恢复。\
+                 这不是你的参数写错，也不是账号失效 —— 官方把这类码归为「模型侧状态」。\
+                 建议：① 换个模型再发（最有效）；② 新开一个会话；③ 稍等十几秒重试。\
+                 当前会话若已连续失败，换模型往往立刻恢复。"
             )
         } else if is_channel_block(&text) {
             // 两种 11128 变体成因不同，提示也要分开 —— 混在一起用户无从下手：
@@ -3143,6 +3217,40 @@ mod tests {
     /// 真实响应体长这样（上游把内层 JSON 当字符串塞进 `message`）：
     /// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an
     /// unapproved channel\",...}","type":"upstream_error"}`
+    #[test]
+    /// 🔴 业务码必须锚在 `"code":` 上。
+    ///
+    /// `requestId` 是 32 位十六进制，天然可能撞出 `11128` / `11133` 之类的子串；
+    /// 用裸 `contains` 会把别的错误误判成渠道校验 / 模型侧故障。
+    #[test]
+    fn upstream_code_must_be_anchored_not_substring() {
+        // requestId 里含 11128，但真实业务码是 11133 → 不是渠道校验
+        let sneaky = r#"{"code":11133,"msg":"x","requestId":"111280000000000000046302613c7e69"}"#;
+        assert!(has_upstream_code(sneaky, "11133"));
+        assert!(!has_upstream_code(sneaky, "11128"), "不能因为 requestId 里有 11128 就误判");
+        assert!(!is_channel_block(sneaky), "11133 不应被当成渠道校验");
+
+        // 带空格 / 带不带引号的常见写法都要认
+        assert!(has_upstream_code(r#"{"code": 11133}"#, "11133"));
+        assert!(has_upstream_code(r#"{"code":11133}"#, "11133"));
+        assert!(!has_upstream_code(r#"{"msg":"11133"}"#, "11133"), "只是 msg 里出现数字不算");
+    }
+
+    /// 11133 / 11134 / 14003 属于「模型侧瞬时故障」，靠重试解决，不是账号问题。
+    #[test]
+    fn transient_model_errors_are_recognized() {
+        let real = r#"{"code":11133,"msg":"the request parameters were rejected by the model provider","extError":{"code":"1210"}}"#;
+        assert!(is_transient_model_error(real));
+        assert_eq!(transient_code(real), Some("11133"));
+        assert!(is_transient_model_error(r#"{"code":11134}"#));
+        assert!(is_transient_model_error(r#"{"code":14003}"#));
+        // 别的码不能落进这一类
+        assert!(!is_transient_model_error(r#"{"code":11128,"msg":"request illegal"}"#));
+        assert!(!is_transient_model_error(r#"{"code":60004,"msg":"频率限制"}"#));
+        assert!(!is_transient_model_error(r#"{"code":11102}"#));
+        assert_eq!(transient_code(r#"{"code":11102}"#), None);
+    }
+
     #[test]
     fn detects_channel_block_from_upstream_body() {
         let real = r#"400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"000000000000000046302613c7e69e4d\"}","type":"upstream_error"}"#;
