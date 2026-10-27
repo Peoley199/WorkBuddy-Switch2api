@@ -111,9 +111,12 @@ async fn checkin_request(path: &str, account: &Value) -> Value {
     // 这里返回的 401 不会被 `is_unauthorized` 误触刷新 —— 信封账号的
     // `refresh_token` 同样是信封，下面的 `as_str()` 取不到值。
     if is_envelope(account, "access_token") {
+        // 🔴 别写「重新登录即可」——重新登录后客户端**仍然**写成密文，解决不了。
+        // 密文凭据的可解封密钥在客户端原生模块里（编译期注入的 atRestSecretKey），
+        // 本工具拿不到，所以这条路是硬边界，不是提示用户去补一步操作。
         return json!({
             "code": 401,
-            "message": "该账号凭据为加密存储，仅支持切换账号；签到需重新登录",
+            "message": "该账号凭据由客户端加密存储（AES-256-GCM），本工具无法解密，只能原样写回用于切换账号；签到需要明文 token，因此不可用。重新登录也无法解决——客户端会再次写入密文。",
         });
     }
     let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
