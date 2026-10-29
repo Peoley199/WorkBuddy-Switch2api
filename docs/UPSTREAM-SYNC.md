@@ -61,6 +61,19 @@
 - **API 反代用量接入 Token 统计页**（v1.6.18）
 - **`refresh_token_only`**（不落盘的顺手刷新，避免瞬时失败把账号永久标 needs_relogin）
 - **`take_account` 排除本轮已失败 uid**（挑号与取明文失败不互相顶掉）
+- **11140 双语义分流 + 账号级风控摘号**（2026-10-28）：`ban_kind()` 按 displayMsg 区分
+  「账号级限制 / 内容审核 / 未知」；账号级写 `needs_relogin` 持久摘号 + 5 分钟池内冷却，
+  内容审核不碰账号，未知走 1 小时保守冷却。上游 `dc4133f` 把 `request illegal` 归入
+  「渠道拦截不冷却」——**同步该提交时必须让 11140 判定排在它前面**，否则被封的号会被
+  「不冷却」地持续调用。
+- **`has_upstream_code` 业务码锚定匹配**（2026-10-28）：`"code":NNN` / `code\":NNN` /
+  `bizCode` 八种形态，避免 `requestId` 里的 hex 子串误命中。上游 `dc4133f` 有同思路实现，
+  同步时可直接采用上游版本，但要注意本仓库还多了 `bizCode` 键与 11140 的调用点。
+- **出站头族对齐官方 5.8.4**（2026-10-28）：`X-Product=SaaS` / `X-IDE-Type=WorkBuddy` /
+  `X-IDE-Version` / `Accept: application/json` / 不发 `Origin`·`Referer`·`X-Root-Request-ID` /
+  `X-B3-SpanId` 不再恒零 / `X-Conversation-ID` 不再双发。同步时若上游也动 `chat_headers()`，
+  **两侧逐项对齐后再合并**，不要整块取一侧。
+
 
 ## 同步流程（下次照此办理）
 

@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -37,8 +37,14 @@ use super::http_guard::{self, Access};
 use super::refresh::refresh_token_only;
 
 const CONFIG_FILE: &str = "proxy.json";
-const DEFAULT_CLIENT_VERSION: &str = "5.5.4";
-const DEFAULT_CLI_VERSION: &str = "2.137.1";
+/// 出站头族里冒充的官方客户端版本。
+///
+/// 🔴 对齐的是**本机安装的官方桌面端**（2026-10-27 从其 `app.asar` 读到的
+/// `WorkBuddy/5.8.4 … CLI/2.161.0`）。旧值 5.5.4 / 2.137.1 落后一个 minor 周期，
+/// 与「官方客户端特征」相关的风控维度上多一个可识别的差异。
+/// 官方升级后这里应同步上调（值同时用于 `X-IDE-Version`）。
+const DEFAULT_CLIENT_VERSION: &str = "5.8.4";
+const DEFAULT_CLI_VERSION: &str = "2.161.0";
 /// token 剩余有效期小于该值时先刷新再出站。
 const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
@@ -54,6 +60,21 @@ const SKIP_COOLDOWN: Duration = Duration::from_secs(30);
 /// 没有它就只能退回整账号 120 秒短冷却：同账号其他模型被无谓停掉，120 秒后大概率
 /// 立刻再 429。与 [`COOLDOWN`] 同量级：恢复要快，但也不该比它更短地空转上游。
 const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(120);
+
+/// 上游**账号级风控限制**（403 / `11140` + displayMsg「unusual activity」）的池内冷却。
+///
+/// 真正的持久化靠账号库里的 `needs_relogin` 标记：重启、重建池、刷新都不会让它回池，
+/// 只有用户重新登录 / 重新导入 / 申诉恢复后才能自动回池。这里的池内冷却只负责
+/// 两件事：① 让 `/status` 与界面立刻显示「这个号被停用了」；② 让本进程立刻不再选它。
+/// 与 [`SKIP_COOLDOWN`] 同思路但更长一点：用户看到红标去重新登录需要一点时间，
+/// 期间没必要反复重读盘；重新登录会清掉 `needs_relogin`，冷却到期后自然回池。
+const BAN_QUARANTINE: Duration = Duration::from_secs(300);
+
+/// 命中 `11140` 但 displayMsg 认不出语义时的**保守**长冷却。
+///
+/// 此时不能持久摘号（万一是内容审核，误摘会把好号踢出池）；但也不能退化回
+/// 120 秒短冷却 —— 那等于每两分钟拿被封的号再打一次上游。1 小时后重新观察一次。
+const BAN_SUSPECT_COOLDOWN: Duration = Duration::from_secs(3600);
 
 /// 上游「渠道校验」软拦截（`11128`）的最大重试次数。
 ///
@@ -1219,30 +1240,70 @@ fn test_upstream_port() -> Option<u16> {
     url.starts_with("http://127.0.0.1:").then_some(port)
 }
 
+/// 32 位 hex 的请求级 id（对齐官方客户端的 ULID 形态 id）。
+///
+/// 🔴 旧实现是 `format!("{:032x}", nanos ^ 常量)`：2026 年的纳秒时间戳远小于 2^64，
+/// 异或后仍小于 2^64，补足 32 位 hex 时**高 16 位恒为零** —— `X-B3-TraceId` /
+/// 各会话 id 全带 16 个前导零，是一次格式校验就能识别的确定性指纹。
+/// 这里用 SplitMix64 把纳秒 + 进程内序号铺满 128 位：输出无前导零、同一纳秒内
+/// 的多次调用也不重复（Windows 时钟精度不保证每次 now() 都变化）。
 fn hex_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{:032x}", nanos ^ 0x5eed_5eed_5eed_5eedu128)
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let seed = (nanos as u64) ^ 0x5eed_5eed_5eed_5eed ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let hi = splitmix64(seed);
+    let lo = splitmix64(seed ^ hi.rotate_left(17));
+    format!("{hi:016x}{lo:016x}")
+}
+
+/// SplitMix64 的一轮：非密码学随机，但雪崩性足够，且对输入是双射
+/// （不同 seed 必得不同输出，id 不会撞）。
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// 16 位 hex 的 span / parent span id。
+///
+/// 🔴 不能从 [`hex_id`] 的前 16 位截取：旧 hex_id 的高 16 位恒为零，
+/// `msg[..16]` 截出来永远是字面量 `0000000000000000`，等于向上游广播一个
+/// 确定性指纹（官方客户端的 span id 是随机 16 hex）。取**低** 16 位：
+/// 每个请求都不同，且与 trace id 不互为前缀。
+fn span_id(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let start = chars.len().saturating_sub(16);
+    chars[start..].iter().collect()
 }
 
 /// 组装出站头族（对齐官方桌面端，缺字段用 X-No-* 约定）。
-fn chat_headers(acc: &Value) -> HashMap<String, String> {
+///
+/// `session` 是入站请求自带的会话标识（`X-Conversation-ID`）。官方桌面端里它就是
+/// sessionId、整个会话内稳定；有它时原样做出站 `X-Conversation-ID`，没有才用本次
+/// 请求现生成的 id 兜底。
+///
+/// 🔴 `X-Conversation-ID` 必须**只出现一次**。此前是这里插一份、发送循环里再
+/// `req.header(...)` 追加一份 —— reqwest 的 `header()` 是 append 语义，入站带会话
+/// 头时上游会收到两个同名头（官方客户端永远只有一个）。现在统一在这里决定取值。
+fn chat_headers(acc: &Value, session: Option<&str>) -> HashMap<String, String> {
     let mut h = HashMap::new();
     let uid = acc.get("uid").and_then(Value::as_str).unwrap_or("");
     let at = acc.get("access_token").and_then(Value::as_str).unwrap_or("");
     let domain = acc.get("domain").and_then(Value::as_str).unwrap_or("");
 
     h.insert("Content-Type".into(), "application/json".into());
-    h.insert(
-        "Accept".into(),
-        "application/json, text/event-stream".into(),
-    );
+    // 官方桌面端 Accept 就是单值 `application/json`（响应是 SSE，但 Accept 不列
+    // text/event-stream）。出站恒为 stream:true，读侧按流处理，收窄不影响功能。
+    h.insert("Accept".into(), "application/json".into());
     h.insert("X-Requested-With".into(), "XMLHttpRequest".into());
-    let endpoint = upstream_endpoint(acc);
-    h.insert("Origin".into(), endpoint.into());
-    h.insert("Referer".into(), format!("{endpoint}/"));
+    // 🔴 官方桌面端转发 chat 请求时**不发送** `Origin` / `Referer`（其头族黑名单
+    // 里明确过滤）。此前跟着发上游根地址，等于多出两个官方没有的头。
     h.insert(
         "User-Agent".into(),
         format!(
@@ -1276,14 +1337,26 @@ fn chat_headers(acc: &Value) -> HashMap<String, String> {
         }
     }
     // 用量归属：伪装成桌面端会话，避免上游统计里 client 为空。
+    // 三个 X-* 取值对照官方桌面端 `buildVlmGatewayHeaders`（2026-10-27 读 asar 核实）：
+    // X-Product=SaaS / X-IDE-Type=WorkBuddy / X-IDE-Name=WorkBuddy，另发 X-IDE-Version。
+    // 旧值 X-Product=WorkBuddy / X-IDE-Type=desktop 是反代自己猜的，官方从没用过。
     h.insert("X-Agent-Purpose".into(), "conversation".into());
     h.insert("X-IDE-Name".into(), "WorkBuddy".into());
-    h.insert("X-IDE-Type".into(), "desktop".into());
-    h.insert("X-Product".into(), "WorkBuddy".into());
+    h.insert("X-IDE-Type".into(), "WorkBuddy".into());
+    h.insert("X-Product".into(), "SaaS".into());
+    h.insert(
+        "X-IDE-Version".into(),
+        DEFAULT_CLIENT_VERSION.into(),
+    );
 
-    // 会话头族（一次对话轮复用同一个聚合主键）。
+    // 会话头族：官方桌面端的语义是「会话 id 稳定、请求/消息 id 每轮现生成」，
+    // 所以入站带了会话 id 时只替换 `X-Conversation-ID`，其余仍是本次请求的 id。
     let conv_req = hex_id();
     let msg = hex_id();
+    let conversation_id = session
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| conv_req.clone());
     // 🔴 `X-Conversation-ID` 是上游渠道校验的**必需项**，缺了整个 chat 请求被
     // `400 / code 11128` 打回（文案「这次调用没通过渠道校验，可能不是官方客户端发出的」）。
     //
@@ -1295,14 +1368,16 @@ fn chat_headers(acc: &Value) -> HashMap<String, String> {
     // 官方桌面端在 `applyGatewayHeaders` 里必发 `X-Conversation-ID`（值 = sessionId），
     // 反代此前只发了 `X-Conversation-Request-ID` 系列，于是从 2026-10-19~20 上游加固后
     // 整条链路全灭。值用每次请求新生成的 32 位 hex 即可（实测随机值也放行）。
-    h.insert("X-Conversation-ID".into(), conv_req.clone());
+    h.insert("X-Conversation-ID".into(), conversation_id);
     h.insert("X-Conversation-Request-ID".into(), conv_req.clone());
     h.insert("X-Conversation-Message-ID".into(), msg.clone());
     h.insert("X-Request-ID".into(), msg.clone());
-    h.insert("X-Root-Request-ID".into(), conv_req.clone());
+    // 🔴 不发 X-Root-Request-ID：官方桌面端的头族里没有这个头，多发的每一个
+    // 官方没有的头都是「非官方客户端」的可识别特征。
     h.insert("X-Trace-ID".into(), conv_req.clone());
     h.insert("X-B3-TraceId".into(), conv_req);
-    h.insert("X-B3-SpanId".into(), msg[..16].to_string());
+    // span id 见 span_id 的说明：不能取 msg 的前 16 位（恒全零）。
+    h.insert("X-B3-SpanId".into(), span_id(&msg));
     h.insert("X-B3-Sampled".into(), "1".into());
     h
 }
@@ -1646,6 +1721,26 @@ fn sanitize_messages_aggressive(body: &mut Value, degraded: &mut Vec<String>) {
     }
 }
 
+/// 上游失败响应体里是否带某个**业务码**（`"code":11128` / `code\":11128` 等形态）。
+///
+/// 🔴 必须锚定 `code` 键名，不能裸子串匹配：上游响应体里还有 `requestId` 这类
+/// 32 位 hex 字段，裸 `contains("11128")` 会被随机 id 误命中（同一个思路见上游
+/// 2026-10-26 的 `has_upstream_code` 修复）。响应体可能被再套一层 JSON 转义，
+/// 所以紧凑/带空格、未转义/转义、`code`/`bizCode` 八种形态都要认。
+fn has_upstream_code(text: &str, code: &str) -> bool {
+    const KEYS: [&str; 8] = [
+        "\"code\":",
+        "\"code\": ",
+        "code\\\":",
+        "code\\\": ",
+        "\"bizCode\":",
+        "\"bizCode\": ",
+        "bizCode\\\":",
+        "bizCode\\\": ",
+    ];
+    KEYS.iter().any(|key| text.contains(&format!("{key}{code}")))
+}
+
 /// 上游的失败响应体是不是「渠道校验软拦截」（`11128`）。
 ///
 /// 只看响应体里有没有这个码 / 这句 msg —— 上游把它包在 `message` 字符串里再套一层
@@ -1654,7 +1749,7 @@ fn sanitize_messages_aggressive(body: &mut Value, degraded: &mut Vec<String>) {
 /// 视为**可重试**的理由见 [`MAX_CHANNEL_RETRY`]：它是间歇性的，且文案本身在让客户端重发。
 /// 判定成它之后**不要立刻冷却账号** —— 号是好的，冻它只会把整个账号池拖空。
 fn is_channel_block(text: &str) -> bool {
-    text.contains("11128") || text.contains("unapproved channel")
+    has_upstream_code(text, "11128") || text.contains("unapproved channel")
 }
 
 /// 上游「模型不存在 / 该账号无权使用该模型」（`11102`）。
@@ -1664,13 +1759,57 @@ fn is_channel_block(text: &str) -> bool {
 /// 拿它 `mark_failed` 会把整个账号冻 120 秒，一次写错的模型名就白冻一个好号。
 /// 判据基于响应体而非状态码：仓库未记录该码固定伴随哪个 HTTP 状态。
 fn is_model_not_found(text: &str) -> bool {
-    const MARKS: [&str; 4] = [
-        "\"code\":11102",
-        "code\\\":11102",
-        "service info not found",
-        "only available for authorized users",
+    has_upstream_code(text, "11102")
+        || text.contains("service info not found")
+        || text.contains("only available for authorized users")
+}
+
+/// 上游 `403 / 11140` 的语义分类。
+///
+/// 🔴 `11140` 是**双语义码**（2026-10-27 调研报告 §2，外部社区两次实测一致）：
+/// 同一个 HTTP 403、同一个 `msg:"request illegal"`，只有 `displayMsg` 能区分：
+/// ① 「账号存在异常行为，已被限制使用」/ "unusual activity" → **账号级风控限制**，
+///    换号有效、本号应长期摘除；
+/// ② 「内容未通过安全审核」→ **请求级内容拒绝**，换号无效、账号本身没事。
+/// 不按 displayMsg 分流就会把内容审核误判成封号（或反过来让封号每 120 秒继续打上游）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BanKind {
+    /// 账号级风控限制：本号长期摘除，直到人工重新登录 / 申诉。
+    Account,
+    /// 请求级内容审核拒绝：不碰账号，原样/人话告知客户端。
+    Content,
+    /// 是 11140 但 displayMsg 认不出：保守长冷却 + 显式日志，不持久摘号。
+    Unknown,
+}
+
+/// 判定失败响应体是不是 `11140`，以及属于哪一类语义。
+fn ban_kind(text: &str) -> Option<BanKind> {
+    if !has_upstream_code(text, "11140") {
+        return None;
+    }
+    // 英文文案是 ASCII、在任何 JSON 转义形式下都保持原样，优先据此判定；
+    // 中文既认原文，也认 serde_json 的 `\uXXXX` 小写转义形态（国内版可能出现转义体）。
+    const ACCOUNT_MARKS: [&str; 6] = [
+        "unusual activity",
+        "has been restricted",
+        "账号存在异常行为",
+        "异常行为",
+        "\\u8d26\\u53f7\\u5b58\\u5728\\u5f02\\u5e38\\u884c\\u4e3a",
+        "\\u5f02\\u5e38\\u884c\\u4e3a",
     ];
-    MARKS.iter().any(|m| text.contains(m))
+    const CONTENT_MARKS: [&str; 4] = [
+        "安全审核",
+        "内容未通过",
+        "\\u5b89\\u5168\\u5ba1\\u6838",
+        "\\u5185\\u5bb9\\u672a\\u901a\\u8fc7",
+    ];
+    if ACCOUNT_MARKS.iter().any(|mark| text.contains(mark)) {
+        Some(BanKind::Account)
+    } else if CONTENT_MARKS.iter().any(|mark| text.contains(mark)) {
+        Some(BanKind::Content)
+    } else {
+        Some(BanKind::Unknown)
+    }
 }
 
 /// 11128 重试耗尽后给客户端的人话。
@@ -2390,7 +2529,7 @@ async fn fetch_edition_models(
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(&url);
-    for (k, v) in chat_headers(&acc) {
+    for (k, v) in chat_headers(&acc, None) {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| format!("请求上游失败：{e}"))?;
@@ -3696,8 +3835,9 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     );
 
     // 🔴 发请求 + 「渠道校验软拦截」重试，见 MAX_CHANNEL_RETRY。
-    // 重试时**重新生成**会话头族（chat_headers 里的 id 是每次调用现算的），
-    // 免得同一个 request id 被上游当成重复包直接判掉。
+    // 重试时**重新生成**请求级 id（chat_headers 里的 conv/message id 是每次调用现算的），
+    // 免得同一个 request id 被上游当成重复包直接判掉；入站自带会话 id 时，
+    // `X-Conversation-ID` 保持会话稳定（与官方桌面端语义一致），只有请求/消息 id 变化。
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，把请求体换成
@@ -3706,13 +3846,11 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     let mut send_body = upstream_body.clone();
     let resp = loop {
         let mut req = client.post(chat_url(&acc));
-        for (k, v) in chat_headers(&acc) {
+        // 入站会话标识在 chat_headers 里统一合并（只产生一个 X-Conversation-ID），
+        // 这里**不能**再 `req.header("X-Conversation-ID", …)` 追加 —— 那是 append
+        // 语义，会让上游收到两个同名头。
+        for (k, v) in chat_headers(&acc, meta.session.as_deref()) {
             req = req.header(k, v);
-        }
-        // 透传入站的会话标识（原样，不新增、不修改）：官方桌面端自己也会发，
-        // 但经 Anthropic 兼容层等中转时可能只剩我们看得见 —— 转发给上游保持一致。
-        if let Some(session) = meta.session.as_deref() {
-            req = req.header("X-Conversation-ID", session);
         }
         let r = match req.json(&send_body).send().await {
             Ok(r) => r,
@@ -3858,8 +3996,67 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         let blocked = is_channel_block(&text);
         // 11102「模型不存在 / 账号无权使用该模型」也不是账号故障，判据见 is_model_not_found。
         let model_missing = is_model_not_found(&text);
+        // 11140 双语义（账号级风控 vs 请求级内容审核），判据见 ban_kind。
+        // 🔴 必须排在通用 4xx 之前：账号级限制若按 `mark_failed` 的 120 秒短冷却
+        // 回池，等于让被封的号每两分钟再打一次上游 —— 既浪费请求，又把
+        // 「被封号仍在持续调用」这个信号继续放大。
+        let ban = ban_kind(&text);
         if raw_status.is_client_error() {
-            if blocked {
+            if matches!(ban, Some(BanKind::Account)) {
+                // 账号级风控限制：持久摘号（needs_relogin）+ 池内冷却。
+                //
+                // 持久化复用账号库的 `needs_relogin`（与 refresh.rs 缺 RT 的先例一致）：
+                // 建池时 eligible_accounts 排除，存量池里 take_account 读盘判定失败、
+                // 只打本地 30 秒跳过标记，不会再有出站请求。用户重新登录 / 重新导入
+                // 后自动回池；界面已有 needsRelogin 红标，reason 会显示在卡片上。
+                //
+                // 🔴 以**磁盘上的完整记录**为底再改：`acc` 是 `take_account` 返回的
+                // 出站对象，`upsert_account` 会整体替换，拿它直接写会把账号库里
+                // 刷新令牌、额度等字段冲掉。
+                let reason = "上游账号级风控限制（11140 unusual activity），需重新登录或申诉";
+                let mut banned = load_accounts()
+                    .into_iter()
+                    .find(|a| a.get("uid").and_then(Value::as_str) == Some(uid.as_str()))
+                    .unwrap_or_else(|| acc.clone());
+                banned["needs_relogin"] = json!(true);
+                banned["needs_relogin_reason"] = json!(reason);
+                if let Err(e) = upsert_account(&banned) {
+                    eprintln!(
+                        "[反代] 11140 摘号落盘失败（本进程内仍会隔离，重启后会重新入池）\
+                         uid={uid}: {e}"
+                    );
+                }
+                st.pool.mark_until(
+                    &uid,
+                    now_ms_i64() + BAN_QUARANTINE.as_millis() as i64,
+                    reason,
+                );
+                eprintln!(
+                    "[反代] 🔴 账号「{account_name}」已被上游限制使用（403/11140 unusual \
+                     activity），已从号池摘除；重新登录或申诉恢复后再导入 (uid={uid})"
+                );
+            } else if matches!(ban, Some(BanKind::Content)) {
+                // 请求级内容审核：账号没问题，换号也没用 —— 不冷却、不摘号。
+                eprintln!(
+                    "[反代] 上游内容审核拒绝（403/11140），**不冷却账号** \
+                     (model={model}, uid={uid})"
+                );
+            } else if matches!(ban, Some(BanKind::Unknown)) {
+                // 认不出是哪一种：不持久摘号（避免把内容审核误当封号），但也不能
+                // 停在 120 秒短冷却上反复撞。长冷却 + 提示开 DEBUG_DUMP 留存响应体。
+                let reason = "上游 11140（displayMsg 无法辨认，保守长冷却）";
+                st.pool.mark_until(
+                    &uid,
+                    now_ms_i64() + BAN_SUSPECT_COOLDOWN.as_millis() as i64,
+                    reason,
+                );
+                eprintln!(
+                    "[反代] ⚠️ 上游 11140 语义不明（既非 unusual activity 也非内容审核），\
+                     账号长冷却 {}(model={model}, uid={uid})；\
+                     请创建 ~/.wb-switch/DEBUG_DUMP 后复现，把 dump/last-failure.txt 留存",
+                    BAN_SUSPECT_COOLDOWN.as_secs()
+                );
+            } else if blocked {
                 // 🔴 11128 渠道校验**不能冷却账号**。
                 //
                 // 它拦的是「这次请求」（请求体不合规 / 调用方被识别），不是账号本身：
@@ -3889,7 +4086,22 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         record_usage(&meta, None, false);
         // 11128 原样透传只会让用户看到一坨双层转义的 JSON，根本不知道该做什么 ——
         // 两种变体成因不同，提示也要分开（见 API-PROXY.md）。
-        let message = if blocked {
+        let message = if matches!(ban, Some(BanKind::Account)) {
+            format!(
+                "账号「{account_name}」已被上游限制使用（403/11140: unusual activity）。\
+                 已自动从号池摘除，不会再向上游发请求；请重新登录或提交申诉恢复后再导入。"
+            )
+        } else if matches!(ban, Some(BanKind::Content)) {
+            "上游内容安全审核拒绝了这条请求（403/11140）。这与账号本身无关，\
+             调整内容后重试即可。"
+                .to_string()
+        } else if matches!(ban, Some(BanKind::Unknown)) {
+            format!(
+                "账号「{account_name}」收到上游 11140 限制（原因未能识别），已临时停用 {} 分钟。\
+                 请创建 ~/.wb-switch/DEBUG_DUMP 后复现一次，把 dump/last-failure.txt 留存以便定位。",
+                BAN_SUSPECT_COOLDOWN.as_secs() / 60
+            )
+        } else if blocked {
             channel_block_message(&text, st.edition.label(), channel_retry)
         } else if model_missing {
             format!(
@@ -7225,5 +7437,132 @@ mod tests {
         assert!(STREAM_IDLE_TIMEOUT > STREAM_FIRST_BYTE);
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(env_secs("WB_SWITCH_TEST_NOT_SET", Duration::from_secs(5)), Duration::from_secs(5));
+    }
+
+    // ------------------------------------------------ 出站头族 / 11140 分流
+
+    fn test_account() -> Value {
+        json!({
+            "uid": "u-1",
+            "access_token": "at",
+            "domain": "www.workbuddy.ai",
+            "edition": "international",
+        })
+    }
+
+    /// 出站头族要与官方桌面端一致：取值错误、多余头、缺头都是可识别的差异。
+    #[test]
+    fn chat_headers_align_with_official_client() {
+        let h = chat_headers(&test_account(), None);
+        assert_eq!(h.get("X-Product").map(String::as_str), Some("SaaS"));
+        assert_eq!(h.get("X-IDE-Type").map(String::as_str), Some("WorkBuddy"));
+        assert_eq!(h.get("X-IDE-Name").map(String::as_str), Some("WorkBuddy"));
+        assert_eq!(
+            h.get("X-IDE-Version").map(String::as_str),
+            Some(DEFAULT_CLIENT_VERSION)
+        );
+        // 官方只声明 application/json；官方转发时过滤 Origin / Referer。
+        assert_eq!(
+            h.get("Accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(!h.contains_key("Origin"));
+        assert!(!h.contains_key("Referer"));
+        // 官方头族里没有 X-Root-Request-ID。
+        assert!(!h.contains_key("X-Root-Request-ID"));
+        let ua = h.get("User-Agent").cloned().unwrap_or_default();
+        assert!(
+            ua.contains(&format!("WorkBuddy/{DEFAULT_CLIENT_VERSION}")),
+            "{ua}"
+        );
+        assert!(ua.contains(&format!("CLI/{DEFAULT_CLI_VERSION}")), "{ua}");
+    }
+
+    /// 🔴 旧 hex_id 的高 16 位恒为零，导致 X-B3-SpanId 恒为 `0000000000000000`、
+    /// TraceId 全带 16 个前导零 —— 一次格式校验就能识别的确定性指纹。
+    #[test]
+    fn ids_are_full_width_and_span_id_is_random() {
+        for _ in 0..32 {
+            let id = hex_id();
+            assert_eq!(id.len(), 32, "{id}");
+            assert!(!id.starts_with("0000000000000000"), "{id}");
+        }
+
+        let h = chat_headers(&test_account(), None);
+        let span = h.get("X-B3-SpanId").expect("必须有 span id");
+        assert_eq!(span.len(), 16);
+        assert_ne!(span, "0000000000000000");
+        let trace = h.get("X-B3-TraceId").expect("必须有 trace id");
+        assert_eq!(trace.len(), 32);
+        assert!(!trace.starts_with("0000000000000000"), "{trace}");
+        // 同一纳秒内连续生成也不能重复（hex_id 里有序号兜底）。
+        let h2 = chat_headers(&test_account(), None);
+        assert_ne!(h.get("X-B3-SpanId"), h2.get("X-B3-SpanId"));
+        assert_ne!(h.get("X-Conversation-Request-ID"), h2.get("X-Conversation-Request-ID"));
+    }
+
+    /// 入站自带会话 id 时，出站 `X-Conversation-ID` 就是它（会话内稳定）；
+    /// 请求级 id 仍按每次请求现生成 —— 发送侧也不再追加第二个同名头。
+    #[test]
+    fn conversation_id_follows_inbound_session() {
+        let h = chat_headers(&test_account(), Some("3f8a0c1e-session"));
+        assert_eq!(
+            h.get("X-Conversation-ID").map(String::as_str),
+            Some("3f8a0c1e-session")
+        );
+        assert_ne!(
+            h.get("X-Conversation-Request-ID"),
+            h.get("X-Conversation-ID"),
+            "请求级 id 不能跟着会话走"
+        );
+        // 空串按「没有会话」处理，不能把空值发给上游。
+        let h2 = chat_headers(&test_account(), Some(""));
+        assert_ne!(h2.get("X-Conversation-ID").map(String::as_str), Some(""));
+        assert_eq!(
+            h2.get("X-Conversation-ID").map(|v| v.len()),
+            Some(32),
+            "无会话时用现生成的 32 位 hex"
+        );
+    }
+
+    /// 11140 双语义必须靠 displayMsg 区分（调研报告 §2）：
+    /// 账号级 → 摘号；内容审核 → 只回文案，不动账号；认不出 → 保守长冷却。
+    #[test]
+    fn ban_kind_splits_11140_by_display_msg() {
+        let account = r#"{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity","zh":"账号存在异常行为，已被限制使用"}}"#;
+        assert_eq!(ban_kind(account), Some(BanKind::Account));
+
+        let content = r#"{"code":11140,"msg":"request illegal","displayMsg":{"zh":"内容未通过安全审核，请调整后重试"}}"#;
+        assert_eq!(ban_kind(content), Some(BanKind::Content));
+
+        let unknown = r#"{"code":11140,"msg":"request illegal"}"#;
+        assert_eq!(ban_kind(unknown), Some(BanKind::Unknown));
+
+        // 其它码不能被误判成封号。
+        assert_eq!(ban_kind(r#"{"code":11128,"msg":"unapproved channel"}"#), None);
+        assert_eq!(ban_kind(r#"{"code":6004,"msg":"frequency limit"}"#), None);
+        assert_eq!(ban_kind("plain text"), None);
+    }
+
+    /// 中文被转义成 `\uXXXX` 时也要能分出「账号级」。
+    #[test]
+    fn ban_kind_recognises_escaped_chinese_display_msg() {
+        let body = "{\"code\":11140,\"msg\":\"request illegal\",\"displayMsg\":\"\\u8d26\\u53f7\\u5b58\\u5728\\u5f02\\u5e38\\u884c\\u4e3a\\uff0c\\u5df2\\u88ab\\u9650\\u5236\\u4f7f\\u7528\"}";
+        assert!(!body.contains("异常行为"), "前提：中文确实被转义了");
+        assert_eq!(ban_kind(body), Some(BanKind::Account));
+    }
+
+    /// 业务码匹配必须锚定 `code` 键：`requestId` 里的 hex 数字不能被误命中
+    /// （上游 2026-10-26 的同类修复）。
+    #[test]
+    fn upstream_code_match_is_anchored() {
+        // requestId 里含 11128，但真正的码是 11133：不能当渠道拦截去重试。
+        let body = r#"{"code":11133,"msg":"model busy","requestId":"00000000000011128aabb"}"#;
+        assert!(!is_channel_block(body));
+        // 双层转义形态照旧要认。
+        assert!(is_channel_block(r#"{"message":"{\"code\":11128}"}"#));
+        assert!(is_model_not_found(r#"{"message":"{\"code\":11102}"}"#));
+        assert!(ban_kind(r#"{"message":"{\"code\":11140,\"displayMsg\":\"unusual activity\"}"}"#)
+            .is_some());
     }
 }
