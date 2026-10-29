@@ -7633,6 +7633,25 @@ mod tests {
         assert_eq!(transient_code(r#"{"code":11102}"#), None);
     }
 
+    /// 🔴 出站头必须同时带齐三个会话 ID。
+    ///
+    /// 国际版渠道校验只查**存在性**：缺 `X-Conversation-ID` 时，同一个号、同一套
+    /// 其余头、同一个 payload 会被稳定判成 `11128 request illegal`（上游
+    /// 2026-10-26 的对照实验）。这条测试防止将来「精简头族」时又把它删掉 ——
+    /// 这个缺失曾让国际版整整 9 天全线不可用。
+    #[test]
+    fn chat_headers_carry_all_three_conversation_ids() {
+        let h = chat_headers(&test_account(), None);
+        for key in [
+            "X-Conversation-ID",
+            "X-Conversation-Request-ID",
+            "X-Conversation-Message-ID",
+        ] {
+            let v = h.get(key).unwrap_or_else(|| panic!("{key} 必须存在"));
+            assert!(!v.is_empty(), "{key} 不能为空");
+        }
+    }
+
     /// 11140 双语义必须靠 displayMsg 区分（调研报告 §2）：
     /// 账号级 → 摘号；内容审核 → 只回文案，不动账号；认不出 → 保守长冷却。
     #[test]
