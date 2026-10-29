@@ -85,6 +85,17 @@ const BAN_SUSPECT_COOLDOWN: Duration = Duration::from_secs(3600);
 /// 所以遇到它**先重试**，重试仍失败才当账号故障处理。
 const MAX_CHANNEL_RETRY: usize = 2;
 
+/// 模型侧瞬时故障（11133/11134/14003）的重试次数（退避见 [`MODEL_RETRY_BACKOFF_MS`]）。
+///
+/// 🔴 这类码**不是账号的问题**（官方归类「模型侧状态」），重试耗尽也不冷却账号 ——
+/// 冻它只会让下一次请求换到一个同样会撞故障窗口的号。
+const MAX_MODEL_RETRY: usize = 3;
+/// 退避梯度：1s → 3s → 8s（合计 12s）。
+///
+/// 上游同功能用的是 1/3/8s，此处保持一致。反代是同步阻塞客户端的，
+/// 不再拉长：这类故障窗口实测通常几秒内就恢复，拖太久客户端会先超时断开。
+const MODEL_RETRY_BACKOFF_MS: [u64; MAX_MODEL_RETRY] = [1_000, 3_000, 8_000];
+
 /// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
 /// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
 /// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
@@ -1750,6 +1761,25 @@ fn has_upstream_code(text: &str, code: &str) -> bool {
 /// 判定成它之后**不要立刻冷却账号** —— 号是好的，冻它只会把整个账号池拖空。
 fn is_channel_block(text: &str) -> bool {
     has_upstream_code(text, "11128") || text.contains("unapproved channel")
+}
+
+/// 上游「模型侧瞬时故障」——官方文档把 `11133` / `11134` / `14003` 都归为
+/// 「多与模型侧状态有关」，处理建议是「新开会话或切换模型重试」。
+///
+/// 🔴 这一类**不是**参数错误：`invalid_request_error`、`param` 字段看着像校验失败，
+/// 但官方归类是模型侧状态，重发即可能成功。
+///
+/// ⇒ 正确处置是**重试**，而不是冷却账号 —— 账号和请求都没问题。
+/// （判据与重试节奏来源：上游 2026-10-26 的逐参数排除实验，见 API-PROXY.md。）
+fn is_transient_model_error(text: &str) -> bool {
+    transient_code(text).is_some()
+}
+
+/// 命中时返回具体是哪个业务码（用于给用户看「是哪个码」）。
+fn transient_code(text: &str) -> Option<&'static str> {
+    ["11133", "11134", "14003"]
+        .into_iter()
+        .find(|code| has_upstream_code(text, code))
 }
 
 /// 上游「模型不存在 / 该账号无权使用该模型」（`11102`）。
@@ -3840,6 +3870,8 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     // `X-Conversation-ID` 保持会话稳定（与官方桌面端语义一致），只有请求/消息 id 变化。
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
+    // 模型侧瞬时故障（11133/11134/14003）的重试计数，见 MAX_MODEL_RETRY。
+    let mut model_retry = 0usize;
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，把请求体换成
     // 更保守的形态再试一次。默认只做「无损」那一层（见 heal_body_for_channel）。
     let mut self_healed = false;
@@ -3883,6 +3915,18 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         }
         let raw_status = r.status();
         let text = r.text().await.unwrap_or_default();
+        // 🔴 模型侧瞬时故障（11133/11134/14003）：官方归类「模型侧状态」，
+        // 重发即可能成功。**绝不能冷却账号** —— 见 is_transient_model_error。
+        if is_transient_model_error(&text) && model_retry < MAX_MODEL_RETRY {
+            let wait = MODEL_RETRY_BACKOFF_MS[model_retry];
+            model_retry += 1;
+            eprintln!(
+                "[反代] 上游模型侧瞬时故障，第 {model_retry}/{MAX_MODEL_RETRY} 次重试，\
+                 等待 {wait}ms (model={model}, uid={uid})"
+            );
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            continue;
+        }
         if is_channel_block(&text) {
             // 🔴 先试「自愈」：`unapproved channel` 是**负载**被判成非官方客户端，
             // 换一份更保守的请求往往能直接过（`request illegal` 是客户端身份变体，
@@ -4073,6 +4117,13 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                 eprintln!(
                     "[反代] 上游无此模型（11102，**不冷却账号**）(model={model}, uid={uid})"
                 );
+            } else if is_transient_model_error(&text) {
+                // 模型侧状态问题：已重试 {MAX_MODEL_RETRY} 次仍失败，号还是好的，
+                // 冻它只会让下一次请求换到一个同样会撞故障窗口的号。
+                eprintln!(
+                    "[反代] 上游模型侧故障（11133/11134/14003）重试 {model_retry} 次仍未恢复，\
+                     **不冷却账号** (model={model}, uid={uid})"
+                );
             } else {
                 st.pool
                     .mark_failed(&uid, &format!("上游返回 {}", raw_status.as_u16()));
@@ -4106,6 +4157,15 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         } else if model_missing {
             format!(
                 "上游没有模型 `{model}`，或当前账号无权使用该模型（11102）。这不影响账号本身，换一个模型即可。"
+            )
+        } else if is_transient_model_error(&text) {
+            // 官方文档对 11133/11134/14003 的处置建议就是「新开会话或切换模型重试」。
+            // 我们已经退避重试过，仍未恢复。
+            let code_label = transient_code(&text).unwrap_or("11133");
+            format!(
+                "上游模型侧暂时异常（code {code_label}），已自动退避重试 {model_retry} 次仍未恢复。\
+                 这不是你的参数写错，也不是账号失效 —— 官方把这类码归为「模型侧状态」。\
+                 建议：① 换个模型再发（最有效）；② 新开一个会话；③ 稍等十几秒重试。"
             )
         } else if raw_status.as_u16() == 429 {
             // 429 但解析不出重置时刻：别把原始 JSON 糊给客户端。
@@ -7523,6 +7583,21 @@ mod tests {
             Some(32),
             "无会话时用现生成的 32 位 hex"
         );
+    }
+
+    /// 11133 / 11134 / 14003 属于「模型侧瞬时故障」，靠重试解决，不是账号问题。
+    #[test]
+    fn transient_model_errors_are_recognized() {
+        let real = r#"{"code":11133,"msg":"the request parameters were rejected by the model provider","extError":{"code":"1210"}}"#;
+        assert!(is_transient_model_error(real));
+        assert_eq!(transient_code(real), Some("11133"));
+        assert!(is_transient_model_error(r#"{"code":11134}"#));
+        assert!(is_transient_model_error(r#"{"code":14003}"#));
+        // 别的码不能落进这一类
+        assert!(!is_transient_model_error(r#"{"code":11128,"msg":"request illegal"}"#));
+        assert!(!is_transient_model_error(r#"{"code":60004,"msg":"频率限制"}"#));
+        assert!(!is_transient_model_error(r#"{"code":11102}"#));
+        assert_eq!(transient_code(r#"{"code":11102}"#), None);
     }
 
     /// 11140 双语义必须靠 displayMsg 区分（调研报告 §2）：
