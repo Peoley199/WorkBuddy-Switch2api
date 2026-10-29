@@ -420,6 +420,55 @@ x-wb-switch-degraded: system-env
 **冷却口径**：`11128` 不冷却账号（它拦的是请求不是号，同号只读接口照常 200）。
 重试耗尽后的报错文案按两种变体分开给出可执行建议。
 
+### 国际版 `request illegal`：缺 `X-Conversation-ID` 的教训（上游 v1.6.22 复盘）
+
+上游 2026-10-17 起国际版全线报 `11128 request illegal`，当时的判断是
+「上游按调用方身份做策略封禁，本地无解」，依据是：同 token 读模型清单 200、
+打 chat 端点稳定 11128、换 4 种 User-Agent 全挂、5/5 国际号全挂而国内版全好。
+
+**这个结论是错的。** 真正的成因是出站头少了**一个**：2026-10-26 对照实验
+（同一个号、同一套其余头、同一个 payload，只此一处不同）——
+
+| 请求 | 结果 |
+|---|---|
+| `/v2/chat/completions` + 原有 2 个会话头 | **11128 `request illegal`** |
+| `/v2/chat/completions` + 补 `X-Conversation-ID` | **200 ✅** |
+
+国际版渠道校验只查三个会话头的**存在性**、不校验值：
+`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`。
+缺任一即拦，换 UA 无效——「换 UA 无效」不能推出「封的是账号」，当时还有一个
+变量没被隔离：**请求头是多了还是少了**。本仓库自 2026-10-20 起就带齐三个头
+（且做了会话内稳定 + 单次发送），未踩过这个坑；此处记录复盘以免将来「精简头族」时重犯。
+
+> 国内版不受此约束：`copilot.tencent.com` / `codebuddy.cn` 上没有这道头检查。
+
+## 模型侧瞬时故障 11133 / 11134 / 14003（上游 v1.6.21，本仓库已同步）
+
+```text
+{"code":11133,"msg":"the request parameters were rejected by the model provider",
+ "extError":{"code":"1210","type":"invalid_request_error","StatusCode":400}}
+```
+
+**这条容易误判成「参数写错了」** —— 它有 `invalid_request_error` 和 `param` 字段，
+看起来像校验失败。但腾讯官方《错误码处理说明》把它归为「**多与模型侧状态有关**」，
+处理建议是「新开会话或切换模型重试」，不是让你改参数。
+
+上游 2026-10-26 在 `glm-5.3-flash` 上逐个排除（`stop` / `response_format` /
+`logprobs` / `seed` / `reasoning_effort` / `stream_options` / `parallel_tool_calls` /
+图片输入 / 80 个 tools / 7.5 万字 system / `tool_call` 配对断裂），**全部 200**，
+单参数复现不出来。对照开源实现 `opencode-codebuddy-oauth`：把 11133 当
+「服务端侧故障窗口」，按 1s→4s→10s→25s 退避幂等重发，同构请求稍后即成功。
+
+**反代处理**：
+
+- `is_transient_model_error()` 识别 `11133` / `11134` / `14003`（走本仓库的
+  8 形态 `has_upstream_code` 锚定匹配）
+- 退避重试 3 次（1s → 3s → 8s，合计 12s）。比参考实现的 ≤40s 短：
+  反代是同步阻塞客户端的，拖太久客户端会先超时断开
+- 🔴 **重试耗尽也不冷却账号** —— 账号和请求都没问题，冻号只会让下一次请求
+  换到一个同样会撞故障窗口的号
+- 仍失败时返回可读文案，提示「换模型 / 新开会话 / 稍等重试」
+
 ## 标准参数透传与 `tool_choice` 归一化
 
 `build_upstream_body` 以前只转 `model / messages / stream / temperature / top_p /
