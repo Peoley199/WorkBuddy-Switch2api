@@ -42,6 +42,16 @@ const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
 
+/// 账号被上游**风控限制**（`11140`）后的冷却时长：6 小时。
+///
+/// 取 6 小时的理由：
+/// - 这类限制是「账号级 + 长时」，不是抖动。用 120 秒冷却去等它，等于每两分钟
+///   再撞一次 403 —— 既刷屏，也可能让风控评分继续恶化。
+/// - 但又不能永久拉黑：实测文案是 `restricted due to unusual activity`，
+///   属于**可自愈**的临时限制（不像 401 那样必须重登）。6 小时是一个折中，
+///   到期自动回到池子里重试；若仍被限，会被再次标记，不会无限重试。
+const RESTRICTED_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// 上游「渠道校验」（`11128`）的最大重试次数。
 ///
 /// 这个码**不是账号的问题**（同号读接口 200、打 chat 端点 11128），也**不一定**是
@@ -563,6 +573,17 @@ struct AccountLease {
     /// 拿国际版专属的 model 去打国内版网关会被拒，所以选号必须认版本。
     edition: Edition,
     failed_at: Option<Instant>,
+    /// 被上游**风控限制**（`11140 request illegal`）的截止时刻。
+    ///
+    /// 🔴 这类限制是**账号级且长时**的，和 120 秒的抖动冷却完全不同：
+    /// 2026-10-29 实测国际版 5/5 可用号全部 403
+    /// `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has
+    /// been restricted due to unusual activity"}}`，而**同一个 token** 读
+    /// `/v2/enterprises/personal/models` 仍 200 —— 号没被注销，是被限制对话。
+    /// 国内版同在一条网络下 200 正常，所以既不是 IP 也不是网络。
+    ///
+    /// 用 120 秒冷却去等它，只会每两分钟再撞一次 403：既刷屏，又可能让风控评分更差。
+    restricted_until: Option<Instant>,
     /// **按模型**的长冷却：`model -> 恢复时刻`。
     ///
     /// 60004 只代表「这个模型的额度用完了」，同一账号换模型仍可用（上游文案
@@ -587,6 +608,7 @@ impl Pool {
                         uid,
                         edition,
                         failed_at: None,
+                        restricted_until: None,
                         model_cooldowns: HashMap::new(),
                     })
                 })
@@ -624,6 +646,14 @@ impl Pool {
             if cooling {
                 continue;
             }
+            // 被风控限制的号直接跳过，别拿它去撞 403。
+            let restricted = lease
+                .restricted_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+            if restricted {
+                continue;
+            }
             if let Some(m) = model {
                 let model_cooling = lease
                     .model_cooldowns
@@ -653,6 +683,20 @@ impl Pool {
             let Ok(mut lease) = slot.lock() else { continue };
             if lease.uid == uid {
                 lease.failed_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 标记账号被上游**风控限制**，长时间不再选它。
+    ///
+    /// 与 [`mark_failed`](Self::mark_failed) 的区别见 `AccountLease::restricted_until`：
+    /// 那个是 120 秒的抖动冷却，这个是数小时的账号级限制。
+    fn mark_restricted(&self, uid: &str) {
+        let until = Instant::now() + RESTRICTED_COOLDOWN;
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.restricted_until = Some(until);
             }
         }
     }
@@ -1064,6 +1108,25 @@ fn transient_code(text: &str) -> Option<&'static str> {
         .find(|code| has_upstream_code(text, code))
 }
 
+/// 上游是否把该账号判成**风控限制**（`11140`）。
+///
+/// 判据来自 2026-10-29 实测（国际版 5/5 可用号）：
+///
+/// ```text
+/// 403 {"code":11140,"msg":"request illegal",
+///      "displayMsg":{"en":"Your account has been restricted due to unusual activity"}}
+/// ```
+///
+/// 关键鉴别：**同一个 token 读 `/v2/enterprises/personal/models` 仍 200**。
+/// 所以它不是 token 失效（那会 401）、不是渠道校验（11128）、也不是 IP 风控
+/// （国内版在同一条网络下 200 正常）——是**这个账号的对话能力被限制**。
+///
+/// 🔴 与 `11128 request illegal` 的区别：两者 `msg` 相同，**只能靠 `code` 分辨**。
+/// 11128 改负载还有救；11140 改什么都没用，只能等或申诉。
+fn is_account_restricted(text: &str) -> bool {
+    has_upstream_code(text, "11140")
+}
+
 /// 模型侧瞬时故障的重试次数（退避见 [`MODEL_RETRY_BACKOFF_MS`]）。
 const MAX_MODEL_RETRY: usize = 3;
 /// 退避梯度：1s → 3s → 8s（合计 12s）。
@@ -1081,6 +1144,12 @@ const MODEL_RETRY_BACKOFF_MS: [u64; MAX_MODEL_RETRY] = [1_000, 3_000, 8_000];
 /// 判定成它之后**绝不能冷却账号** —— 号是好的（读接口照样 200），
 /// 冻它只会把整个账号池拖空。理由见 4xx 分支里的实测记录。
 fn is_channel_block(text: &str) -> bool {
+    // 🔴 必须先排除 11140：它的 msg 也是 `request illegal`（与 11128 一字不差），
+    // 只按 msg 判会把「账号被风控限制」误当成「渠道校验」，于是去重试 + 自愈，
+    // 在一个注定 403 的号上反复送请求。
+    if is_account_restricted(text) {
+        return false;
+    }
     // 锚 `"code":` 而不是裸子串 —— `requestId` 是十六进制，可能撞出 11128。
     has_upstream_code(text, "11128")
         || text.contains("unapproved channel")
@@ -2578,7 +2647,16 @@ async fn chat_completions(
             //   客户端随即收到「国际版的账号当前都不可用」，而这 5 个号其实一个都没坏。
             let blocked = is_channel_block(&text);
             let transient = is_transient_model_error(&text);
-            if blocked {
+            let restricted = is_account_restricted(&text);
+            if restricted {
+                // 🔴 风控限制：长冷却 + 不再重试。用 120 秒冷却去等它，
+                // 等于每两分钟再撞一次 403，既刷屏也可能加重风控评分。
+                st.pool.mark_restricted(&uid);
+                eprintln!(
+                    "[反代] 账号被上游风控限制（11140 unusual activity），\
+                     已冷却 {RESTRICTED_COOLDOWN:?} 不再选用 (model={model}, uid={uid})"
+                );
+            } else if blocked {
                 eprintln!(
                     "[反代] 上游 chat 端点拒绝该请求（11128 渠道校验），**不冷却账号** \
                      —— 这是端点级策略拦截，账号本身有效 (model={model}, uid={uid})"
@@ -2616,6 +2694,20 @@ async fn chat_completions(
                  这不是你的参数写错，也不是账号失效 —— 官方把这类码归为「模型侧状态」。\
                  建议：① 换个模型再发（最有效）；② 新开一个会话；③ 稍等十几秒重试。\
                  当前会话若已连续失败，换模型往往立刻恢复。"
+            )
+        } else if is_account_restricted(&text) {
+            // 结论要说得直白：这是账号被限制，不是我们发得不对，重发也没用。
+            format!(
+                "账号「{account_name}」被{edition_label}上游**风控限制**了\
+                 （HTTP 403 / code 11140，上游原文：Your account has been restricted \
+                 due to unusual activity）。\n\
+                 判定依据：同一个 token 读模型清单仍返回 200（说明登录态有效、账号没被注销），\
+                 只有对话接口被拦——这是账号级的使用限制，不是网络、不是参数、也不是频率超限。\n\
+                 已把该账号冷却 {cooldown_h} 小时不再自动选用；到期会自动重试。\n\
+                 建议：① 别反复重发，重发只会延长限制；② 到官方客户端里确认是否同样被拦；\
+                 ③ 通过「帮助与反馈」或 workbuddy_ai@tencent.com 申诉；\
+                 ④ 暂时改用国内版入口（国内版账号目前正常）。",
+                cooldown_h = RESTRICTED_COOLDOWN.as_secs() / 3600,
             )
         } else if is_channel_block(&text) {
             // 两种 11128 变体成因不同，提示也要分开 —— 混在一起用户无从下手：
@@ -3337,6 +3429,28 @@ mod tests {
             h["X-Conversation-Request-ID"], h["X-Conversation-Message-ID"],
             "会话请求 ID 与消息 ID 不应相同"
         );
+    }
+
+    /// 🔴 `11140` 与 `11128` 的 `msg` **完全一样**（都是 `request illegal`），
+    /// 只能靠 `code` 分辨，且两者的处置相反：
+    /// - 11128：改负载可能过（渠道校验）
+    /// - 11140：改什么都没用（账号被风控限制），必须长冷却
+    #[test]
+    fn restricted_11140_is_distinguished_from_channel_11128() {
+        let restricted = r#"{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}"#;
+        let channel = r#"{"code":11128,"msg":"request illegal","displayMsg":{"zh":"这次调用没通过渠道校验"}}"#;
+
+        assert!(is_account_restricted(restricted), "11140 必须识别为风控限制");
+        assert!(!is_account_restricted(channel), "11128 不能被误判成风控限制");
+
+        // 反向：11140 不属于渠道校验，也不属于模型侧瞬时故障
+        assert!(!is_channel_block(restricted), "11140 不该被当成 11128");
+        assert!(!is_transient_model_error(restricted), "11140 不该被当成重试类");
+
+        // 别的码都不算
+        assert!(!is_account_restricted(r#"{"code":11133}"#));
+        assert!(!is_account_restricted(r#"{"code":401,"msg":"unauthorized"}"#));
+        assert!(!is_account_restricted(""));
     }
 
     #[test]
