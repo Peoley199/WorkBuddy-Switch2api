@@ -96,14 +96,23 @@ const MAX_MODEL_RETRY: usize = 3;
 /// 不再拉长：这类故障窗口实测通常几秒内就恢复，拖太久客户端会先超时断开。
 const MODEL_RETRY_BACKOFF_MS: [u64; MAX_MODEL_RETRY] = [1_000, 3_000, 8_000];
 
-/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
+/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒 / TLS 重置）的最大重试次数。
 /// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
 /// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
 /// 国际版只有 3 个号，几下就冻空 ⇒ 客户端收到
 /// `503 国际版的账号当前都不可用（冷却中，或需要重新登录）`，过两分钟又好了，
 /// 然后网络再抖 → 再冻 —— 表现为「一会儿报错停下来、一会儿又能用」反复横跳。
 /// （2026-10-11 与 `refresh.rs` 里 `code=-1` 那个坑同源。）
-const MAX_TRANSPORT_RETRY: usize = 1;
+///
+/// 从 **1 次** 提到 **3 次**（上游 2026-10-26 同改）：反代**走直连、不读系统代理**，
+/// 线路抖动时只有这一条路可走，只重试 1 次容易把瞬时抖动放大成「全线故障」的观感。
+const MAX_TRANSPORT_RETRY: usize = 3;
+
+/// 连接层失败的退避梯度：400ms → 1s → 2s。
+///
+/// 不取更长：这是在**等网络**，不是等上游处理；客户端自己还有外层重试，
+/// 反代这边拖太久只会让用户觉得「卡住了」。
+const TRANSPORT_RETRY_BACKOFF_MS: [u64; MAX_TRANSPORT_RETRY] = [400, 1_000, 2_000];
 
 /// 出站连接超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3888,15 +3897,16 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
             Ok(r) => r,
             Err(e) => {
                 // 🔴 连接层失败：**不冷却账号**（原因见 MAX_TRANSPORT_RETRY）。
-                // 只重试一次应对瞬时抖动；仍失败就把 502 如实回给客户端，
+                // 退避重试几次应对瞬时抖动；仍失败就回 **502 + 可读原因**，
                 // 由客户端自己决定要不要再发 —— 号本身没坏，别把它冻掉。
                 if transport_retry < MAX_TRANSPORT_RETRY {
+                    let wait = TRANSPORT_RETRY_BACKOFF_MS[transport_retry];
                     transport_retry += 1;
                     eprintln!(
-                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试 \
-                         (model={model}, uid={uid}): {e}"
+                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试，\
+                         等待 {wait}ms (model={model}, uid={uid}): {e}"
                     );
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
                     continue;
                 }
                 debug_dump(
@@ -3907,7 +3917,30 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                     ),
                 );
                 record_usage(&meta, None, false);
-                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+                // 🔴 别把裸的 reqwest 原文回给客户端：原文形如
+                // `error sending request for url (https://www.workbuddy.ai/...)`，
+                // 用户看到「workbuddy.ai + 502」第一反应就是「号被封了」（真实发生过）。
+                // 这里明确写清：连不上 ≠ 被拒，账号没坏，怎么处理。
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": {
+                            "message": format!(
+                                "连不上上游（{}），已重试 {transport_retry} 次。\
+                                 这是**网络层**失败：DNS、超时、TLS 重置或线路抖动，\
+                                 不是账号被封、不是鉴权失败、也不是频率超限 —— 账号本身是好的。\
+                                 反代走**直连**（不读系统代理），线路一抖就会落到这里。\
+                                 处理办法：① 稍等几秒重发；② 若长期频繁出现，检查本机到上游的网络。\
+                                 原始错误：{e}",
+                                st.edition.label()
+                            ),
+                            "type": "upstream_unreachable",
+                            "edition": st.edition.label(),
+                            "retries": transport_retry,
+                        }
+                    })),
+                )
+                    .into_response();
             }
         };
         if r.status().is_success() {
