@@ -42,16 +42,21 @@ const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
 
-/// 账号被上游**风控限制**（`11140`）后的冷却时长：3 小时。
+/// 账号被上游**风控限制**（`11140`）后的**起始**冷却时长：3 小时。
 ///
-/// 为什么是 3 小时：
-/// - 腾讯云开发者社区对 11140 的官方口径是「**停 2~4 小时再试**，如果是内容安全
-///   触发的临时限制，等一会儿通常自解；期间别反复重试，越试风控越紧」
-///   （`cloud.tencent.com/developer/ask/2212682`）。
-/// - 所以既不能用 120 秒（等于每两分钟再撞一次 403，反把风控评分养坏），
-///   也不需要 6 小时（比「2~4 小时」还长，白白多损失可用时间）。
-/// - 取 3 小时落在社区的恢复窗口内：到期自动回池；若仍被限会被再次标记，不会无限重试。
-const RESTRICTED_COOLDOWN: Duration = Duration::from_secs(3 * 60 * 60);
+/// 🔴🔴 这里曾经写死 6 小时，后来按「腾讯云开发者社区说停 2~4 小时」改成 3 小时 ——
+/// **社区那个口径对本案不成立**。2026-10-29 实测：
+/// - 同一账号换出口 IP（走代理）仍然 403 ⇒ 与 IP 无关，绑的是账号
+/// - 用户反馈已等 **2 天**仍未恢复 ⇒ 不是「几小时自解」那类内容安全临时抖动
+/// - 8 个国际号里 5 个可测的**全部** 403 ⇒ 更像批量标记，而非单次误触
+///
+/// 所以改成**递增冷却**：3h → 6h → 12h → 24h（封顶）。
+/// 好处是既保留「万一真自愈了」的自动回池能力，又不会在长时间受限的号上
+/// 每 3 小时白撞一次（反复重试被认为会加重风控评分）。
+/// 一旦该号成功出字，计数清零，下次再被限重新从 3 小时起步。
+const RESTRICTED_COOLDOWN_BASE: Duration = Duration::from_secs(3 * 60 * 60);
+/// 递增冷却的上限：24 小时。
+const RESTRICTED_COOLDOWN_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 上游「渠道校验」（`11128`）的最大重试次数。
 ///
@@ -585,6 +590,9 @@ struct AccountLease {
     ///
     /// 用 120 秒冷却去等它，只会每两分钟再撞一次 403：既刷屏，又可能让风控评分更差。
     restricted_until: Option<Instant>,
+    /// 累计被风控限制的次数，用于**递增冷却**（见 `RESTRICTED_COOLDOWN_BASE`）。
+    /// 成功出字后清零。
+    restrict_strikes: u32,
     /// **按模型**的长冷却：`model -> 恢复时刻`。
     ///
     /// 60004 只代表「这个模型的额度用完了」，同一账号换模型仍可用（上游文案
@@ -610,6 +618,7 @@ impl Pool {
                         edition,
                         failed_at: None,
                         restricted_until: None,
+                        restrict_strikes: 0,
                         model_cooldowns: HashMap::new(),
                     })
                 })
@@ -688,16 +697,37 @@ impl Pool {
         }
     }
 
-    /// 标记账号被上游**风控限制**，长时间不再选它。
+    /// 标记账号被上游**风控限制**，按**递增**时长不再选它，并返回本次的冷却时长。
     ///
     /// 与 [`mark_failed`](Self::mark_failed) 的区别见 `AccountLease::restricted_until`：
-    /// 那个是 120 秒的抖动冷却，这个是数小时的账号级限制。
-    fn mark_restricted(&self, uid: &str) {
-        let until = Instant::now() + RESTRICTED_COOLDOWN;
+    /// 那个是 120 秒的抖动冷却，这个是「账号级、时长未知」的限制。
+    ///
+    /// 递增序列：3h → 6h → 12h → 24h（封顶）。理由见 `RESTRICTED_COOLDOWN_BASE`：
+    /// 实测等 2 天仍不恢复，固定 3 小时只会让人每小时白撞一次。
+    fn mark_restricted(&self, uid: &str) -> Duration {
+        let mut applied = RESTRICTED_COOLDOWN_BASE;
         for slot in &self.leases {
             let Ok(mut lease) = slot.lock() else { continue };
             if lease.uid == uid {
-                lease.restricted_until = Some(until);
+                lease.restrict_strikes = lease.restrict_strikes.saturating_add(1);
+                let factor = 1u32 << lease.restrict_strikes.saturating_sub(1).min(4);
+                let secs = RESTRICTED_COOLDOWN_BASE.as_secs().saturating_mul(factor as u64);
+                applied = Duration::from_secs(secs.min(RESTRICTED_COOLDOWN_MAX.as_secs()));
+                lease.restricted_until = Some(Instant::now() + applied);
+                break;
+            }
+        }
+        applied
+    }
+
+    /// 该号成功出字 → 清掉风控计数，下次再被限从最短档重新开始。
+    fn clear_restrict(&self, uid: &str) {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.restrict_strikes = 0;
+                lease.restricted_until = None;
+                break;
             }
         }
     }
@@ -2540,6 +2570,8 @@ async fn chat_completions(
             }
         };
         if r.status().is_success() {
+            // 出字即视为恢复正常：清掉风控计数，下次再被限从最短档（3h）重新起步。
+            st.pool.clear_restrict(&uid);
             break r;
         }
         let raw_status = r.status();
@@ -2646,6 +2678,9 @@ async fn chat_completions(
             )
                 .into_response();
         }
+        // 本次实际生效的风控冷却时长，声明在分支外供下面的错误文案复用
+        // （递增序列 3h/6h/12h/24h，每次不同）。
+        let mut restricted_cool = Duration::from_secs(0);
         if raw_status.is_client_error() {
             // 🔴 11128 渠道校验**不能冷却账号**。
             //
@@ -2663,12 +2698,13 @@ async fn chat_completions(
             let transient = is_transient_model_error(&text);
             let restricted = is_account_restricted(&text);
             if restricted {
-                // 🔴 风控限制：长冷却 + 不再重试。用 120 秒冷却去等它，
+                // 🔴 风控限制：递增冷却 + 不再重试。用 120 秒冷却去等它，
                 // 等于每两分钟再撞一次 403，既刷屏也可能加重风控评分。
-                st.pool.mark_restricted(&uid);
+                restricted_cool = st.pool.mark_restricted(&uid);
                 eprintln!(
                     "[反代] 账号被上游风控限制（11140 unusual activity），\
-                     已冷却 {RESTRICTED_COOLDOWN:?} 不再选用 (model={model}, uid={uid})"
+                     本次冷却 {} 分钟不再选用 (model={model}, uid={uid})",
+                    restricted_cool.as_secs() / 60
                 );
             } else if blocked {
                 eprintln!(
@@ -2722,13 +2758,12 @@ async fn chat_completions(
                  判定依据：同一个 token 读模型清单仍返回 200（说明登录态有效、账号没被注销），\
                  只有对话接口被拦——这是账号级的使用限制，不是网络、不是参数、也不是频率超限。\n\
                  已把该账号冷却 {cooldown_h} 小时不再自动选用，到期会再试一次。\n\
-                 官方口径：这类限制**停 2~4 小时通常自解**，期间别反复重试（越试风控越紧）。\n\
-                 可做：① 等 2~4 小时；② 用手机热点试一次（若能通过说明是 IP 被限，不是账号）；\
-                 ③ 确认没有多台设备同时挂同一个号；\
-                 ④ 申诉：客户端「设置 → 帮助与反馈」提交工单，或发邮件到 \
-                 workbuddy_ai@tencent.com，标题和正文都写上 Trace ID；\
-                 ⑤ 先改用国内版入口（国内版账号目前正常）。",
-                cooldown_h = RESTRICTED_COOLDOWN.as_secs() / 3600,
+                 实证补充（2026-10-29 本机）：换出口 IP 仍然 403，说明限制绑的是**账号、不是 IP**；\
+                 且已有账号等待 **2 天** 仍未恢复 —— 所以别指望「等几小时就好」。\n\
+                 能做的只有申诉：客户端「设置 → 帮助与反馈」提交工单，或发邮件到 \
+                 workbuddy_ai@tencent.com，**标题和正文都要写上上面的 Trace ID**。\n\
+                 期间建议先用国内版入口（国内版账号目前正常）。",
+                cooldown_h = restricted_cool.as_secs() / 3600,
             )
         } else if is_channel_block(&text) {
             // 两种 11128 变体成因不同，提示也要分开 —— 混在一起用户无从下手：
@@ -3472,6 +3507,34 @@ mod tests {
         assert!(!is_account_restricted(r#"{"code":11133}"#));
         assert!(!is_account_restricted(r#"{"code":401,"msg":"unauthorized"}"#));
         assert!(!is_account_restricted(""));
+    }
+
+    /// 风控冷却必须**递增**且封顶，成功出字后清零重来。
+    ///
+    /// 为什么这条值得测：固定 3 小时的做法已被实测证伪（等 2 天不恢复），
+    /// 若有人把它改回定值，或者递增算错（比如永远 3h），都会让受限账号被反复白撞。
+    #[test]
+    fn restricted_cooldown_escalates_then_caps() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::International)]);
+        let h = |d: Duration| d.as_secs() / 3600;
+
+        assert_eq!(h(pool.mark_restricted("u1")), 3, "第 1 次 3 小时");
+        assert_eq!(h(pool.mark_restricted("u1")), 6, "第 2 次 6 小时");
+        assert_eq!(h(pool.mark_restricted("u1")), 12, "第 3 次 12 小时");
+        assert_eq!(h(pool.mark_restricted("u1")), 24, "第 4 次 24 小时");
+        assert_eq!(h(pool.mark_restricted("u1")), 24, "第 5 次仍是 24 小时（封顶）");
+
+        // 受限期间不选它
+        assert!(pool.next_uid_of(Some(Edition::International), None).is_none());
+
+        // 恢复后清零：再被限从头（3 小时）开始
+        pool.clear_restrict("u1");
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::International), None).as_deref(),
+            Some("u1"),
+            "清零后应重新可选"
+        );
+        assert_eq!(h(pool.mark_restricted("u1")), 3, "清零后回到最短档");
     }
 
     /// 申诉要 Trace ID：上游的 `requestId` 就是它，必须能从失败体里抠出来。
