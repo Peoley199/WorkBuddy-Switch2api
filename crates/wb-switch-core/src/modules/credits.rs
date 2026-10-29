@@ -700,11 +700,12 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
     // `build_auth_headers` 拼出来是 `Bearer `（空）⇒ 网关必然回 401 HTML。
     // 直接给出准确原因，不发这个注定失败的请求。该类账号只能用于切换客户端。
     if is_envelope(account, "access_token") {
+        // 🔴 别写「重新登录即可」：客户端重新登录后依旧写密文，改不了这个结果。
         return json!({
             "ok": false,
             "accountId": account.get("id").cloned().unwrap_or(Value::Null),
             "accountName": account_display_name(account),
-            "error": "该账号凭据为加密存储，仅支持切换账号；查询积分需重新登录",
+            "error": "该账号凭据由客户端加密存储（AES-256-GCM），本工具无法解密，只能原样写回用于切换账号；查询积分需要明文 token，因此不可用。重新登录也无法解决——客户端会再次写入密文。",
         });
     }
 

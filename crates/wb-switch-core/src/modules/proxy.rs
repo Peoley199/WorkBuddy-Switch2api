@@ -85,14 +85,34 @@ const BAN_SUSPECT_COOLDOWN: Duration = Duration::from_secs(3600);
 /// 所以遇到它**先重试**，重试仍失败才当账号故障处理。
 const MAX_CHANNEL_RETRY: usize = 2;
 
-/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒）的最大重试次数。
+/// 模型侧瞬时故障（11133/11134/14003）的重试次数（退避见 [`MODEL_RETRY_BACKOFF_MS`]）。
+///
+/// 🔴 这类码**不是账号的问题**（官方归类「模型侧状态」），重试耗尽也不冷却账号 ——
+/// 冻它只会让下一次请求换到一个同样会撞故障窗口的号。
+const MAX_MODEL_RETRY: usize = 3;
+/// 退避梯度：1s → 3s → 8s（合计 12s）。
+///
+/// 上游同功能用的是 1/3/8s，此处保持一致。反代是同步阻塞客户端的，
+/// 不再拉长：这类故障窗口实测通常几秒内就恢复，拖太久客户端会先超时断开。
+const MODEL_RETRY_BACKOFF_MS: [u64; MAX_MODEL_RETRY] = [1_000, 3_000, 8_000];
+
+/// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒 / TLS 重置）的最大重试次数。
 /// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
 /// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
 /// 国际版只有 3 个号，几下就冻空 ⇒ 客户端收到
 /// `503 国际版的账号当前都不可用（冷却中，或需要重新登录）`，过两分钟又好了，
 /// 然后网络再抖 → 再冻 —— 表现为「一会儿报错停下来、一会儿又能用」反复横跳。
 /// （2026-10-11 与 `refresh.rs` 里 `code=-1` 那个坑同源。）
-const MAX_TRANSPORT_RETRY: usize = 1;
+///
+/// 从 **1 次** 提到 **3 次**（上游 2026-10-26 同改）：反代**走直连、不读系统代理**，
+/// 线路抖动时只有这一条路可走，只重试 1 次容易把瞬时抖动放大成「全线故障」的观感。
+const MAX_TRANSPORT_RETRY: usize = 3;
+
+/// 连接层失败的退避梯度：400ms → 1s → 2s。
+///
+/// 不取更长：这是在**等网络**，不是等上游处理；客户端自己还有外层重试，
+/// 反代这边拖太久只会让用户觉得「卡住了」。
+const TRANSPORT_RETRY_BACKOFF_MS: [u64; MAX_TRANSPORT_RETRY] = [400, 1_000, 2_000];
 
 /// 出站连接超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1750,6 +1770,39 @@ fn has_upstream_code(text: &str, code: &str) -> bool {
 /// 判定成它之后**不要立刻冷却账号** —— 号是好的，冻它只会把整个账号池拖空。
 fn is_channel_block(text: &str) -> bool {
     has_upstream_code(text, "11128") || text.contains("unapproved channel")
+}
+
+/// 上游「模型侧瞬时故障」——官方文档把 `11133` / `11134` / `14003` 都归为
+/// 「多与模型侧状态有关」，处理建议是「新开会话或切换模型重试」。
+///
+/// 🔴 这一类**不是**参数错误：`invalid_request_error`、`param` 字段看着像校验失败，
+/// 但官方归类是模型侧状态，重发即可能成功。
+///
+/// ⇒ 正确处置是**重试**，而不是冷却账号 —— 账号和请求都没问题。
+/// （判据与重试节奏来源：上游 2026-10-26 的逐参数排除实验，见 API-PROXY.md。）
+fn is_transient_model_error(text: &str) -> bool {
+    transient_code(text).is_some()
+}
+
+/// 命中时返回具体是哪个业务码（用于给用户看「是哪个码」）。
+fn transient_code(text: &str) -> Option<&'static str> {
+    ["11133", "11134", "14003"]
+        .into_iter()
+        .find(|code| has_upstream_code(text, code))
+}
+
+/// 从上游失败体里抠出 `requestId`（官方叫 **Trace ID**，申诉时必填）。
+///
+/// 形如 `"requestId":"9d5bc5fd-3e04-4752-8e13-a8d4cf28767e"`。
+/// 官方渠道要求把它写进工单/邮件，否则客服定位不到具体请求。
+/// （取值来源：上游 2026-10-29 的 11140 申诉指引。）
+fn upstream_request_id(text: &str) -> Option<String> {
+    let key = "\"requestId\":\"";
+    let start = text.find(key)? + key.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    let id = &rest[..end];
+    (!id.is_empty() && id.len() <= 64).then(|| id.to_string())
 }
 
 /// 上游「模型不存在 / 该账号无权使用该模型」（`11102`）。
@@ -3840,6 +3893,8 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     // `X-Conversation-ID` 保持会话稳定（与官方桌面端语义一致），只有请求/消息 id 变化。
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
+    // 模型侧瞬时故障（11133/11134/14003）的重试计数，见 MAX_MODEL_RETRY。
+    let mut model_retry = 0usize;
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，把请求体换成
     // 更保守的形态再试一次。默认只做「无损」那一层（见 heal_body_for_channel）。
     let mut self_healed = false;
@@ -3856,15 +3911,16 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
             Ok(r) => r,
             Err(e) => {
                 // 🔴 连接层失败：**不冷却账号**（原因见 MAX_TRANSPORT_RETRY）。
-                // 只重试一次应对瞬时抖动；仍失败就把 502 如实回给客户端，
+                // 退避重试几次应对瞬时抖动；仍失败就回 **502 + 可读原因**，
                 // 由客户端自己决定要不要再发 —— 号本身没坏，别把它冻掉。
                 if transport_retry < MAX_TRANSPORT_RETRY {
+                    let wait = TRANSPORT_RETRY_BACKOFF_MS[transport_retry];
                     transport_retry += 1;
                     eprintln!(
-                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试 \
-                         (model={model}, uid={uid}): {e}"
+                        "[反代] 上游连接失败，第 {transport_retry}/{MAX_TRANSPORT_RETRY} 次重试，\
+                         等待 {wait}ms (model={model}, uid={uid}): {e}"
                     );
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
                     continue;
                 }
                 debug_dump(
@@ -3875,7 +3931,30 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                     ),
                 );
                 record_usage(&meta, None, false);
-                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+                // 🔴 别把裸的 reqwest 原文回给客户端：原文形如
+                // `error sending request for url (https://www.workbuddy.ai/...)`，
+                // 用户看到「workbuddy.ai + 502」第一反应就是「号被封了」（真实发生过）。
+                // 这里明确写清：连不上 ≠ 被拒，账号没坏，怎么处理。
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": {
+                            "message": format!(
+                                "连不上上游（{}），已重试 {transport_retry} 次。\
+                                 这是**网络层**失败：DNS、超时、TLS 重置或线路抖动，\
+                                 不是账号被封、不是鉴权失败、也不是频率超限 —— 账号本身是好的。\
+                                 反代走**直连**（不读系统代理），线路一抖就会落到这里。\
+                                 处理办法：① 稍等几秒重发；② 若长期频繁出现，检查本机到上游的网络。\
+                                 原始错误：{e}",
+                                st.edition.label()
+                            ),
+                            "type": "upstream_unreachable",
+                            "edition": st.edition.label(),
+                            "retries": transport_retry,
+                        }
+                    })),
+                )
+                    .into_response();
             }
         };
         if r.status().is_success() {
@@ -3883,6 +3962,18 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         }
         let raw_status = r.status();
         let text = r.text().await.unwrap_or_default();
+        // 🔴 模型侧瞬时故障（11133/11134/14003）：官方归类「模型侧状态」，
+        // 重发即可能成功。**绝不能冷却账号** —— 见 is_transient_model_error。
+        if is_transient_model_error(&text) && model_retry < MAX_MODEL_RETRY {
+            let wait = MODEL_RETRY_BACKOFF_MS[model_retry];
+            model_retry += 1;
+            eprintln!(
+                "[反代] 上游模型侧瞬时故障，第 {model_retry}/{MAX_MODEL_RETRY} 次重试，\
+                 等待 {wait}ms (model={model}, uid={uid})"
+            );
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            continue;
+        }
         if is_channel_block(&text) {
             // 🔴 先试「自愈」：`unapproved channel` 是**负载**被判成非官方客户端，
             // 换一份更保守的请求往往能直接过（`request illegal` 是客户端身份变体，
@@ -4073,6 +4164,13 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
                 eprintln!(
                     "[反代] 上游无此模型（11102，**不冷却账号**）(model={model}, uid={uid})"
                 );
+            } else if is_transient_model_error(&text) {
+                // 模型侧状态问题：已重试 {MAX_MODEL_RETRY} 次仍失败，号还是好的，
+                // 冻它只会让下一次请求换到一个同样会撞故障窗口的号。
+                eprintln!(
+                    "[反代] 上游模型侧故障（11133/11134/14003）重试 {model_retry} 次仍未恢复，\
+                     **不冷却账号** (model={model}, uid={uid})"
+                );
             } else {
                 st.pool
                     .mark_failed(&uid, &format!("上游返回 {}", raw_status.as_u16()));
@@ -4087,17 +4185,25 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         // 11128 原样透传只会让用户看到一坨双层转义的 JSON，根本不知道该做什么 ——
         // 两种变体成因不同，提示也要分开（见 API-PROXY.md）。
         let message = if matches!(ban, Some(BanKind::Account)) {
+            // 申诉渠道与 Trace ID 指引取自上游 2026-10-29 的 11140 处置文案。
+            let trace = upstream_request_id(&text)
+                .map(|id| format!("\nTrace ID：{id}   ← 申诉时务必附上，客服靠它定位具体请求"))
+                .unwrap_or_default();
             format!(
                 "账号「{account_name}」已被上游限制使用（403/11140: unusual activity）。\
-                 已自动从号池摘除，不会再向上游发请求；请重新登录或提交申诉恢复后再导入。"
+                 已自动从号池摘除，不会再向上游发请求；请重新登录或提交申诉恢复后再导入。{trace}\n\
+                 申诉渠道：客户端「设置 → 帮助与反馈」提交工单，或发邮件到 workbuddy_ai@tencent.com。"
             )
         } else if matches!(ban, Some(BanKind::Content)) {
             "上游内容安全审核拒绝了这条请求（403/11140）。这与账号本身无关，\
              调整内容后重试即可。"
                 .to_string()
         } else if matches!(ban, Some(BanKind::Unknown)) {
+            let trace = upstream_request_id(&text)
+                .map(|id| format!("\nTrace ID：{id}"))
+                .unwrap_or_default();
             format!(
-                "账号「{account_name}」收到上游 11140 限制（原因未能识别），已临时停用 {} 分钟。\
+                "账号「{account_name}」收到上游 11140 限制（原因未能识别），已临时停用 {} 分钟。{trace}\n\
                  请创建 ~/.wb-switch/DEBUG_DUMP 后复现一次，把 dump/last-failure.txt 留存以便定位。",
                 BAN_SUSPECT_COOLDOWN.as_secs() / 60
             )
@@ -4106,6 +4212,15 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         } else if model_missing {
             format!(
                 "上游没有模型 `{model}`，或当前账号无权使用该模型（11102）。这不影响账号本身，换一个模型即可。"
+            )
+        } else if is_transient_model_error(&text) {
+            // 官方文档对 11133/11134/14003 的处置建议就是「新开会话或切换模型重试」。
+            // 我们已经退避重试过，仍未恢复。
+            let code_label = transient_code(&text).unwrap_or("11133");
+            format!(
+                "上游模型侧暂时异常（code {code_label}），已自动退避重试 {model_retry} 次仍未恢复。\
+                 这不是你的参数写错，也不是账号失效 —— 官方把这类码归为「模型侧状态」。\
+                 建议：① 换个模型再发（最有效）；② 新开一个会话；③ 稍等十几秒重试。"
             )
         } else if raw_status.as_u16() == 429 {
             // 429 但解析不出重置时刻：别把原始 JSON 糊给客户端。
@@ -7523,6 +7638,56 @@ mod tests {
             Some(32),
             "无会话时用现生成的 32 位 hex"
         );
+    }
+
+    /// 11133 / 11134 / 14003 属于「模型侧瞬时故障」，靠重试解决，不是账号问题。
+    #[test]
+    fn transient_model_errors_are_recognized() {
+        let real = r#"{"code":11133,"msg":"the request parameters were rejected by the model provider","extError":{"code":"1210"}}"#;
+        assert!(is_transient_model_error(real));
+        assert_eq!(transient_code(real), Some("11133"));
+        assert!(is_transient_model_error(r#"{"code":11134}"#));
+        assert!(is_transient_model_error(r#"{"code":14003}"#));
+        // 别的码不能落进这一类
+        assert!(!is_transient_model_error(r#"{"code":11128,"msg":"request illegal"}"#));
+        assert!(!is_transient_model_error(r#"{"code":60004,"msg":"频率限制"}"#));
+        assert!(!is_transient_model_error(r#"{"code":11102}"#));
+        assert_eq!(transient_code(r#"{"code":11102}"#), None);
+    }
+
+    /// 🔴 出站头必须同时带齐三个会话 ID。
+    ///
+    /// 国际版渠道校验只查**存在性**：缺 `X-Conversation-ID` 时，同一个号、同一套
+    /// 其余头、同一个 payload 会被稳定判成 `11128 request illegal`（上游
+    /// 2026-10-26 的对照实验）。这条测试防止将来「精简头族」时又把它删掉 ——
+    /// 这个缺失曾让国际版整整 9 天全线不可用。
+    #[test]
+    fn chat_headers_carry_all_three_conversation_ids() {
+        let h = chat_headers(&test_account(), None);
+        for key in [
+            "X-Conversation-ID",
+            "X-Conversation-Request-ID",
+            "X-Conversation-Message-ID",
+        ] {
+            let v = h.get(key).unwrap_or_else(|| panic!("{key} 必须存在"));
+            assert!(!v.is_empty(), "{key} 不能为空");
+        }
+    }
+
+    /// 申诉要 Trace ID：上游的 `requestId` 就是它，必须能从失败体里抠出来。
+    #[test]
+    fn extracts_upstream_trace_id_for_appeal() {
+        let real = r#"{"code":11140,"msg":"request illegal","requestId":"9d5bc5fd-3e04-4752-8e13-a8d4cf28767e","displayMsg":{"en":"..."}}"#;
+        assert_eq!(
+            upstream_request_id(real).as_deref(),
+            Some("9d5bc5fd-3e04-4752-8e13-a8d4cf28767e"),
+            "必须原样取出 requestId（Trace ID）"
+        );
+        // 没有该字段 / 空体 → None，不能 panic
+        assert_eq!(upstream_request_id(r#"{"code":11128}"#), None);
+        assert_eq!(upstream_request_id(""), None);
+        // 值为空串也不算有效
+        assert_eq!(upstream_request_id(r#"{"requestId":""}"#), None);
     }
 
     /// 11140 双语义必须靠 displayMsg 区分（调研报告 §2）：
