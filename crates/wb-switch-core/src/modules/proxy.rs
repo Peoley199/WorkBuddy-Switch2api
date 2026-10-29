@@ -1791,6 +1791,20 @@ fn transient_code(text: &str) -> Option<&'static str> {
         .find(|code| has_upstream_code(text, code))
 }
 
+/// 从上游失败体里抠出 `requestId`（官方叫 **Trace ID**，申诉时必填）。
+///
+/// 形如 `"requestId":"9d5bc5fd-3e04-4752-8e13-a8d4cf28767e"`。
+/// 官方渠道要求把它写进工单/邮件，否则客服定位不到具体请求。
+/// （取值来源：上游 2026-10-29 的 11140 申诉指引。）
+fn upstream_request_id(text: &str) -> Option<String> {
+    let key = "\"requestId\":\"";
+    let start = text.find(key)? + key.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    let id = &rest[..end];
+    (!id.is_empty() && id.len() <= 64).then(|| id.to_string())
+}
+
 /// 上游「模型不存在 / 该账号无权使用该模型」（`11102`）。
 ///
 /// 实测语义：请求**已通过渠道校验**，只是 model 解析不到（`service info not found`）
@@ -4171,17 +4185,25 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         // 11128 原样透传只会让用户看到一坨双层转义的 JSON，根本不知道该做什么 ——
         // 两种变体成因不同，提示也要分开（见 API-PROXY.md）。
         let message = if matches!(ban, Some(BanKind::Account)) {
+            // 申诉渠道与 Trace ID 指引取自上游 2026-10-29 的 11140 处置文案。
+            let trace = upstream_request_id(&text)
+                .map(|id| format!("\nTrace ID：{id}   ← 申诉时务必附上，客服靠它定位具体请求"))
+                .unwrap_or_default();
             format!(
                 "账号「{account_name}」已被上游限制使用（403/11140: unusual activity）。\
-                 已自动从号池摘除，不会再向上游发请求；请重新登录或提交申诉恢复后再导入。"
+                 已自动从号池摘除，不会再向上游发请求；请重新登录或提交申诉恢复后再导入。{trace}\n\
+                 申诉渠道：客户端「设置 → 帮助与反馈」提交工单，或发邮件到 workbuddy_ai@tencent.com。"
             )
         } else if matches!(ban, Some(BanKind::Content)) {
             "上游内容安全审核拒绝了这条请求（403/11140）。这与账号本身无关，\
              调整内容后重试即可。"
                 .to_string()
         } else if matches!(ban, Some(BanKind::Unknown)) {
+            let trace = upstream_request_id(&text)
+                .map(|id| format!("\nTrace ID：{id}"))
+                .unwrap_or_default();
             format!(
-                "账号「{account_name}」收到上游 11140 限制（原因未能识别），已临时停用 {} 分钟。\
+                "账号「{account_name}」收到上游 11140 限制（原因未能识别），已临时停用 {} 分钟。{trace}\n\
                  请创建 ~/.wb-switch/DEBUG_DUMP 后复现一次，把 dump/last-failure.txt 留存以便定位。",
                 BAN_SUSPECT_COOLDOWN.as_secs() / 60
             )
@@ -7650,6 +7672,22 @@ mod tests {
             let v = h.get(key).unwrap_or_else(|| panic!("{key} 必须存在"));
             assert!(!v.is_empty(), "{key} 不能为空");
         }
+    }
+
+    /// 申诉要 Trace ID：上游的 `requestId` 就是它，必须能从失败体里抠出来。
+    #[test]
+    fn extracts_upstream_trace_id_for_appeal() {
+        let real = r#"{"code":11140,"msg":"request illegal","requestId":"9d5bc5fd-3e04-4752-8e13-a8d4cf28767e","displayMsg":{"en":"..."}}"#;
+        assert_eq!(
+            upstream_request_id(real).as_deref(),
+            Some("9d5bc5fd-3e04-4752-8e13-a8d4cf28767e"),
+            "必须原样取出 requestId（Trace ID）"
+        );
+        // 没有该字段 / 空体 → None，不能 panic
+        assert_eq!(upstream_request_id(r#"{"code":11128}"#), None);
+        assert_eq!(upstream_request_id(""), None);
+        // 值为空串也不算有效
+        assert_eq!(upstream_request_id(r#"{"requestId":""}"#), None);
     }
 
     /// 11140 双语义必须靠 displayMsg 区分（调研报告 §2）：
