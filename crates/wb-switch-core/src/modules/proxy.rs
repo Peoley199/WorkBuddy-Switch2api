@@ -42,15 +42,16 @@ const REFRESH_MARGIN_MS: i64 = 2 * 60 * 60 * 1000;
 /// 单账号失败后的冷却时间。
 const COOLDOWN: Duration = Duration::from_secs(120);
 
-/// 账号被上游**风控限制**（`11140`）后的冷却时长：6 小时。
+/// 账号被上游**风控限制**（`11140`）后的冷却时长：3 小时。
 ///
-/// 取 6 小时的理由：
-/// - 这类限制是「账号级 + 长时」，不是抖动。用 120 秒冷却去等它，等于每两分钟
-///   再撞一次 403 —— 既刷屏，也可能让风控评分继续恶化。
-/// - 但又不能永久拉黑：实测文案是 `restricted due to unusual activity`，
-///   属于**可自愈**的临时限制（不像 401 那样必须重登）。6 小时是一个折中，
-///   到期自动回到池子里重试；若仍被限，会被再次标记，不会无限重试。
-const RESTRICTED_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+/// 为什么是 3 小时：
+/// - 腾讯云开发者社区对 11140 的官方口径是「**停 2~4 小时再试**，如果是内容安全
+///   触发的临时限制，等一会儿通常自解；期间别反复重试，越试风控越紧」
+///   （`cloud.tencent.com/developer/ask/2212682`）。
+/// - 所以既不能用 120 秒（等于每两分钟再撞一次 403，反把风控评分养坏），
+///   也不需要 6 小时（比「2~4 小时」还长，白白多损失可用时间）。
+/// - 取 3 小时落在社区的恢复窗口内：到期自动回池；若仍被限会被再次标记，不会无限重试。
+const RESTRICTED_COOLDOWN: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// 上游「渠道校验」（`11128`）的最大重试次数。
 ///
@@ -1106,6 +1107,19 @@ fn transient_code(text: &str) -> Option<&'static str> {
     ["11133", "11134", "14003"]
         .into_iter()
         .find(|code| has_upstream_code(text, code))
+}
+
+/// 从上游失败体里抠出 `requestId`（官方叫 **Trace ID**，申诉时必填）。
+///
+/// 形如 `"requestId":"9d5bc5fd-3e04-4752-8e13-a8d4cf28767e"`。
+/// 官方渠道明确要求把它写进工单/邮件标题，否则客服定位不到具体请求。
+fn upstream_request_id(text: &str) -> Option<String> {
+    let key = "\"requestId\":\"";
+    let start = text.find(key)? + key.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    let id = &rest[..end];
+    (!id.is_empty() && id.len() <= 64).then(|| id.to_string())
 }
 
 /// 上游是否把该账号判成**风控限制**（`11140`）。
@@ -2697,16 +2711,23 @@ async fn chat_completions(
             )
         } else if is_account_restricted(&text) {
             // 结论要说得直白：这是账号被限制，不是我们发得不对，重发也没用。
+            // 恢复窗口与申诉渠道取自腾讯云开发者社区对 11140 的官方口径。
+            let trace = upstream_request_id(&text)
+                .map(|id| format!("\nTrace ID：{id}   ← 申诉时务必附上，客服靠它定位具体请求"))
+                .unwrap_or_default();
             format!(
                 "账号「{account_name}」被{edition_label}上游**风控限制**了\
                  （HTTP 403 / code 11140，上游原文：Your account has been restricted \
-                 due to unusual activity）。\n\
+                 due to unusual activity）。{trace}\n\
                  判定依据：同一个 token 读模型清单仍返回 200（说明登录态有效、账号没被注销），\
                  只有对话接口被拦——这是账号级的使用限制，不是网络、不是参数、也不是频率超限。\n\
-                 已把该账号冷却 {cooldown_h} 小时不再自动选用；到期会自动重试。\n\
-                 建议：① 别反复重发，重发只会延长限制；② 到官方客户端里确认是否同样被拦；\
-                 ③ 通过「帮助与反馈」或 workbuddy_ai@tencent.com 申诉；\
-                 ④ 暂时改用国内版入口（国内版账号目前正常）。",
+                 已把该账号冷却 {cooldown_h} 小时不再自动选用，到期会再试一次。\n\
+                 官方口径：这类限制**停 2~4 小时通常自解**，期间别反复重试（越试风控越紧）。\n\
+                 可做：① 等 2~4 小时；② 用手机热点试一次（若能通过说明是 IP 被限，不是账号）；\
+                 ③ 确认没有多台设备同时挂同一个号；\
+                 ④ 申诉：客户端「设置 → 帮助与反馈」提交工单，或发邮件到 \
+                 workbuddy_ai@tencent.com，标题和正文都写上 Trace ID；\
+                 ⑤ 先改用国内版入口（国内版账号目前正常）。",
                 cooldown_h = RESTRICTED_COOLDOWN.as_secs() / 3600,
             )
         } else if is_channel_block(&text) {
@@ -3451,6 +3472,22 @@ mod tests {
         assert!(!is_account_restricted(r#"{"code":11133}"#));
         assert!(!is_account_restricted(r#"{"code":401,"msg":"unauthorized"}"#));
         assert!(!is_account_restricted(""));
+    }
+
+    /// 申诉要 Trace ID：上游的 `requestId` 就是它，必须能从失败体里抠出来。
+    #[test]
+    fn extracts_upstream_trace_id_for_appeal() {
+        let real = r#"{"code":11140,"msg":"request illegal","requestId":"9d5bc5fd-3e04-4752-8e13-a8d4cf28767e","displayMsg":{"en":"..."}}"#;
+        assert_eq!(
+            upstream_request_id(real).as_deref(),
+            Some("9d5bc5fd-3e04-4752-8e13-a8d4cf28767e"),
+            "必须原样取出 requestId（Trace ID）"
+        );
+        // 没有该字段 / 空体 → None，不能 panic
+        assert_eq!(upstream_request_id(r#"{"code":11128}"#), None);
+        assert_eq!(upstream_request_id(""), None);
+        // 值为空串也不算有效
+        assert_eq!(upstream_request_id(r#"{"requestId":""}"#), None);
     }
 
     #[test]
