@@ -45,8 +45,10 @@ die() { printf '\033[31m✗ %s\033[0m\n' "$*"; exit 1; }
 if [ "$MODE" = verify ]; then
   say "收尾验证"
 
-  if [ -n "$(git status --porcelain)" ]; then
-    die "工作区不干净 —— 先把移植改动全部落库再验证（未提交的改动不会被测试覆盖到基线对比里）"
+  # 只拦**已跟踪**文件的改动；未跟踪文件（本机调研资料等）不影响测试口径
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    git status --short --untracked-files=no
+    die "工作区有未提交改动 —— 先把移植改动全部落库再验证（未提交的改动不会被测试覆盖到基线对比里）"
   fi
 
   LEDGER=docs/UPSTREAM-SYNC.md
