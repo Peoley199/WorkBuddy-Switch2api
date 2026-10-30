@@ -134,8 +134,21 @@
 
 ## 同步流程（下次照此办理）
 
-1. `git fetch upstream && git log upstream/main --not main` 看差异
-2. 逐个提交判断：原样移植 / 移植+修正 / 刻意不同步，理由写进本文件
-3. 代码改动放 `sync/upstream-<版本>` 分支，提交说明带上游 sha（`Upstream: …@<sha>`）
-4. `cargo test -p wb-switch-core` 全绿、`cargo clippy -D warnings` 零警告后合并
-5. 冲突时**永远人工判断**，不要整文件取某一侧——上游不知道本仓库的独有功能
+> 📘 详细的做法、判断标准与踩坑实录见 [经验-上游同步与本地部署.md](经验-上游同步与本地部署.md)。
+> 下面是可以直接照抄的步骤和脚本用法。
+
+0. 本地有未提交改动 → **先落库**（否则同步 diff 会互相污染）
+1. `sh scripts/upstream-sync.sh` —— 自动完成：拉取（断网会降级并警告）、逐提交导出差异到
+   `/tmp/wb-upstream/`、风险扫描（上游误删 `#[test]`、保护清单文件被改、独有功能锚点被触碰）、
+   生成决策表、备份分支 + bundle、开 `sync/upstream-<sha>` 分支并跑基线测试
+2. 看 `/tmp/wb-upstream/SUMMARY.md` 与各 `<sha>.diff`，逐个提交判断：
+   原样移植 / 移植+修正 / 文档采纳 / 刻意不同步，理由写进本文件
+3. 代码改动提交说明带上游 sha（`Upstream: …@<sha>`）
+4. `sh scripts/upstream-sync.sh --verify` —— 测试全绿、clippy **增量**零新增、账本已更新
+5. 合并：`git merge --no-ff sync/upstream-<sha>`，再 `git merge -s ours upstream/main` 记账
+   （只动历史，让 `git log upstream/main --not main` 与 GitHub 的「落后 N 个提交」一起归零）
+6. 版本号用 `node scripts/version.mjs set <ver>`，**不要**手写 sed（会漏 npm optionalDependencies）
+7. `git push origin main`，用 GitHub API 确认 `behind_by: 0`
+8. 需要部署：`sh scripts/deploy-local.sh`（四道防线，探活失败自动回滚）
+
+**冲突时永远人工判断**，不要整文件取某一侧——上游不知道本仓库的独有功能。
