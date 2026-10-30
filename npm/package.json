@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-switch2api",
-  "version": "1.6.27",
+  "version": "1.6.28",
   "description": "WorkBuddy 账号切换工具：本地 webui（浏览器操作）+ 桌面 App（安装后运行 workbuddy-switch 命令）",
   "bin": {
     "workbuddy-switch": "bin/workbuddy-switch.js"
