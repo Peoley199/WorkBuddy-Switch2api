@@ -98,11 +98,13 @@ if [ "$MODE" = verify ]; then
   fi
 
   say "结论：可以合并"
+  SYNC_BR=$(git rev-parse --abbrev-ref HEAD)
   cat <<EOF
   git checkout main
-  git merge --no-ff $(git rev-parse --abbrev-ref HEAD)
-  # 再用 `-s ours` 记账，让 `git log upstream/main --not main` 归零：
+  git merge --no-ff $SYNC_BR
+  # 再用 '-s ours' 记账，让 'git log upstream/main --not main' 归零：
   git merge -s ours upstream/main -m "merge(-s ours)：标记上游 <sha> 已同步（内容已按 docs/UPSTREAM-SYNC.md 手工移植）"
+  git push origin main
 EOF
   exit 0
 fi
