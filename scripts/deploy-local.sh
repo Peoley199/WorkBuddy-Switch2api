@@ -60,8 +60,12 @@ probe_all() {
     [ -z "$listen" ] && continue
     local port=${listen##*:}
     local code
+    # ⚠️ 不要写成 `curl ... || echo 000`：curl 失败时自己也会打印 000，
+    # 两者拼接会得到 "000000"。用子串截断保住 3 位。
     code=$(curl -s -m 6 -o /dev/null -w "%{http_code}" \
-      -H "Authorization: Bearer $key" "http://127.0.0.1:$port/v1/models" 2>/dev/null || echo 000)
+      -H "Authorization: Bearer $key" "http://127.0.0.1:$port/v1/models" 2>/dev/null) || code="000"
+    [ -z "$code" ] && code="000"
+    code=$(printf '%.3s' "$code")
     printf '%s\t%s\t%s\n' "$ed" "$listen" "$code"
   done <<< "$rows"
 }
@@ -103,6 +107,23 @@ fi
 
 [ -f "$BUILT" ] || die "找不到构建产物：$BUILT"
 ok "产物：$BUILT（$(stat -c %s "$BUILT") 字节，$(date -r "$BUILT" '+%Y-%m-%d %H:%M')）"
+
+# 🔴 部署前先验证「产物本身能不能启动」，把坏件挡在部署目录之外。
+# 教训（2026-10-30 实测）：截断/损坏的 exe 一旦装进部署目录，下次部署的
+# 「备份旧版」备份的就是坏件，回滚只能回到坏件 —— 备份链会被永久污染。
+#
+# 判据用「PE 头完整 + 能被系统加载」：
+#   1. 文件头必须是 MZ（DOS stub），这是 PE 的硬性标志，截断/损坏最先丢的就是这个判据之外的东西；
+#   2. 真跑一次 —— 坏 PE 会得到 "Exec format error"，好 PE 至少能走到单实例检测。
+PE_SIG=$(head -c 2 "$BUILT" 2>/dev/null || true)
+[ "$PE_SIG" = "MZ" ] || die "产物不是有效的 Windows 可执行文件（文件头不是 MZ），不会部署"
+
+SMOKE_OUT=$(timeout 25 "$BUILT" --version 2>&1 || true)
+if echo "$SMOKE_OUT" | grep -qiE "exec format error|not a valid|无法执行|不是有效的"; then
+  echo "$SMOKE_OUT"
+  die "产物无法运行（冒烟测试失败），不会部署。重新构建：cargo build --release -p wb-switch-rust"
+fi
+ok "产物冒烟测试通过（PE 头有效、可被系统加载）"
 
 # ---------------------------------------------------------------- 3. 定位 + 部署前探活
 
@@ -178,50 +199,79 @@ if [ -n "$RUN_PIDS" ]; then
 fi
 
 cp "$BUILT" "$TARGET" || die "覆盖失败"
-A=$(md5sum "$BUILT" | cut -d' ' -f1)
-B=$(md5sum "$TARGET" | cut -d' ' -f1)
-[ "$A" = "$B" ] && ok "替换完成，MD5 一致：$A" || die "MD5 不一致，替换可能被拦截"
+
+# Windows 上「刚结束的进程 + 杀软扫描」会让目标文件在被写出后短暂不可读/读不全，
+# 立刻算 MD5 偶发对不上。重试几秒再判，避免把正常的替换误报成失败。
+hash_of() {
+  # 只取 32 位十六进制：绕过 md5sum 的 ' *' 前缀与可能的 CRLF 混入
+  md5sum "$1" 2>/dev/null | grep -oE '^[0-9a-f]{32}'
+}
+A=$(hash_of "$BUILT")
+B=""
+for i in 1 2 3 4 5; do
+  B=$(hash_of "$TARGET")
+  [ -n "$B" ] && [ "$A" = "$B" ] && break
+  sleep 1
+done
+if [ "$A" = "$B" ] && [ -n "$A" ]; then
+  ok "替换完成，MD5 一致：$A"
+else
+  die "MD5 不一致（构建产物 $A / 部署目标 ${B:-<读不到>}），替换可能被拦截或被占用"
+fi
 
 # ---------------------------------------------------------------- 6. 重启
 
 say "6/7 重启"
+START_OK=1
+REGRESSED=""
+AFTER=""
 powershell -NoProfile -Command \
-  "Start-Process -FilePath '$TARGET' -WorkingDirectory '$DEPLOY_DIR'" \
-  || die "启动失败"
+  "Start-Process -FilePath '$TARGET' -WorkingDirectory '$DEPLOY_DIR'" >/dev/null 2>&1 || START_OK=0
 sleep 8
 
-NEW_PIDS=$(pids_of | tr '\n' ' ')
-[ -n "$NEW_PIDS" ] && ok "已启动，PID：$NEW_PIDS" || die "进程未起来"
+NEW_PIDS=""
+if [ "$START_OK" = 1 ]; then
+  NEW_PIDS=$(pids_of | tr '\n' ' ')
+fi
 
-# ---------------------------------------------------------------- 7. 探活 + 回滚
-
-say "7/7 探活"
-
-AFTER=$(probe_all || true)
-REGRESSED=""
-if [ -n "$BASELINE" ] && [ -n "$AFTER" ]; then
-  while IFS=$'\t' read -r ed listen code; do
-    [ -z "$ed" ] && continue
-    if [ "$code" = "200" ]; then
-      new_code=$(echo "$AFTER" | awk -F'\t' -v e="$ed" '$1==e {print $3}' | head -1)
-      if [ "$new_code" = "200" ]; then
-        printf '  %-14s %-22s → HTTP %s ✓\n' "$ed" "$listen" "$new_code"
-      else
-        printf '  %-14s %-22s → HTTP %s ✗（部署前是 200）\n' "$ed" "$listen" "$new_code"
-        REGRESSED="$REGRESSED\n  - $ed ($listen) 部署前 200，部署后 $new_code"
-      fi
-    fi
-  done <<< "$BASELINE"
-  # 部署前本就不通的入口：只提示，不算失败
-  while IFS=$'\t' read -r ed listen code; do
-    [ -z "$ed" ] && continue
-    if [ "$code" != "200" ]; then
-      new_code=$(echo "$AFTER" | awk -F'\t' -v e="$ed" '$1==e {print $3}' | head -1)
-      printf '  %-14s %-22s → HTTP %s（部署前也不是 200，非本次回归）\n' "$ed" "$listen" "$new_code"
-    fi
-  done <<< "$BASELINE"
+# 🔴 启动失败不能直接 die —— 那样坏 exe 会留在部署目录、服务停摆，比不部署更糟。
+# 统一走下面的「失败 → 回滚」出口。
+if [ "$START_OK" != 1 ] || [ -z "$NEW_PIDS" ]; then
+  REGRESSED="\n  - 新版本无法启动（进程没起来）"
+  say "7/7 跳过硬探活（进程未启动）"
 else
-  warn "无探活数据（配置缺失），只确认进程存活"
+  ok "已启动，PID：$NEW_PIDS"
+  say "7/7 探活"
+  AFTER=$(probe_all || true)
+fi
+if [ -n "$AFTER" ]; then
+  while IFS=$'\t' read -r ed listen code; do
+    [ -z "$ed" ] && continue
+    before=$(echo "$BASELINE" | awk -F'\t' -v e="$ed" '$1==e {print $3}' | head -1)
+    before=${before:-"（未测）"}
+    if [ "$code" = "200" ]; then
+      printf '  %-14s %-22s → HTTP 200 ✓\n' "$ed" "$listen"
+      # 顺带报喜：部署前不通、部署后通了
+      if [ "$before" != "200" ]; then
+        printf '                  （部署前是 %s，本次已恢复）\n' "$before"
+      fi
+    elif [ "$before" = "200" ]; then
+      printf '  %-14s %-22s → HTTP %s ✗（部署前是 200，本次回归）\n' "$ed" "$listen" "$code"
+      REGRESSED="$REGRESSED\n  - $ed ($listen) 部署前 200 → 部署后 $code"
+    else
+      printf '  %-14s %-22s → HTTP %s（部署前也不是 200，非本次回归）\n' "$ed" "$listen" "$code"
+    fi
+  done <<< "$AFTER"
+fi
+
+# 🔴 额外硬闸：进程刚起来却连不上**任何**已启用入口，基本等于起坏了 ——
+# 即使部署前本来就是坏的（基线全 000），也不能把一次「启动了但不可用」当成成功。
+if [ -n "$AFTER" ]; then
+  ANY_OK=$(echo "$AFTER" | awk -F'\t' '$3=="200"' | head -1)
+  ENABLED_N=$(echo "$AFTER" | grep -c . || true)
+  if [ -z "$ANY_OK" ] && [ "${ENABLED_N:-0}" -gt 0 ]; then
+    REGRESSED="$REGRESSED\n  - 所有 $ENABLED_N 个已启用入口都不可用（进程起来了但服务没通）"
+  fi
 fi
 
 if [ -z "$REGRESSED" ]; then
@@ -236,10 +286,37 @@ printf "%b\n" "$REGRESSED"
 if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
   taskkill //IM "$APP_EXE" //F >/dev/null 2>&1 || true
   sleep 2
-  cp "$BACKUP" "$TARGET" && ok "已回滚到 $(basename "$BACKUP")"
+  cp "$BACKUP" "$TARGET" && ok "已恢复备份文件：$(basename "$BACKUP")"
   powershell -NoProfile -Command "Start-Process -FilePath '$TARGET' -WorkingDirectory '$DEPLOY_DIR'" >/dev/null 2>&1 || true
-  echo "  下次排查：优先看 $DEPLOY_DIR\\stderr.log，或前台运行看启动输出"
+  sleep 8
+
+  # 🔴 回滚也必须验证：备份本身可能就是个坏件（例如上一次部署失败后，坏的 exe
+  # 留在了部署目录，这一次的「备份旧版」备份的就是它）。不验证就宣布「已回滚」
+  # 等于给用户一个更坏的状态：服务停了，且以为已经恢复。
+  RB_PIDS=$(pids_of | tr '\n' ' ')
+  RB_AFTER=$(probe_all || true)
+  RB_OK=0
+  if [ -n "$RB_PIDS" ]; then
+    if [ -z "$RB_AFTER" ]; then
+      RB_OK=1   # 无探活配置时，进程起来即视为回滚成功
+    elif echo "$RB_AFTER" | awk -F'\t' '$3=="200"' | grep -q .; then
+      RB_OK=1
+    fi
+  fi
+
+  if [ "$RB_OK" = 1 ]; then
+    ok "回滚成功，服务已恢复（PID：$RB_PIDS）"
+    echo "  ⚠️ 新版本未能通过验证，已退回上一版本。排查：$DEPLOY_DIR\\stderr.log"
+  else
+    printf '\033[31m✗ 回滚后服务仍未起来 —— 备份件本身可能就是坏的\033[0m\n'
+    echo "    备份：$BACKUP"
+    echo "    请手工选择一份可用的历史备份覆盖 $TARGET："
+    ls -1 "$DEPLOY_DIR"/"$APP_EXE".bak-* 2>/dev/null | while read -r f; do
+      echo "      $(basename "$f")  ($(stat -c %s "$f") 字节, $(date -r "$f" '+%m-%d %H:%M'))"
+    done
+    echo "    线索：5000000 字节这种明显偏小的文件是截断件，别用。"
+  fi
 else
-  warn "没有可回滚的备份"
+  warn "没有可回滚的备份 —— 部署目录当前是新版本，需手工处理"
 fi
-die "部署未通过探活"
+die "部署未通过验证（见上）"
