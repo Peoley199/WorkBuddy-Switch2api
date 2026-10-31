@@ -192,6 +192,14 @@ if [ -f "$TARGET" ]; then
 fi
 
 if [ -n "$RUN_PIDS" ]; then
+  # 🔴 兜底：从这里往下，脚本任何一步意外退出都可能留下「服务停着」的状态
+  # （2026-11-01 实测：哈希校验里一个命令返回非零 + `set -e`，脚本在停服后静默退出，
+  #  服务一直是停的，而人以为已经部署完）。EXIT 时若发现没有实例在跑就拉起来。
+  trap 'if [ -z "$(pids_of)" ] && [ -f "$TARGET" ]; then
+          echo; printf "[33m⚠️  脚本异常退出，正在拉起 $TARGET[0m
+"
+          powershell -NoProfile -Command "Start-Process -FilePath @\"$TARGET\" -WorkingDirectory @\"$DEPLOY_DIR\"" >/dev/null 2>&1 || true
+        fi' EXIT
   taskkill //IM "$APP_EXE" //F >/dev/null 2>&1 || true
   sleep 2
   [ -z "$(pids_of)" ] || die "进程仍在运行，无法覆盖（请手工关闭后重试）"
@@ -203,14 +211,21 @@ cp "$BUILT" "$TARGET" || die "覆盖失败"
 # Windows 上「刚结束的进程 + 杀软扫描」会让目标文件在被写出后短暂不可读/读不全，
 # 立刻算 MD5 偶发对不上。重试几秒再判，避免把正常的替换误报成失败。
 hash_of() {
-  # 只取 32 位十六进制：绕过 md5sum 的 ' *' 前缀与可能的 CRLF 混入
-  md5sum "$1" 2>/dev/null | grep -oE '^[0-9a-f]{32}'
+  # 只取 32 位十六进制：绕过 md5sum 的 ' *' 前缀与可能的 CRLF 混入。
+  # ⚠️ 末尾的 `|| true`：读不到时 grep 返回 1，配合 `set -e` 会**静默杀掉整个脚本**
+  # （2026-11-01 实测：文件被短暂占用 → 脚本在停掉服务之后直接退出，服务一直没起来）。
+  md5sum "$1" 2>/dev/null | grep -oE '^[0-9a-f]{32}' || true
 }
 A=$(hash_of "$BUILT")
 B=""
-for i in 1 2 3 4 5; do
+# 最多等 15 秒：本机实测「刚写完 23MB exe」时杀软会锁住目标文件好几秒，
+# 5 次（5 秒）不够，会把正常替换误判成失败并触发回滚。
+for i in $(seq 1 15); do
   B=$(hash_of "$TARGET")
-  [ -n "$B" ] && [ "$A" = "$B" ] && break
+  # ⚠️ 不能写成 `[ ] && [ ] && break`：条件为假时返回非零，set -e 会直接退出。
+  if [ -n "$B" ] && [ "$A" = "$B" ]; then
+    break
+  fi
   sleep 1
 done
 if [ "$A" = "$B" ] && [ -n "$A" ]; then
@@ -275,6 +290,7 @@ if [ -n "$AFTER" ]; then
 fi
 
 if [ -z "$REGRESSED" ]; then
+  trap - EXIT
   say "部署完成"
   echo "  回滚方法：taskkill //IM $APP_EXE //F && cp \"$BACKUP\" \"$TARGET\" && 重启"
   exit 0
