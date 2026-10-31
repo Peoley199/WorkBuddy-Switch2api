@@ -118,13 +118,18 @@ git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 \
 # 但必须显式警告 —— 基于陈旧引用做出的「已同步」结论可能是错的。
 # 15 秒硬超时：GitHub 连不通时 curl 的 connectTimeout 不一定生效，这里用 timeout 兜底，
 # 断网时不该让同步流程卡半分钟。
-if ! FETCH_OUT=$(timeout 15 git fetch "$UPSTREAM_REMOTE" --tags 2>&1); then
+#
+# ⚠️ 不带 `--tags`：两仓库的版本号各自独立，tag 名**必然撞车**
+# （实测 2026-11-01：本地 v1.6.27 → 94adf40，上游 v1.6.27 → 170cac2，
+#  `--tags` 每次都因 "would clobber existing tag" 返回非零，把成功的一轮
+#  误报成「拉取失败」）。同步只需要分支引用，tag 用不到。
+if ! FETCH_OUT=$(timeout 15 git fetch --no-tags "$UPSTREAM_REMOTE" 2>&1); then
   UPDATED_AT=$(git log -1 --format=%cd --date=iso "$UPSTREAM_REMOTE/main" 2>/dev/null || echo "?")
   warn "拉取上游失败，改用本地已有的 $UPSTREAM_REMOTE/main（最后更新 $UPDATED_AT）"
   echo "     $(echo "$FETCH_OUT" | tail -1)"
   warn "结论可能不是最新；网络恢复后重跑本脚本再决定是否合并"
 else
-  echo "$FETCH_OUT" | tail -2
+  echo "$FETCH_OUT" | tail -3
 fi
 
 UP="$UPSTREAM_REMOTE/main"
@@ -295,8 +300,8 @@ if [ "$MODE" = nobranch ]; then
   say "已按 --no-branch 跳过建分支"
 else
   say "6/6 开同步分支 + 基线验证"
-  if [ -n "$(git status --porcelain)" ]; then
-    warn "工作区不干净 —— 先把未提交改动落库再同步（否则 diff 会互相污染）"
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    warn "工作区有未提交改动 —— 先把它们落库再同步（否则 diff 会互相污染）"
   fi
   SYNC_BRANCH="sync/upstream-$LAST"
   if git show-ref --verify --quiet "refs/heads/$SYNC_BRANCH"; then
@@ -313,7 +318,7 @@ cat <<EOF
 ────────────────────────────────────────────────────────
 下一步（人工决策，脚本到此为止）：
   1. 逐条读 $OUT/<sha>.diff，把结论填进 $SUMMARY
-  2. 按结论逐项移植，每个逻辑单元单独提交，说明带 `Upstream: …@<sha>`
+  2. 按结论逐项移植，每个逻辑单元单独提交，说明带 Upstream: <repo>@<sha>
      - 能用 cherry-pick 且无冲突的：git cherry-pick <sha> && git commit --amend（补 Upstream 行）
      - 需要改写的：手工编辑，别整块 checkout
      - 不要移植版本号提交
@@ -322,6 +327,6 @@ cat <<EOF
 
 基线数据（收尾时对比用）：
   git log -1 --format=%h   # 记下开分支时的 HEAD
-  clippy 警告数：$(cd "$ROOT" && cargo clippy -p wb-switch-core --message-format=short 2>&1 | grep -c "warning:" || true)
+  clippy 警告数：$(cd "$ROOT" && cargo clippy -p wb-switch-core --message-format=short 2>&1 | grep "warning:" | grep -v "^warning: \`" | wc -l)
 ────────────────────────────────────────────────────────
 EOF

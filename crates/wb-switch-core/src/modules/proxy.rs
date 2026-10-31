@@ -96,6 +96,24 @@ const MAX_MODEL_RETRY: usize = 3;
 /// 不再拉长：这类故障窗口实测通常几秒内就恢复，拖太久客户端会先超时断开。
 const MODEL_RETRY_BACKOFF_MS: [u64; MAX_MODEL_RETRY] = [1_000, 3_000, 8_000];
 
+// ---------------------------------------------------- 并发上限（对齐社区实现）
+//
+// 多账号在同一 IP 上高频互换 / 无限并发，是风控判定「账号共享、批量使用」
+// 最典型的两个形状。会话粘滞（见 [`SessionStick`]）压住了前一个，
+// 下面这组常数压住后一个：单号在途请求数封顶，整池再有一个总上限。
+//
+// 取值来自社区实现 `dsh-workbuddy2api` 的池策略（2026-10 版本）：
+// 单号 3、国际版号 2（号更少、风控更敏感）、整池 8。
+const MAX_INFLIGHT_DOMESTIC: u32 = 3;
+const MAX_INFLIGHT_INTERNATIONAL: u32 = 2;
+const MAX_INFLIGHT_POOL: u32 = 8;
+
+/// 单个请求内**换号重试**的最大次数（只对 429 / 5xx 生效）。
+///
+/// 这两类是「这个号这一刻不行」，换一个号往往立刻就好；参数错误、内容被拦
+/// 则相反 —— 换号只会把同一个 400 在别的号上再犯一次，所以不走这条路。
+const MAX_ACCOUNT_RETRY: usize = 2;
+
 /// 上游**连接层**失败（DNS 解析不了 / 超时 / 连接被拒 / TLS 重置）的最大重试次数。
 /// 🔴 连接层失败**不是账号的问题**，绝不能拿它去冷却账号。
 /// 以前这里无条件 `mark_failed`，于是网络一抖就把整池冻 120 秒：
@@ -193,6 +211,10 @@ const STANDARD_PASSTHROUGH: &[&str] = &[
 ///
 /// 本仓库**默认路径就抹**（不同于上游只在自愈重试里抹）：这些短语是客户端自动
 /// 注入的固定身份声明，不是用户自己写的内容；留着只会让整条请求被拦。
+///
+/// 🔴 2026-10-28 起**国内版**还按指令文本做指纹（不只看出站头）：
+/// 除 `system` 外，`developer` 与 **`assistant` 历史**里的品牌名同样会被拦，
+/// 见 [`neutralize_domestic_fingerprints`]；`user` / `tool` 内容不触发。
 const IDENTITY_DECLARATIONS: &[&str] = &[
     "DeepSeek Harness",
     "deepseek-harness",
@@ -502,11 +524,39 @@ struct AccountLease {
     /// 用的模型一起冻掉，所以这类失败记在模型键上；账号仍留在池子里服务
     /// 其他模型。
     model_cooldowns: HashMap<String, ModelCooldown>,
+    /// 在途请求数（并发上限用，见 [`MAX_INFLIGHT_DOMESTIC`]）。
+    /// 由 [`LeaseGuard`] 在响应结束时归还 —— 手工还漏一条就会永久占名额。
+    inflight: u32,
+}
+
+/// 借用守卫：drop 时把在途计数还给池子。
+///
+/// 🔴 必须用 RAII 而不是在每条 return 前手写 release：`chat_completions_inner`
+/// 有多条提前返回的分支（鉴权失败、模型不匹配、上游早退、换号重试），
+/// 手写释放漏一条就会永久占着一个并发名额，池子越用越窄，最后表现为
+/// 「莫名其妙 503」——而且重启之前无法自愈。
+struct LeaseGuard {
+    pool: Arc<Pool>,
+    uid: String,
+}
+
+impl LeaseGuard {
+    fn uid(&self) -> &str {
+        &self.uid
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.pool.release(&self.uid);
+    }
 }
 
 struct Pool {
     leases: Vec<std::sync::Mutex<AccountLease>>,
     cursor: AtomicUsize,
+    /// 整池在途总数（各 lease 的 inflight 之和，单独存一份免得到处加锁求和）。
+    inflight_total: std::sync::atomic::AtomicU32,
 }
 
 impl Pool {
@@ -521,10 +571,12 @@ impl Pool {
                         failed_until_ms: None,
                         failed_reason: None,
                         model_cooldowns: HashMap::new(),
+                        inflight: 0,
                     })
                 })
                 .collect(),
             cursor: AtomicUsize::new(0),
+            inflight_total: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -609,6 +661,101 @@ impl Pool {
                 .map(|l| l.edition == edition)
                 .unwrap_or(false)
         })
+    }
+
+    // ------------------------------------------------ 并发名额
+
+    /// 在并发上限内占用一个号；成功返回守卫，drop 时自动归还。
+    ///
+    /// 拿不到名额的原因可能是「号不可用」也可能是「号满了」，调用方无法区分，
+    /// 但这两者都会让 `take_account` 继续试下一个号 —— 行为一致，无需分开。
+    fn try_acquire(
+        self: &Arc<Self>,
+        uid: &str,
+        want: Option<Edition>,
+        model: Option<&str>,
+    ) -> Option<LeaseGuard> {
+        if self.inflight_total.load(Ordering::Relaxed) >= MAX_INFLIGHT_POOL {
+            return None;
+        }
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid != uid {
+                continue;
+            }
+            // ⚠️ 这里不能调 `lease_usable()`：它会再锁一遍所有 slot，
+            // 而当前 slot 已被本线程持有 —— std 的 Mutex 不可重入，会直接死锁。
+            // 判据必须与 `lease_usable` 保持一致（那边是同一套字段）。
+            let now = now_ms_i64();
+            if want.is_some_and(|e| lease.edition != e)
+                || lease.failed_until_ms.is_some_and(|t| t > now)
+                || model.is_some_and(|m| {
+                    lease
+                        .model_cooldowns
+                        .get(m)
+                        .is_some_and(|c| c.until_ms > now)
+                })
+            {
+                return None;
+            }
+            let cap = match lease.edition {
+                Edition::International => MAX_INFLIGHT_INTERNATIONAL,
+                Edition::Domestic => MAX_INFLIGHT_DOMESTIC,
+            };
+            if lease.inflight >= cap {
+                return None;
+            }
+            lease.inflight += 1;
+            self.inflight_total.fetch_add(1, Ordering::Relaxed);
+            return Some(LeaseGuard {
+                pool: Arc::clone(self),
+                uid: uid.to_string(),
+            });
+        }
+        None
+    }
+
+    /// 归还在途计数（由 [`LeaseGuard`] 的 Drop 调用）。
+    fn release(&self, uid: &str) {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.inflight = lease.inflight.saturating_sub(1);
+                self.inflight_total.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// 该档的号是不是**只是因为并发名额满了**才选不出来。
+    ///
+    /// 只用于把 503 的文案说清楚：以前这种情况会报「账号都在冷却中」，
+    /// 用户去查账号状态只会看到一片正常，完全摸不着头脑。
+    fn saturated(&self, want: Option<Edition>) -> bool {
+        if self.inflight_total.load(Ordering::Relaxed) >= MAX_INFLIGHT_POOL {
+            return true;
+        }
+        let now = now_ms_i64();
+        let mut any = false;
+        for slot in &self.leases {
+            let Ok(lease) = slot.lock() else { continue };
+            if want.is_some_and(|e| lease.edition != e) {
+                continue;
+            }
+            let cooling = lease.failed_until_ms.is_some_and(|t| t > now);
+            if cooling {
+                continue;
+            }
+            any = true;
+            let cap = match lease.edition {
+                Edition::International => MAX_INFLIGHT_INTERNATIONAL,
+                Edition::Domestic => MAX_INFLIGHT_DOMESTIC,
+            };
+            if lease.inflight < cap {
+                return false; // 还有一个号有空位
+            }
+        }
+        any
     }
 
     /// 给账号打一次短冷却（固定 [`COOLDOWN`]），并记下原因供界面展示。
@@ -918,13 +1065,20 @@ impl Drop for PumpBody {
 ///
 /// `sticky`：会话粘滞（见 [`SessionStick`]）。绑定中的号**冷却/标签不合格时直接解绑**，
 /// 本轮重新轮转；成功选出后把会话绑到它上面。没有会话标识时行为与纯轮转完全一致。
+///
+/// `exclude`：调用方额外排除的 uid（换号重试时把刚失败的那个号传进来）。
+///
+/// 返回值里的 [`LeaseGuard`] 占着一个并发名额，**必须活到响应结束**：
+/// 流式响应要把守卫搬进泵的任务体里，否则函数一 return 名额就还了，
+/// 并发上限等于没生效。
 async fn take_account(
-    pool: &Pool,
+    pool: &Arc<Pool>,
     _cfg: &ProxyConfig,
     want: Option<Edition>,
     model: Option<&str>,
     sticky: Option<(&SessionStick, &str)>,
-) -> Option<Value> {
+    exclude: &[String],
+) -> Option<(Value, LeaseGuard)> {
     // 🔴 挑号与「从磁盘取明文」必须绑在一起重试。
     //
     // `next_uid_of` 只看版本与冷却，看不到 `needs_relogin`，也看不到号是不是还在磁盘上；
@@ -935,7 +1089,7 @@ async fn take_account(
     //
     // 现在：挑到一个失效号就给它打短冷却（[`SKIP_COOLDOWN`]，到期会重新读盘判定）
     // 并继续挑下一个 —— 单个坏号只让「这一轮」多绕一步，不会再把整单打成 503。
-    let failed: Vec<String> = Vec::new();
+    let failed: Vec<String> = exclude.to_vec();
     let mut tried: Vec<String> = Vec::new();
     let mut skipped: Option<Value> = None;
     // 先看会话是否已粘在某个号上：**只有冷却/不可用时才解绑**，其余情况固定用它。
@@ -971,8 +1125,10 @@ async fn take_account(
                     // 本轮所有号都被略过了：放过一个（「刷新失败但可能还能用」的）再试一次，
                     // 免得单个号的问题把整池拖空；连一个都没有才真的 503。
                     let acc = skipped?;
-                    pool.clear_cooldown(&uid_of(&acc));
-                    return Some(acc);
+                    let uid = uid_of(&acc);
+                    pool.clear_cooldown(&uid);
+                    let guard = pool.try_acquire(&uid, want, model)?;
+                    return Some((acc, guard));
                 }
             },
         };
@@ -983,6 +1139,12 @@ async fn take_account(
         // 磁盘上每一个号**每轮只看一次**：已经试过的 uid 不会再被 `next_uid_of`
         // 绕回来（`tried` 里一出现就直接收工），所以这里不需要额外的排除列表。
         tried.push(uid.clone());
+        // 🔴 名额要在真正使用它之前占住；后面任何一条 continue 都会让守卫掉出
+        // 作用域、自动归还，不需要手写 release。
+        let guard = match pool.try_acquire(&uid, want, model) {
+            Some(g) => g,
+            None => continue, // 并发名额已满，换下一个号
+        };
         let Some(acc) = load_accounts()
             .into_iter()
             .find(|a| is_leasable_uid(a, &uid))
@@ -1016,7 +1178,7 @@ async fn take_account(
                 if let Some((stick, session)) = sticky {
                     stick.bind(session, &uid_of(&acc), now_ms_i64());
                 }
-                return Some(acc);
+                return Some((acc, guard));
             }
             Prepared::Fallback(acc) => {
                 // 刷新失败：不再纠结直接出站（token 真失效上游会回 401 并冷却该号），
@@ -1030,6 +1192,47 @@ async fn take_account(
                 pool.mark_unusable(&uid, "刷新失败：没有可用凭据，需要重新登录");
             }
         }
+    }
+}
+
+/// 由请求体算一个**跨轮次稳定**的会话键，用于会话粘滞。
+///
+/// 取「首条 system + 首条 user」的哈希：同一段对话多轮里这两条是不变的
+/// （历史只会往后面追加），所以键稳定；不同对话立刻分开。
+///
+/// 不直接用「整段 messages」的哈希 —— 那样每加一轮就换一个键，粘性等于没有。
+///
+/// 为什么需要它：粘滞原本只看入站 `X-Conversation-ID`（官方桌面端会发），
+/// 不带该头的客户端（CCH / 各类 Agent）就退化成纯轮转 —— 同一段对话在多个
+/// 账号之间跳，正是风控眼里「账号共享」的形状。
+fn session_key(incoming: &Value) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let msgs = incoming.get("messages")?.as_array()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut filled = 0u8;
+    for m in msgs {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        let want_bit = match role {
+            "system" | "developer" => 1u8,
+            "user" => 2u8,
+            _ => continue,
+        };
+        if filled & want_bit != 0 {
+            continue;
+        }
+        if let Some(c) = m.get("content").and_then(Value::as_str) {
+            role.hash(&mut h);
+            c.hash(&mut h);
+            filled |= want_bit;
+            if filled == 3 {
+                break;
+            }
+        }
+    }
+    if filled == 0 {
+        None
+    } else {
+        Some(format!("{:016x}", h.finish()))
     }
 }
 
@@ -1570,7 +1773,10 @@ fn strip_identity_declarations(text: &str) -> Option<String> {
                     .zip(p.iter())
                     .all(|(a, b)| a.eq_ignore_ascii_case(b))
             {
-                out.push_str("Assistant");
+                // 替换词取 `DeepSeek`（原短语的前缀）：语义零损失。
+                // 曾用 `Assistant`，会造出「powered by Assistant」这种病句
+                // （上游 v1.6.28 的同款修正）。
+                out.push_str("DeepSeek");
                 i += p.len();
                 hit = true;
                 continue 'outer;
@@ -1585,6 +1791,125 @@ fn strip_identity_declarations(text: &str) -> Option<String> {
         Some(out)
     } else {
         None
+    }
+}
+
+/// 把**被空格包围的裸 `@`** 换成全角 `＠`，返回 `None` 表示没命中。
+///
+/// 国内版 11128 的第二道判据（2026-10-28，见 [`IDENTITY_DECLARATIONS`]）：
+/// 同一条消息里出现**裸 `@` 提及**（两侧都是空格）且同时出现
+/// 「`@` 前缀是路径」那段说明 → 拒。
+///
+/// 只动 ` @ ` 这一种形态，因此：
+/// - `@file`、`@scope/pkg`（@ 在词首，前面不是空格）→ 不动
+/// - `someone@example.com`（两侧无空格）→ 不动
+/// - `@"..."`（后面不是空格）→ 不动
+///
+/// 全角 `＠` 在语义上与 `@` 等价，模型读到不会误解，但不再命中该指纹。
+fn neutralize_bare_at(text: &str) -> Option<String> {
+    if !text.contains(" @ ") {
+        return None;
+    }
+    Some(text.replace(" @ ", " ＠ "))
+}
+
+/// **国内版**出站前的主动清洗：抹掉渠道校验会认的「指令文本指纹」。
+///
+/// 2026-10-28 起国内版也按**指令文本内容**拦 11128（不只是出站头）：
+/// `system` / `developer` / **`assistant` 历史**里出现两词品牌名
+/// （`DeepSeek Harness`，空格/Tab、大小写不敏感）就整条拒；
+/// `user` / `tool` 消息里的同名词**不触发**。
+///
+/// 为什么必须主动做（而不是等 11128 再自愈）：
+/// 自愈是在**已经撞墙之后**才发生，每个新会话都要先花一次 400 + 一次重发；
+/// 而且自愈只对 `unapproved channel` 变体生效，对文本指纹这一道命中不了。
+///
+/// `assistant` 历史也在扫描范围内 —— 不洗它的话，「对话里提到过品牌名」
+/// 会让后续每一轮都复发。
+///
+/// 🔴 `user` / `tool` 内容一个字不动：实测不触发，改了就是篡改用户内容。
+fn neutralize_domestic_fingerprints(messages: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    let mut hits = 0usize;
+    for item in arr.iter_mut() {
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+        if !matches!(role, "system" | "developer" | "assistant") {
+            continue;
+        }
+        let Some(content) = item.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::String(s) => {
+                let mut next = s.clone();
+                if let Some(v) = strip_identity_declarations(&next) {
+                    next = v;
+                    hits += 1;
+                }
+                if let Some(v) = neutralize_bare_at(&next) {
+                    next = v;
+                    hits += 1;
+                }
+                *s = next;
+            }
+            Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    // 先拷成 owned String 再写回：避免同时持有只读借用与可变借用。
+                    let Some(mut next) = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if let Some(v) = strip_identity_declarations(&next) {
+                        next = v;
+                        hits += 1;
+                    }
+                    if let Some(v) = neutralize_bare_at(&next) {
+                        next = v;
+                        hits += 1;
+                    }
+                    part["text"] = Value::String(next);
+                }
+            }
+            _ => {}
+        }
+    }
+    if hits > 0 {
+        degraded.push(format!("domestic-fingerprint:{hits}"));
+    }
+}
+
+/// 工具描述同样在扫描范围内（`tools[].function.description`）。
+fn neutralize_domestic_tool_descriptions(tools: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    let mut hits = 0usize;
+    for tool in arr.iter_mut() {
+        let Some(mut next) = tool
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(v) = strip_identity_declarations(&next) {
+            next = v;
+            hits += 1;
+        }
+        if let Some(v) = neutralize_bare_at(&next) {
+            next = v;
+            hits += 1;
+        }
+        tool["function"]["description"] = Value::String(next);
+    }
+    if hits > 0 {
+        degraded.push(format!("domestic-tool-desc:{hits}"));
     }
 }
 
@@ -2132,6 +2457,11 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
     let messages = incoming.get("messages").cloned().unwrap_or_else(|| json!([]));
     let mut sanitized = sanitize_messages(&messages, degraded);
     ensure_leading_system(edition, &mut sanitized, degraded);
+    // 🔴 国内版必须**主动**清洗渠道指纹（2026-10-28 起按文本内容判）。
+    // 放在默认路径而不是等撞了 11128 再自愈 —— 自愈要多付一次 400 + 一次重发。
+    if edition == Edition::Domestic {
+        neutralize_domestic_fingerprints(&mut sanitized, degraded);
+    }
     let mut body = json!({
         "model": model,
         "messages": sanitized,
@@ -2151,7 +2481,11 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
         body["stream_options"]["include_usage"] = Value::Bool(true);
     }
     if let Some(t) = incoming.get("tools") {
-        body["tools"] = t.clone();
+        let mut tools = t.clone();
+        if edition == Edition::Domestic {
+            neutralize_domestic_tool_descriptions(&mut tools, degraded);
+        }
+        body["tools"] = tools;
     }
     // 🔴 `tool_choice` 必须**归一化**后再发：上游只吃字符串，
     // 收到 OpenAI 规范的对象形式会直接 11101（见 normalize_tool_choice）。
@@ -3803,27 +4137,51 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         }
     }
 
-    // 会话粘滞：官方桌面端发 `X-Conversation-ID`（= sessionId），把同一会话的连续
-    // 请求固定到同一个号，避免每个号都重建一遍上游缓存。没有该头就纯轮转。
-    let session = inbound_session(headers);
-    let picked = match session.as_deref() {
-        Some(session) => {
-            take_account(
-                &st.pool,
-                &st.cfg,
-                Some(st.edition),
-                Some(model.as_str()),
-                Some((st.sticky.as_ref(), session)),
-            )
-            .await
+    // 会话粘滞：优先用客户端自带的会话标识（官方桌面端发 `X-Conversation-ID`
+    // = sessionId），没有就退回**从请求体推导**的会话键 —— 后者让不带该头的
+    // 客户端（CCH / 各类 Agent）也能享受粘滞，否则它们退化成纯轮转。
+    let session = inbound_session(headers).or_else(|| session_key(&incoming));
+    // 独立的副本供闭包使用：`session` 本体后面要移进 `UsageMeta`。
+    let session_for_pick = session.clone();
+    let pick = |exclude: &[String]| {
+        let pool = st.pool.clone();
+        let cfg = st.cfg.clone();
+        let edition = st.edition;
+        let sticky = st.sticky.clone();
+        let session = session_for_pick.clone();
+        let model = model.clone();
+        let exclude = exclude.to_vec();
+        async move {
+            match session.as_deref() {
+                Some(s) => {
+                    take_account(
+                        &pool,
+                        &cfg,
+                        Some(edition),
+                        Some(model.as_str()),
+                        Some((sticky.as_ref(), s)),
+                        &exclude,
+                    )
+                    .await
+                }
+                None => {
+                    take_account(&pool, &cfg, Some(edition), Some(model.as_str()), None, &exclude)
+                        .await
+                }
+            }
         }
-        None => take_account(&st.pool, &st.cfg, Some(st.edition), Some(model.as_str()), None).await,
     };
-    let Some(acc) = picked else {
-        // 报错要说清楚是「冷却中」还是「号在磁盘上已经不可用（被删 / 需重新登录）」——
-        // 以前两者共用一句「都不可用」，用户修完重新登录还以为没生效。
+    let Some((mut acc, mut lease)) = pick(&[]).await else {
+        // 报错要说清楚是「冷却中」「磁盘上不可用」还是「并发满了」——
+        // 以前几种情况共用一句「都不可用」，用户去查账号状态只会看到一片正常。
         let eligible = eligible_on_disk(&st.cfg, st.edition);
-        let message = if st.pool.has_edition(st.edition) && eligible == 0 {
+        let message = if st.pool.saturated(Some(st.edition)) {
+            format!(
+                "{}的账号当前都已占满（并发上限：单账号 {} 个在途请求），请稍后重试",
+                st.edition.label(),
+                MAX_INFLIGHT_DOMESTIC
+            )
+        } else if st.pool.has_edition(st.edition) && eligible == 0 {
             // 池子里还有这一版的号，但磁盘上一个都拿不到明文 ⇒ 它们都是「被删 / 需重新登录」，
             // 只是还在 30 秒的跳过冷却里。
             format!(
@@ -3844,7 +4202,7 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         )
             .into_response();
     };
-    let uid = acc
+    let mut uid = acc
         .get("uid")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -3854,7 +4212,7 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let meta = UsageMeta {
+    let mut meta = UsageMeta {
         uid: uid.clone(),
         nickname,
         model: model.clone(),
@@ -3893,6 +4251,10 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
     // `X-Conversation-ID` 保持会话稳定（与官方桌面端语义一致），只有请求/消息 id 变化。
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
+    // 换号重试次数：只在「换号可能解决」的错误上消耗（429 / 5xx）。
+    let mut account_retry = 0usize;
+    // 本次请求已经换掉的号：再换号时一并排除，免得绕回同一个。
+    let mut account_failed_uids: Vec<String> = Vec::new();
     // 模型侧瞬时故障（11133/11134/14003）的重试计数，见 MAX_MODEL_RETRY。
     let mut model_retry = 0usize;
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，把请求体换成
@@ -3962,6 +4324,47 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         }
         let raw_status = r.status();
         let text = r.text().await.unwrap_or_default();
+
+        // 🔴 429 / 5xx：**换号重试**。这两类都是「这个号这一刻不行」，换一个号
+        // 往往立刻就好；参数错、内容被拦则相反 —— 换号只会把同一个 400 在别的号上
+        // 再犯一次，所以那类不在这里处理，走下面的透传路径。
+        //
+        // 与上游实现的差异：429 只在**本次请求内**把该号排除，不改动它已有的
+        // 模型级冷却（本仓库对 429 的处置是「只冻那个模型」，见下方 6004 分支）；
+        // 5xx **不打任何冷却标记** —— 那会把网络抖动放大成整池停摆（2026-10-11
+        // 的教训，见 MAX_TRANSPORT_RETRY 的说明）。
+        let is_rate = raw_status.as_u16() == 429;
+        let is_5xx = raw_status.is_server_error();
+        if (is_rate || is_5xx) && account_retry < MAX_ACCOUNT_RETRY {
+            account_retry += 1;
+            eprintln!(
+                "[反代] 上游 {}，换号重试 {}/{} (model={model}, uid={uid})",
+                if is_rate { "429 限流" } else { "5xx" },
+                account_retry,
+                MAX_ACCOUNT_RETRY
+            );
+            let mut exclude = vec![uid.clone()];
+            exclude.extend(account_failed_uids.iter().cloned());
+            // 🔴 先拿到新号、再归还旧号：反过来写的话，一旦换号失败，
+            // `lease` 已被 drop，后面的流式分支就没有名额可归还了。
+            // 先占后换最坏也只是短暂多占一个名额（仍在池子上限内）。
+            if let Some((next_acc, next_lease)) = pick(&exclude).await {
+                account_failed_uids.push(uid.clone());
+                drop(lease);
+                acc = next_acc;
+                lease = next_lease;
+                uid = lease.uid().to_string();
+                meta.uid = uid.clone();
+                meta.nickname = acc
+                    .get("nickname")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                continue;
+            }
+            eprintln!("[反代] 429/5xx 后没有其他可用账号，直接返回上游错误 (uid={uid})");
+        }
+
         // 🔴 模型侧瞬时故障（11133/11134/14003）：官方归类「模型侧状态」，
         // 重发即可能成功。**绝不能冷却账号** —— 见 is_transient_model_error。
         if is_transient_model_error(&text) && model_retry < MAX_MODEL_RETRY {
@@ -4244,8 +4647,12 @@ async fn chat_completions_inner(st: &AppState, headers: &HeaderMap, incoming: Va
         // 泵持有 client 的 Arc：连接池属于 client，client 一旦被 drop，尚未读完的
         // 连接也会跟着关掉。泵要在客户端断开后独立收尾，所以这个引用不能提前释放。
         let upstream_arc = Arc::clone(&st.stream_upstream);
+        // 🔴 把并发名额的所有权搬进任务体：流式响应会一直产出到 [DONE]，
+        // 名额必须活到那一刻才归还。放在外层的话，函数一 return 名额就还了，
+        // 并发上限等于没生效（上游 v1.6.29 踩过同一个坑）。
         tokio::spawn(async move {
             sse_pump(upstream_arc, upstream, tx, meta).await;
+            drop(lease);
         });
         // 泵的结束状态：`PumpBody` 读到就结束响应体；被 drop（客户端断开）时用它叫停泵。
         let (pump_tx, mut pump_rx) = tokio::sync::mpsc::unbounded_channel::<Emitted>();
@@ -6430,7 +6837,7 @@ mod tests {
         let out = sanitize_messages(&msgs, &mut degraded);
         assert_eq!(out[0]["role"], "system", "developer 必须被改成 system");
         // 身份声明会被抹掉（见 strip_identity_declarations）—— 它正是 11128 的触发点。
-        assert_eq!(out[0]["content"], "You are an AI agent powered by Assistant.");
+        assert_eq!(out[0]["content"], "You are an AI agent powered by DeepSeek.");
         assert_eq!(out[1]["role"], "user", "user 消息不受影响");
         assert_eq!(
             degraded,
@@ -6634,6 +7041,77 @@ mod tests {
         assert!(!only_intl.has_edition(Edition::Domestic));
         // 不限版本时照常能拿到
         assert_eq!(only_intl.next_uid_of(None, None::<&str>, &[]).as_deref(), Some("u-intl"));
+    }
+
+    /// 并发上限：单号占满后不再放行，归还后恢复；`saturated` 要能说清是「满了」
+    /// 而不是「冷却中」（503 的文案按它分流）。
+    #[test]
+    fn inflight_cap_blocks_then_recovers() {
+        let pool = Arc::new(Pool::new(vec![(
+            "u1".to_string(),
+            Edition::International,
+        )]));
+        let intl = Some(Edition::International);
+        let a = pool.try_acquire("u1", intl, None);
+        let b = pool.try_acquire("u1", intl, None);
+        assert!(a.is_some() && b.is_some(), "国际版上限 2，前两个应放行");
+        assert!(
+            pool.try_acquire("u1", intl, None).is_none(),
+            "第三个必须被并发上限挡下"
+        );
+        assert!(pool.saturated(intl), "占满时应能报告「满」");
+        drop(a);
+        assert!(
+            pool.try_acquire("u1", intl, None).is_some(),
+            "归还名额后应恢复"
+        );
+        assert!(!pool.saturated(intl), "还有空位时不算饱和");
+    }
+
+    /// 守卫 drop 后必须把名额还回去 —— 漏还就是「越用越窄、最后莫名 503」。
+    #[test]
+    fn lease_guard_returns_slot_on_drop() {
+        let pool = Arc::new(Pool::new(vec![("u1".to_string(), Edition::Domestic)]));
+        let dom = Some(Edition::Domestic);
+        // 国内版单号上限 3，占满后应挡住
+        let guards: Vec<_> = (0..3)
+            .map(|_| pool.try_acquire("u1", dom, None).expect("前 3 个应放行"))
+            .collect();
+        assert!(pool.try_acquire("u1", dom, None).is_none());
+        drop(guards); // 全部归还
+        for _ in 0..3 {
+            assert!(
+                pool.try_acquire("u1", dom, None).is_some(),
+                "归还后应全部可再占"
+            );
+        }
+    }
+
+    /// 会话键必须**跨轮次稳定**：同一段对话追加历史后键不变，换对话立刻分开。
+    /// 不稳定的话粘性等于没有（每轮都换号）。
+    #[test]
+    fn session_key_is_stable_across_turns() {
+        let turn1 = json!({"messages": [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "U1"}
+        ]});
+        let turn2 = json!({"messages": [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "U1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "U2"}
+        ]});
+        let k1 = session_key(&turn1);
+        assert!(k1.is_some());
+        assert_eq!(k1, session_key(&turn2), "追加历史后会话键必须不变");
+
+        let other = json!({"messages": [{"role": "user", "content": "另一个问题"}]});
+        assert_ne!(k1, session_key(&other), "不同对话必须分开");
+
+        // 只有 user（没有 system）也能算；完全没有可用消息则 None
+        assert!(session_key(&other).is_some());
+        assert_eq!(session_key(&json!({"messages": []})), None);
+        assert_eq!(session_key(&json!({})), None);
     }
 
     /// 🔴 60004 只冻**模型**：同账号的其他模型仍能被选中，冷却到期后该模型自动回归。
@@ -7358,7 +7836,7 @@ mod tests {
         });
         let mut degraded = Vec::new();
         let healed = heal_body_for_channel(&body, &mut degraded);
-        assert_eq!(healed["messages"][0]["content"], "You are Assistant.");
+        assert_eq!(healed["messages"][0]["content"], "You are DeepSeek.");
         // 🔴 图片块必须还在 —— 拍平内容会把它弄丢。
         assert!(healed["messages"][1]["content"].is_array(), "默认层不能拍平 content");
         assert_eq!(healed["messages"][1]["content"][1]["type"], "image_url");
@@ -7443,6 +7921,95 @@ mod tests {
         assert!(identity.contains("本地无法绕过"));
         assert_ne!(payload, identity, "两种变体文案要分开");
     }
+    /// 国内版渠道指纹必须**主动**清洗，且边界严格对齐实测判据。
+    ///
+    /// 国内版（2026-10-28 起）扫 `system` / `developer` / **`assistant` 历史**与
+    /// 工具描述；`user` / `tool` 里的同名词**不触发**，所以一个字都不能动 ——
+    /// 改了就是篡改用户内容。
+    #[test]
+    fn domestic_neutralizes_fingerprints_but_leaves_user_content_alone() {
+        let incoming = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "You are an AI agent powered by DeepSeek Harness. Mention @ here."},
+                {"role": "user", "content": "请解释 @ 的用法"},
+                {"role": "assistant", "content": "按 DeepSeek Harness 文档"},
+                {"role": "tool", "content": "result mentions DeepSeek Harness"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "description": "built on DeepSeek Harness"}
+            }]
+        });
+
+        let mut degraded = Vec::new();
+        let out = build_upstream_body(&incoming, Edition::Domestic, &mut degraded);
+        let msg = |i: usize| out["messages"][i]["content"].as_str().unwrap_or("").to_string();
+
+        // system：品牌名缩成 DeepSeek、裸 @ 换全角
+        let sys = msg(0);
+        assert!(!sys.contains("DeepSeek Harness"), "system 品牌名应缩掉: {sys}");
+        assert!(sys.contains("powered by DeepSeek."), "应缩成 DeepSeek 而非删掉: {sys}");
+        assert!(sys.contains("＠"), "system 里的裸 @ 应换全角: {sys}");
+
+        // assistant 历史同样被扫（否则下一轮复发）
+        let asst = msg(2);
+        assert!(!asst.contains("DeepSeek Harness"), "assistant 历史也要清: {asst}");
+
+        // 工具描述：也清
+        let desc = out["tools"][0]["function"]["description"].as_str().unwrap();
+        assert!(!desc.contains("DeepSeek Harness"), "工具描述要清: {desc}");
+
+        // 🔴 user / tool 一个字都不能动
+        assert_eq!(msg(1), "请解释 @ 的用法", "user 内容必须原样");
+        assert_eq!(msg(3), "result mentions DeepSeek Harness", "tool 内容必须原样");
+
+        // 国际版：**system 里的身份声明照旧抹**（本仓库 2026-10-24 起的既有行为，
+        // 与上游只在自愈时抹不同），但国内版新增的三项（assistant 历史 /
+        // 工具描述 / 裸 @）都不做 —— 国际版判据不同，无谓改动。
+        let mut d2 = Vec::new();
+        let intl = build_upstream_body(&incoming, Edition::International, &mut d2);
+        let intl_sys = intl["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !intl_sys.contains("DeepSeek Harness"),
+            "国际版的 system 身份声明照旧要抹（既有行为）"
+        );
+        assert!(intl_sys.contains(" @ "), "国际版不该动裸 @");
+        assert!(
+            intl["messages"][2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("DeepSeek Harness"),
+            "国际版不该清洗 assistant 历史"
+        );
+        assert!(
+            intl["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("DeepSeek Harness"),
+            "国际版不该清洗工具描述"
+        );
+    }
+
+    /// 裸 `@` 的替换边界：只动「两侧都是空格」的形态，路径 / 邮箱 / 引用一律不动。
+    #[test]
+    fn bare_at_only_rewrites_space_surrounded_mentions() {
+        assert_eq!(
+            neutralize_bare_at("ask @ bob about it").as_deref(),
+            Some("ask ＠ bob about it")
+        );
+        // 以下都不该动
+        for untouched in [
+            "see @file for details",
+            "@scope/pkg is here",
+            "mail someone@example.com",
+            "quote @\"path with spaces\"",
+            "@nospace",
+        ] {
+            assert_eq!(neutralize_bare_at(untouched), None, "不该改：{untouched}");
+        }
+    }
+
     #[test]
     fn identity_declarations_are_stripped_in_system_only() {
         let msgs = json!([
@@ -7454,19 +8021,19 @@ mod tests {
             { "role": "user", "content": "what is DeepSeek Harness?" }
         ]);
         let out = sanitize_messages(&msgs, &mut Vec::new());
-        assert_eq!(out[0]["content"], "You are Assistant. Rules.");
-        assert_eq!(out[1]["content"][0]["text"], "powered by Assistant");
+        assert_eq!(out[0]["content"], "You are DeepSeek. Rules.");
+        assert_eq!(out[1]["content"][0]["text"], "powered by DeepSeek");
         assert_eq!(out[1]["content"][1]["text"], "keep me");
         assert_eq!(out[2]["content"], "what is DeepSeek Harness?", "user 消息不动");
         // 直接测函数本身
         assert_eq!(
             strip_identity_declarations("a DeepSeek Harness b"),
-            Some("a Assistant b".to_string())
+            Some("a DeepSeek b".to_string())
         );
         assert_eq!(strip_identity_declarations("中文里没有身份声明"), None);
         assert_eq!(
             strip_identity_declarations("DeepSeek Harness"),
-            Some("Assistant".to_string())
+            Some("DeepSeek".to_string())
         );
     }
     // ---------------------------------------------------------------- 本次修复的回归测试
