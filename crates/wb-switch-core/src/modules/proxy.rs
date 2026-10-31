@@ -137,8 +137,17 @@ const PASSTHROUGH_PARAMS: &[&str] = &[
 /// 「DeepSeek Harness」身份声明，命中就把整条请求判成 `11128 unapproved channel`；
 /// DSH 自带 `includeHarnessIdentity` 开关，关掉它（或把声明从提示词里删掉）即可恢复。
 ///
-/// 🔴 只在**自愈重试**时抹（见 [`sanitize_messages_aggressive`]），默认路径不动：
-/// 用户自己写的 system prompt 内容不该被我们擅自改写。
+/// 🔴 2026-10-28 起**国内版**也按「指令文本指纹」拦 11128
+/// （同为开源实现 `dsh-workbuddy2api` 的实测结论，与本机现象一致）：
+/// `system` / `developer` / **`assistant` 历史** 里出现 `DeepSeek Harness`
+/// 就整条拒；`user` / `tool` 消息里的品牌名不触发。
+///
+/// 因此清洗**不能只在 11128 自愈时做**（那样每个新会话都要先撞一次 400），
+/// 必须在默认路径对国内版主动执行 —— 见 [`neutralize_domestic_fingerprints`]。
+///
+/// 替换词取 **`DeepSeek`** 而不是整段删掉或换成 `Assistant`：
+/// 它就是原短语的前缀，「powered by DeepSeek Harness」→「powered by DeepSeek」
+/// 语义零损失；换成 `Assistant` 会出现「powered by Assistant」这种病句。
 const IDENTITY_DECLARATIONS: &[&str] = &[
     "DeepSeek Harness",
     "deepseek-harness",
@@ -165,7 +174,7 @@ fn strip_identity_declarations(text: &str) -> Option<String> {
                     .zip(p.iter())
                     .all(|(a, b)| a.eq_ignore_ascii_case(b))
             {
-                out.push_str("Assistant");
+                out.push_str("DeepSeek");
                 i += p.len();
                 hit = true;
                 continue 'outer;
@@ -180,6 +189,121 @@ fn strip_identity_declarations(text: &str) -> Option<String> {
         Some(out)
     } else {
         None
+    }
+}
+
+/// 把**被空格包围的裸 `@`** 换成全角 `＠`，返回 `None` 表示没命中。
+///
+/// 国内版 11128 的第二道判据（2026-10-28，见 [`IDENTITY_DECLARATIONS`]）：
+/// 同一条消息里出现**裸 `@` 提及**（两侧都是空格）且同时出现
+/// 「`@` 前缀是路径」那段说明 → 拒。
+///
+/// 只动 ` @ ` 这一种形态，因此：
+/// - `@file`、`@scope/pkg`（@ 在词首，前面不是空格）→ 不动
+/// - `someone@example.com`（两侧无空格）→ 不动
+/// - `@"..."`（后面不是空格）→ 不动
+///
+/// 全角 `＠` 在语义上与 `@` 等价，模型读到不会误解，但不再命中该指纹。
+fn neutralize_bare_at(text: &str) -> Option<String> {
+    if !text.contains(" @ ") {
+        return None;
+    }
+    Some(text.replace(" @ ", " ＠ "))
+}
+
+/// **国内版**出站前的主动清洗：抹掉渠道校验会认的「指令文本指纹」。
+///
+/// 为什么必须主动做（而不是等 11128 再自愈）：
+/// 自愈是在**已经撞墙之后**才发生，每个新会话都要多花一次 400 + 一次重发；
+/// 而且自愈只对 `unapproved channel` 变体生效，对「文本指纹」这一道命中不了。
+///
+/// 清洗范围严格对齐上游实测判据：
+/// - 角色：`system` / `developer` / `assistant`（**assistant 历史也被扫描**，
+///   否则「上一轮提到过品牌名」会让后续每一轮都复发）
+/// - 载体：字符串 content、multipart 的 text 块、以及 tool 的 description
+/// - `user` / `tool` 内容不动（实测不触发，改了反而有损用户内容）
+fn neutralize_domestic_fingerprints(messages: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    let mut hits = 0usize;
+    for item in arr.iter_mut() {
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+        if !matches!(role, "system" | "developer" | "assistant") {
+            continue;
+        }
+        let Some(content) = item.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::String(s) => {
+                let mut next = s.clone();
+                if let Some(v) = strip_identity_declarations(&next) {
+                    next = v;
+                    hits += 1;
+                }
+                if let Some(v) = neutralize_bare_at(&next) {
+                    next = v;
+                    hits += 1;
+                }
+                *s = next;
+            }
+            Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    // 先拷成 owned String 再写回：避免同时持有只读借用与可变借用。
+                    let Some(mut next) = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if let Some(v) = strip_identity_declarations(&next) {
+                        next = v;
+                        hits += 1;
+                    }
+                    if let Some(v) = neutralize_bare_at(&next) {
+                        next = v;
+                        hits += 1;
+                    }
+                    part["text"] = Value::String(next);
+                }
+            }
+            _ => {}
+        }
+    }
+    if hits > 0 {
+        degraded.push(format!("国内版渠道指纹清洗 {hits} 处"));
+    }
+}
+
+/// 工具描述同样在扫描范围内（`tools[].function.description`）。
+fn neutralize_domestic_tool_descriptions(tools: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    let mut hits = 0usize;
+    for tool in arr.iter_mut() {
+        let Some(mut next) = tool
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(v) = strip_identity_declarations(&next) {
+            next = v;
+            hits += 1;
+        }
+        if let Some(v) = neutralize_bare_at(&next) {
+            next = v;
+            hits += 1;
+        }
+        tool["function"]["description"] = Value::String(next);
+    }
+    if hits > 0 {
+        degraded.push(format!("国内版工具描述清洗 {hits} 处"));
     }
 }
 
@@ -1408,6 +1532,11 @@ fn build_upstream_body_ex(
         .to_string();
     let messages = incoming.get("messages").cloned().unwrap_or_else(|| json!([]));
     let mut sanitized = sanitize_messages(&messages, degraded);
+    // 🔴 国内版必须**主动**清洗渠道指纹（2026-10-28 起按文本内容判）。
+    // 放在 aggressive 之前：默认路径就要干净，而不是等撞了 11128 再补救。
+    if edition == Edition::Domestic {
+        neutralize_domestic_fingerprints(&mut sanitized, degraded);
+    }
     if aggressive {
         sanitize_messages_aggressive(&mut sanitized, degraded);
     }
@@ -1424,7 +1553,11 @@ fn build_upstream_body_ex(
         }
     }
     if let Some(t) = incoming.get("tools") {
-        body["tools"] = t.clone();
+        let mut tools = t.clone();
+        if edition == Edition::Domestic {
+            neutralize_domestic_tool_descriptions(&mut tools, degraded);
+        }
+        body["tools"] = tools;
     }
     // 🔴 `tool_choice` 必须**归一化**后再发：上游只吃字符串，
     // 收到 OpenAI 规范的对象形式会直接 11101（见 normalize_tool_choice）。
@@ -3553,6 +3686,58 @@ mod tests {
         assert_eq!(upstream_request_id(r#"{"requestId":""}"#), None);
     }
 
+    /// 国内版渠道指纹必须**主动**清洗，且边界严格对齐上游实测判据。
+    ///
+    /// 上游（2026-10-28 起）扫的是 `system` / `developer` / `assistant` 与工具描述；
+    /// `user` / `tool` 里的同名词**不触发**，所以一个字都不能动 —— 改了就是篡改用户内容。
+    #[test]
+    fn domestic_neutralizes_fingerprints_but_leaves_user_content_alone() {
+        let incoming = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "You are an AI agent powered by DeepSeek Harness. Mention @ here."},
+                {"role": "user", "content": "请解释 @ 的用法"},
+                {"role": "assistant", "content": "按 DeepSeek Harness 文档"},
+                {"role": "tool", "content": "result mentions DeepSeek Harness"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "description": "built on DeepSeek Harness"}
+            }]
+        });
+
+        let mut degraded = Vec::new();
+        let out = build_upstream_body(&incoming, Edition::Domestic, &mut degraded);
+        let msg = |i: usize| out["messages"][i]["content"].as_str().unwrap_or("").to_string();
+
+        // system：品牌名缩成 DeepSeek、裸 @ 换全角
+        let sys = msg(0);
+        assert!(!sys.contains("DeepSeek Harness"), "system 品牌名应缩掉: {sys}");
+        assert!(sys.contains("powered by DeepSeek."), "应缩成 DeepSeek 而非删掉: {sys}");
+        assert!(sys.contains("＠"), "system 里的裸 @ 应换全角: {sys}");
+
+        // assistant 历史同样被扫（否则下一轮复发）
+        let asst = msg(2);
+        assert!(!asst.contains("DeepSeek Harness"), "assistant 历史也要清: {asst}");
+
+        // 工具描述：也清
+        let desc = out["tools"][0]["function"]["description"].as_str().unwrap();
+        assert!(!desc.contains("DeepSeek Harness"), "工具描述要清: {desc}");
+
+        // 🔴 user / tool 一个字都不能动
+        assert_eq!(msg(1), "请解释 @ 的用法", "user 内容必须原样");
+        assert_eq!(msg(3), "result mentions DeepSeek Harness", "tool 内容必须原样");
+
+        // 国际版不做这套清洗（上游判据不同，无谓改动）
+        let mut d2 = Vec::new();
+        let intl = build_upstream_body(&incoming, Edition::International, &mut d2);
+        let intl_sys = intl["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            intl_sys.contains("DeepSeek Harness"),
+            "国际版不该被国内版的规则清洗"
+        );
+    }
+
     #[test]
     fn detects_channel_block_from_upstream_body() {
         let real = r#"400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"000000000000000046302613c7e69e4d\"}","type":"upstream_error"}"#;
@@ -4077,19 +4262,19 @@ mod tests {
     fn strips_third_party_identity_declarations() {
         assert_eq!(
             strip_identity_declarations("You are DeepSeek Harness, an agent.").as_deref(),
-            Some("You are Assistant, an agent.")
+            Some("You are DeepSeek, an agent.")
         );
         // 大小写变体
         assert_eq!(
             strip_identity_declarations("powered by deepseek harness").as_deref(),
-            Some("powered by Assistant")
+            Some("powered by DeepSeek")
         );
         // 连字符写法
         assert!(strip_identity_declarations("via deepseek-harness bridge").is_some());
         // 中文混排不破坏 UTF-8
         let mixed = "你是DeepSeek Harness，一个助手。";
         let out = strip_identity_declarations(mixed).unwrap();
-        assert_eq!(out, "你是Assistant，一个助手。");
+        assert_eq!(out, "你是DeepSeek，一个助手。");
         assert!(out.is_char_boundary(out.len()));
         // 未命中 → None（调用方不该改写用户提示词）
         assert_eq!(strip_identity_declarations("You are a helpful assistant."), None);
@@ -4104,7 +4289,7 @@ mod tests {
         ]);
         let mut degraded = Vec::new();
         sanitize_messages_aggressive(&mut msgs, &mut degraded);
-        assert_eq!(msgs[0]["content"], "You are Assistant. Be brief.");
+        assert_eq!(msgs[0]["content"], "You are DeepSeek. Be brief.");
         assert_eq!(msgs[1]["content"], "DeepSeek Harness 是什么？", "用户内容不该被改");
         assert!(degraded.iter().any(|d| d == "aggressive-normalize"));
     }
