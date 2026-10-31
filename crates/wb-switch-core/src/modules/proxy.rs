@@ -58,6 +58,49 @@ const RESTRICTED_COOLDOWN_BASE: Duration = Duration::from_secs(3 * 60 * 60);
 /// 递增冷却的上限：24 小时。
 const RESTRICTED_COOLDOWN_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
+// ---------------------------------------------------- 池策略（对齐社区实现）
+//
+// 参数取自开源实现 `dsh-workbuddy2api` 的池策略（2026-10 版本），
+// 它那套值是在真实风控下趟出来的，不是拍脑袋：
+//
+// | 项 | 值 |
+// |---|---|
+// | 会话粘性 | 同一会话固定一个号，TTL 30 分钟滚动续期 |
+// | 并发上限 | 单号 3 / 国际版号 2 / 整池 8 |
+// | 限流 429 | 600s 基数指数退避，封顶 2h，**已在冷却中不翻倍** |
+// | 5xx | 连续 3 次熔断，30m 起翻倍封顶 6h |
+//
+// 我们原来的选号只有一个 cursor 轮转：多账号在同一 IP 上高频互换，
+// 正是风控判定「账号共享/批量使用」最典型的形状 —— 2026-10-29 国际版
+// 5/5 号被批量限制（11140）大概率与之相关。这一组参数就是针对它。
+
+/// 会话粘性 TTL：同一会话在这段时间内固定用同一个账号，到期滚动续期。
+///
+/// 为什么要粘：同一段对话在多个账号之间跳，等于「一个人一会儿在上海一会儿在纽约」，
+/// 既是风控的异常信号，也会让上游的会话态/缓存失效。
+const STICKY_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// 单账号在途请求上限（国际版号更保守：号少、风控更敏感）。
+const MAX_INFLIGHT_DOMESTIC: u32 = 3;
+const MAX_INFLIGHT_INTERNATIONAL: u32 = 2;
+/// 整池在途上限。
+const MAX_INFLIGHT_POOL: u32 = 8;
+
+/// 429 软冷却基数与封顶。
+const RATE_LIMIT_BASE: Duration = Duration::from_secs(600);
+const RATE_LIMIT_MAX: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// 5xx 熔断：连续失败达到阈值即断开，时长翻倍、封顶 6 小时。
+const BREAKER_THRESHOLD: u32 = 3;
+const BREAKER_BASE: Duration = Duration::from_secs(30 * 60);
+const BREAKER_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// 单个请求内**换号重试**的最大次数。
+///
+/// 只在上游返回「可换号解决」的错误时用（429 / 5xx）；
+/// 参数错误、内容被拦这类客户端错误直接透传，换号只会浪费别的账号。
+const MAX_ACCOUNT_RETRY: usize = 2;
+
 /// 上游「渠道校验」（`11128`）的最大重试次数。
 ///
 /// 这个码**不是账号的问题**（同号读接口 200、打 chat 端点 11128），也**不一定**是
@@ -717,6 +760,14 @@ struct AccountLease {
     /// 累计被风控限制的次数，用于**递增冷却**（见 `RESTRICTED_COOLDOWN_BASE`）。
     /// 成功出字后清零。
     restrict_strikes: u32,
+    /// 429 软冷却截止时刻 + 连续次数（指数退避，见 `RATE_LIMIT_BASE`）。
+    rate_until: Option<Instant>,
+    rate_strikes: u32,
+    /// 5xx 熔断：连续失败计数与断开截止时刻（见 `BREAKER_BASE`）。
+    consecutive_5xx: u32,
+    open_until: Option<Instant>,
+    /// 在途请求数（并发上限用）。由 `Lease` 守卫在响应结束时归还。
+    inflight: u32,
     /// **按模型**的长冷却：`model -> 恢复时刻`。
     ///
     /// 60004 只代表「这个模型的额度用完了」，同一账号换模型仍可用（上游文案
@@ -726,9 +777,74 @@ struct AccountLease {
     model_cooldowns: HashMap<String, Instant>,
 }
 
+/// 该租约现在是否**健康可用**（只看状态，不含粘性与并发上限）。
+///
+/// 抽成独立函数是为了让「轮转选号」和「粘性命中」共用同一套判据 ——
+/// 两处判据一旦漂移，就会出现「粘性认为可用、轮转认为不可用」的矛盾。
+fn lease_usable(lease: &AccountLease, want: Option<Edition>, model: Option<&str>) -> bool {
+    if let Some(e) = want {
+        if lease.edition != e {
+            return false;
+        }
+    }
+    let now = Instant::now();
+    if lease.failed_at.map(|t| t.elapsed() < COOLDOWN).unwrap_or(false) {
+        return false;
+    }
+    // 被风控限制（11140）的号直接跳过，别拿它去撞 403。
+    if lease.restricted_until.map(|t| now < t).unwrap_or(false) {
+        return false;
+    }
+    // 429 软冷却中
+    if lease.rate_until.map(|t| now < t).unwrap_or(false) {
+        return false;
+    }
+    // 5xx 熔断中
+    if lease.open_until.map(|t| now < t).unwrap_or(false) {
+        return false;
+    }
+    if let Some(m) = model {
+        if lease
+            .model_cooldowns
+            .get(m)
+            .map(|t| *t > now)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// 借用守卫：drop 时把在途计数还给池子。
+///
+/// 必须用 RAII 而不是手动 release —— 这个函数里有多条提前 return 的分支
+/// （鉴权失败、模型不匹配、上游报错早退），手写释放漏一条就会永久占着一个并发名额，
+/// 池子越用越窄，最后表现为「莫名其妙 503」。
+struct LeaseGuard {
+    pool: Arc<Pool>,
+    uid: String,
+}
+
+impl LeaseGuard {
+    fn uid(&self) -> &str {
+        &self.uid
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.pool.release(&self.uid);
+    }
+}
+
 struct Pool {
     leases: Vec<std::sync::Mutex<AccountLease>>,
     cursor: AtomicUsize,
+    /// 会话 → (账号, 绑定到期时刻)。滚动续期，见 [`STICKY_TTL`]。
+    sticky: std::sync::Mutex<HashMap<String, (String, Instant)>>,
+    /// 整池在途总数（各 lease 的 inflight 之和，单独存一份免得到处加锁求和）。
+    inflight_total: std::sync::atomic::AtomicU32,
 }
 
 impl Pool {
@@ -743,11 +859,18 @@ impl Pool {
                         failed_at: None,
                         restricted_until: None,
                         restrict_strikes: 0,
+                        rate_until: None,
+                        rate_strikes: 0,
+                        consecutive_5xx: 0,
+                        open_until: None,
+                        inflight: 0,
                         model_cooldowns: HashMap::new(),
                     })
                 })
                 .collect(),
             cursor: AtomicUsize::new(0),
+            sticky: std::sync::Mutex::new(HashMap::new()),
+            inflight_total: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -758,6 +881,11 @@ impl Pool {
     ///
     /// 一个版本都没有可用号时**不会**悄悄换另一个版本 —— 那样只会把
     /// 「模型不存在」的 400 换个地方报出来，不如直接说清楚。
+    /// 仅供单测：纯健康轮转、不计并发也不写粘性。
+    ///
+    /// 生产路径一律走 [`Pool::pick`]（粘性 + 并发上限）。留这个口子是因为
+    /// 早期测试都是按「给一个池子问下一个号」写的，用它断言健康判据最直接。
+    #[cfg(test)]
     fn next_uid_of(&self, want: Option<Edition>, model: Option<&str>) -> Option<String> {
         if self.leases.is_empty() {
             return None;
@@ -768,37 +896,177 @@ impl Pool {
             let Ok(lease) = self.leases[idx].lock() else {
                 continue;
             };
-            if let Some(e) = want {
-                if lease.edition != e {
-                    continue;
+            if lease_usable(&lease, want, model) {
+                return Some(lease.uid.clone());
+            }
+        }
+        None
+    }
+
+    /// 带**会话粘性 + 并发上限**的选号；返回的守卫在 drop 时归还在途计数。
+    ///
+    /// 顺序对齐社区实现：粘性优先 → 健康过滤 → 轮转兜底。
+    /// 粘住的号只要健康就一直用它（TTL 内滚动续期），避免同一段对话
+    /// 在多个账号之间跳 —— 那是风控眼里最典型的「账号共享」形状。
+    fn pick(
+        self: &Arc<Self>,
+        want: Option<Edition>,
+        model: Option<&str>,
+        session: Option<&str>,
+    ) -> Option<LeaseGuard> {
+        if self.leases.is_empty() {
+            return None;
+        }
+        // 整池背压：超过上限就不再放行，由调用方回 503。
+        if self.inflight_total.load(Ordering::Relaxed) >= MAX_INFLIGHT_POOL {
+            return None;
+        }
+
+        // ① 粘性：该会话已绑定的号若仍健康，直接续期使用。
+        if let Some(key) = session {
+            let bound = self
+                .sticky
+                .lock()
+                .ok()
+                .and_then(|m| m.get(key).map(|(uid, until)| (uid.clone(), *until)));
+            if let Some((uid, until)) = bound {
+                if until > Instant::now() && self.try_acquire(&uid, want, model) {
+                    if let Ok(mut m) = self.sticky.lock() {
+                        m.insert(key.to_string(), (uid.clone(), Instant::now() + STICKY_TTL));
+                    }
+                    return Some(LeaseGuard {
+                        pool: Arc::clone(self),
+                        uid,
+                    });
+                }
+                // 绑定的号已失效 → 解绑，走下面的重新分配
+                if let Ok(mut m) = self.sticky.lock() {
+                    m.remove(key);
                 }
             }
-            let cooling = lease
-                .failed_at
-                .map(|t| t.elapsed() < COOLDOWN)
-                .unwrap_or(false);
-            if cooling {
-                continue;
-            }
-            // 被风控限制的号直接跳过，别拿它去撞 403。
-            let restricted = lease
-                .restricted_until
-                .map(|t| Instant::now() < t)
-                .unwrap_or(false);
-            if restricted {
-                continue;
-            }
-            if let Some(m) = model {
-                let model_cooling = lease
-                    .model_cooldowns
-                    .get(m)
-                    .map(|t| *t > Instant::now())
-                    .unwrap_or(false);
-                if model_cooling {
+        }
+
+        // ② 健康过滤 + 轮转
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for i in 0..self.leases.len() {
+            let idx = (start + i) % self.leases.len();
+            let uid = {
+                let Ok(lease) = self.leases[idx].lock() else {
+                    continue;
+                };
+                if lease_usable(&lease, want, model) {
+                    lease.uid.clone()
+                } else {
                     continue;
                 }
+            };
+            if !self.try_acquire(&uid, want, model) {
+                continue;
             }
-            return Some(lease.uid.clone());
+            if let Some(key) = session {
+                if let Ok(mut m) = self.sticky.lock() {
+                    m.insert(key.to_string(), (uid.clone(), Instant::now() + STICKY_TTL));
+                }
+            }
+            return Some(LeaseGuard {
+                pool: Arc::clone(self),
+                uid,
+            });
+        }
+        None
+    }
+
+    /// 在并发上限内占用一个号；成功则 inflight +1。
+    fn try_acquire(&self, uid: &str, want: Option<Edition>, model: Option<&str>) -> bool {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid != uid {
+                continue;
+            }
+            if !lease_usable(&lease, want, model) {
+                return false;
+            }
+            let cap = match lease.edition {
+                Edition::International => MAX_INFLIGHT_INTERNATIONAL,
+                Edition::Domestic => MAX_INFLIGHT_DOMESTIC,
+            };
+            if lease.inflight >= cap {
+                return false;
+            }
+            lease.inflight += 1;
+            self.inflight_total.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// 归还在途计数（由 [`LeaseGuard`] 的 Drop 调用）。
+    fn release(&self, uid: &str) {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.inflight = lease.inflight.saturating_sub(1);
+                self.inflight_total.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// 成功出字：清掉 5xx 连败计数（熔断靠它复位）。
+    fn mark_ok(&self, uid: &str) {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid == uid {
+                lease.consecutive_5xx = 0;
+                lease.open_until = None;
+                return;
+            }
+        }
+    }
+
+    /// 429：软冷却 600s 基数指数退避、封顶 2h；**已在冷却中不翻倍**
+    /// （否则用户狂点重试会把冷却越堆越厚）。返回本次剩余冷却。
+    fn mark_rate_limited(&self, uid: &str) -> Duration {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid != uid {
+                continue;
+            }
+            let now = Instant::now();
+            if let Some(until) = lease.rate_until {
+                if until > now {
+                    // 已在冷却中：保持原截止，不翻倍
+                    return until - now;
+                }
+            }
+            lease.rate_strikes = lease.rate_strikes.saturating_add(1);
+            let factor = 1u64 << lease.rate_strikes.saturating_sub(1).min(4);
+            let secs = (RATE_LIMIT_BASE.as_secs() * factor).min(RATE_LIMIT_MAX.as_secs());
+            let d = Duration::from_secs(secs);
+            lease.rate_until = Some(now + d);
+            return d;
+        }
+        RATE_LIMIT_BASE
+    }
+
+    /// 5xx：连续 3 次熔断，时长 30m 起翻倍、封顶 6h。返回断开时长（未断则 None）。
+    fn mark_server_error(&self, uid: &str) -> Option<Duration> {
+        for slot in &self.leases {
+            let Ok(mut lease) = slot.lock() else { continue };
+            if lease.uid != uid {
+                continue;
+            }
+            lease.consecutive_5xx = lease.consecutive_5xx.saturating_add(1);
+            if lease.consecutive_5xx < BREAKER_THRESHOLD {
+                return None;
+            }
+            let over = lease.consecutive_5xx - BREAKER_THRESHOLD; // 0,1,2…
+            let factor = 1u64 << over.min(4);
+            let secs = (BREAKER_BASE.as_secs() * factor).min(BREAKER_MAX.as_secs());
+            let d = Duration::from_secs(secs);
+            lease.open_until = Some(Instant::now() + d);
+            lease.consecutive_5xx = 0;
+            return Some(d);
         }
         None
     }
@@ -903,16 +1171,56 @@ fn now_ms_i64() -> i64 {
     now_ms() as i64
 }
 
-/// 取一个可用的账号（必要时先刷新 token）。
+/// 由请求体算一个**跨轮次稳定**的会话键，用于会话粘性。
+///
+/// 取「首条 system + 首条 user」的哈希：同一段对话多轮里这两条是不变的
+/// （历史只会往后面追加），所以键稳定；不同对话立刻分开。
+///
+/// 不直接用「整段 messages」的哈希 —— 那样每加一轮就换一个键，粘性等于没有。
+fn session_key(incoming: &Value) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let msgs = incoming.get("messages")?.as_array()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut filled = 0u8;
+    for m in msgs {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        let want_bit = match role {
+            "system" => 1u8,
+            "user" => 2u8,
+            _ => continue,
+        };
+        if filled & want_bit != 0 {
+            continue;
+        }
+        if let Some(c) = m.get("content").and_then(Value::as_str) {
+            role.hash(&mut h);
+            c.hash(&mut h);
+            filled |= want_bit;
+            if filled == 3 {
+                break;
+            }
+        }
+    }
+    if filled == 0 {
+        None
+    } else {
+        Some(format!("{:016x}", h.finish()))
+    }
+}
+
+/// 取一个可用的账号（必要时先刷新 token），同时占住一个并发名额。
 ///
 /// `model` 用于跳过「该模型正在长冷却」的号 —— 60004 只冻模型，不冻账号。
+/// `session` 是会话键（见 [`session_key`]），用于会话粘性。
 async fn take_account(
-    pool: &Pool,
+    pool: &Arc<Pool>,
     _cfg: &ProxyConfig,
     want: Option<Edition>,
     model: Option<&str>,
-) -> Option<Value> {
-    let uid = pool.next_uid_of(want, model)?;
+    session: Option<&str>,
+) -> Option<(Value, LeaseGuard)> {
+    let guard = pool.pick(want, model, session)?;
+    let uid = guard.uid().to_string();
     let mut acc = load_accounts().into_iter().find(|a| {
         a.get("uid").and_then(Value::as_str) == Some(uid.as_str())
             && a.get("needs_relogin").and_then(Value::as_bool) != Some(true)
@@ -941,7 +1249,7 @@ async fn take_account(
         }
     }
     let _ = upsert_account(&acc);
-    Some(acc)
+    Some((acc, guard))
 }
 
 // ---------------------------------------------------------------- 上游
@@ -2574,7 +2882,16 @@ async fn chat_completions(
         }
     }
 
-    let Some(acc) = take_account(&st.pool, &st.cfg, Some(st.edition), Some(model.as_str())).await else {
+    let session = session_key(&incoming);
+    let Some((mut acc, mut lease)) = take_account(
+        &st.pool,
+        &st.cfg,
+        Some(st.edition),
+        Some(model.as_str()),
+        session.as_deref(),
+    )
+    .await
+    else {
         let message = if st.pool.has_edition(st.edition) {
             format!(
                 "{}的账号当前都不可用（冷却中，或需要重新登录）",
@@ -2589,7 +2906,7 @@ async fn chat_completions(
         )
             .into_response();
     };
-    let uid = acc
+    let mut uid = acc
         .get("uid")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -2599,7 +2916,7 @@ async fn chat_completions(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let meta = UsageMeta {
+    let mut meta = UsageMeta {
         uid: uid.clone(),
         nickname,
         model: model.clone(),
@@ -2640,6 +2957,8 @@ async fn chat_completions(
     let mut channel_retry = 0usize;
     let mut transport_retry = 0usize;
     let mut model_retry = 0usize;
+    // 换号重试次数：只在「换号可能解决」的错误上消耗（429 / 5xx）。
+    let mut account_retry = 0usize;
     // 版本名在多处文案里要用（传输失败 / 渠道校验），提前取一次。
     let edition_label = st.edition.label();
     // 11128 自愈：第一次撞上 `unapproved channel`（负载变体）时，
@@ -2703,12 +3022,64 @@ async fn chat_completions(
             }
         };
         if r.status().is_success() {
-            // 出字即视为恢复正常：清掉风控计数，下次再被限从最短档（3h）重新起步。
+            // 出字即视为恢复正常：清掉风控计数与 5xx 连败，下次再被限从最短档重新起步。
             st.pool.clear_restrict(&uid);
+            st.pool.mark_ok(&uid);
             break r;
         }
         let raw_status = r.status();
         let text = r.text().await.unwrap_or_default();
+
+        // 🔴 429 / 5xx：**换号重试**（社区实现同样最多 3 次）。
+        // 这两类都是「这个号这一刻不行」，换一个号往往立刻就好；
+        // 参数错/内容被拦则相反 —— 换号只会把同一个 400 在别的号上再犯一次，
+        // 所以那类不在这里处理，走下面的透传路径。
+        let is_rate = raw_status.as_u16() == 429;
+        let is_5xx = raw_status.is_server_error();
+        if (is_rate || is_5xx) && account_retry < MAX_ACCOUNT_RETRY {
+            account_retry += 1;
+            if is_rate {
+                let cool = st.pool.mark_rate_limited(&uid);
+                eprintln!(
+                    "[反代] 429 限流，账号冷却 {}s，换号重试 {}/{} (uid={uid})",
+                    cool.as_secs(),
+                    account_retry,
+                    MAX_ACCOUNT_RETRY
+                );
+            } else if let Some(open) = st.pool.mark_server_error(&uid) {
+                eprintln!(
+                    "[反代] 5xx 连败达阈值，熔断 {}s，换号重试 {}/{} (uid={uid})",
+                    open.as_secs(),
+                    account_retry,
+                    MAX_ACCOUNT_RETRY
+                );
+            }
+            // 🔴 先拿到新号、再归还旧号：反过来写的话，一旦换号失败，
+            // `lease` 已被 drop，后面的 streaming 分支就没有名额可归还了。
+            // 先占后换最坏也只是短暂多占一个名额（在池子上限之内）。
+            if let Some((next_acc, next_lease)) = take_account(
+                &st.pool,
+                &st.cfg,
+                Some(st.edition),
+                Some(model.as_str()),
+                session.as_deref(),
+            )
+            .await
+            {
+                drop(lease);
+                acc = next_acc;
+                lease = next_lease;
+                uid = lease.uid().to_string();
+                meta.uid = uid.clone();
+                meta.nickname = acc
+                    .get("nickname")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                continue;
+            }
+            eprintln!("[反代] 429/5xx 后没有其他可用账号，直接返回上游错误 (uid={uid})");
+        }
         // 🔴 模型侧瞬时故障（11133/11134/14003）：官方归类「模型侧状态」，
         // 重发即可能成功。**绝不能冷却账号** —— 见 is_transient_model_error。
         if is_transient_model_error(&text) && model_retry < MAX_MODEL_RETRY {
@@ -2939,8 +3310,12 @@ async fn chat_completions(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         // bytes_stream() 返回的 impl Stream 不保证 Unpin，必须 Box::pin 一下
         let upstream = Box::pin(resp.bytes_stream());
+        // 🔴 把并发名额的所有权搬进任务体：流式响应会一直产出到 [DONE]，
+        // 名额必须活到那一刻才归还。放在外层的话，函数一 return 名额就还了，
+        // 并发上限等于没生效。
         tokio::spawn(async move {
             sse_pump(upstream, tx, meta).await;
+            drop(lease);
         });
         let body = futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -3735,6 +4110,87 @@ mod tests {
         assert!(
             intl_sys.contains("DeepSeek Harness"),
             "国际版不该被国内版的规则清洗"
+        );
+    }
+
+    /// 会话粘性：同一会话必须固定同一个号；换会话才重新分配。
+    ///
+    /// 这条是风控的核心防线之一 —— 同一段对话在多号之间跳，等于告诉上游
+    /// 「这个账号在多个地点被共享使用」。
+    #[test]
+    fn session_sticks_to_one_account() {
+        let pool = Arc::new(Pool::new(vec![
+            ("u1".to_string(), Edition::Domestic),
+            ("u2".to_string(), Edition::Domestic),
+        ]));
+
+        let g1 = pool.pick(Some(Edition::Domestic), None, Some("sess-A")).unwrap();
+        let first = g1.uid().to_string();
+        drop(g1);
+
+        // 同一会话再来两次：必须还是同一个号（cursor 已经转过也不许变）
+        for _ in 0..2 {
+            let g = pool.pick(Some(Edition::Domestic), None, Some("sess-A")).unwrap();
+            assert_eq!(g.uid(), first, "同一会话应粘住同一个账号");
+        }
+
+        // 换一个会话：应分到另一个号（两号都在池里）
+        let gb = pool.pick(Some(Edition::Domestic), None, Some("sess-B")).unwrap();
+        assert_ne!(gb.uid(), first, "不同会话应分散到不同账号");
+    }
+
+    /// 并发上限：单账号占满后不再放行，归还后恢复。
+    #[test]
+    fn inflight_cap_blocks_then_recovers() {
+        let pool = Arc::new(Pool::new(vec![(
+            "u1".to_string(),
+            Edition::International,
+        )]));
+        let a = pool.pick(Some(Edition::International), None, None);
+        let b = pool.pick(Some(Edition::International), None, None);
+        assert!(a.is_some() && b.is_some(), "国际版上限 2，前两个应放行");
+        assert!(
+            pool.pick(Some(Edition::International), None, None).is_none(),
+            "第三个必须被并发上限挡下"
+        );
+        drop(a);
+        assert!(
+            pool.pick(Some(Edition::International), None, None).is_some(),
+            "归还名额后应恢复"
+        );
+    }
+
+    /// 429 冷却：首次数 600s；**已在冷却中不翻倍**（防用户狂点把冷却堆厚）。
+    #[test]
+    fn rate_limit_backoff_does_not_stack_while_cooling() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        let d1 = pool.mark_rate_limited("u1");
+        assert_eq!(d1.as_secs(), 600, "首次 600s");
+        let d2 = pool.mark_rate_limited("u1");
+        assert!(
+            d2 <= d1,
+            "冷却期内再次 429 不能翻倍（否则越点越久）: {d2:?} > {d1:?}"
+        );
+        assert!(d2.as_secs() > 0, "剩余冷却应大于 0");
+    }
+
+    /// 5xx 熔断：连 3 次才断，断开时长 30 分钟，成功后复位。
+    #[test]
+    fn five_xx_opens_breaker_after_three() {
+        let pool = Pool::new(vec![("u1".to_string(), Edition::Domestic)]);
+        assert!(pool.mark_server_error("u1").is_none(), "第 1 次不断");
+        assert!(pool.mark_server_error("u1").is_none(), "第 2 次不断");
+        let open = pool.mark_server_error("u1").expect("第 3 次应熔断");
+        assert_eq!(open.as_secs(), 30 * 60);
+        assert!(
+            pool.next_uid_of(Some(Edition::Domestic), None).is_none(),
+            "熔断期间不选它"
+        );
+        pool.mark_ok("u1");
+        assert_eq!(
+            pool.next_uid_of(Some(Edition::Domestic), None).as_deref(),
+            Some("u1"),
+            "成功出字后应复位"
         );
     }
 
