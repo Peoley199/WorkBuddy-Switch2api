@@ -193,6 +193,10 @@ const STANDARD_PASSTHROUGH: &[&str] = &[
 ///
 /// 本仓库**默认路径就抹**（不同于上游只在自愈重试里抹）：这些短语是客户端自动
 /// 注入的固定身份声明，不是用户自己写的内容；留着只会让整条请求被拦。
+///
+/// 🔴 2026-10-28 起**国内版**还按指令文本做指纹（不只看出站头）：
+/// 除 `system` 外，`developer` 与 **`assistant` 历史**里的品牌名同样会被拦，
+/// 见 [`neutralize_domestic_fingerprints`]；`user` / `tool` 内容不触发。
 const IDENTITY_DECLARATIONS: &[&str] = &[
     "DeepSeek Harness",
     "deepseek-harness",
@@ -1570,7 +1574,10 @@ fn strip_identity_declarations(text: &str) -> Option<String> {
                     .zip(p.iter())
                     .all(|(a, b)| a.eq_ignore_ascii_case(b))
             {
-                out.push_str("Assistant");
+                // 替换词取 `DeepSeek`（原短语的前缀）：语义零损失。
+                // 曾用 `Assistant`，会造出「powered by Assistant」这种病句
+                // （上游 v1.6.28 的同款修正）。
+                out.push_str("DeepSeek");
                 i += p.len();
                 hit = true;
                 continue 'outer;
@@ -1585,6 +1592,125 @@ fn strip_identity_declarations(text: &str) -> Option<String> {
         Some(out)
     } else {
         None
+    }
+}
+
+/// 把**被空格包围的裸 `@`** 换成全角 `＠`，返回 `None` 表示没命中。
+///
+/// 国内版 11128 的第二道判据（2026-10-28，见 [`IDENTITY_DECLARATIONS`]）：
+/// 同一条消息里出现**裸 `@` 提及**（两侧都是空格）且同时出现
+/// 「`@` 前缀是路径」那段说明 → 拒。
+///
+/// 只动 ` @ ` 这一种形态，因此：
+/// - `@file`、`@scope/pkg`（@ 在词首，前面不是空格）→ 不动
+/// - `someone@example.com`（两侧无空格）→ 不动
+/// - `@"..."`（后面不是空格）→ 不动
+///
+/// 全角 `＠` 在语义上与 `@` 等价，模型读到不会误解，但不再命中该指纹。
+fn neutralize_bare_at(text: &str) -> Option<String> {
+    if !text.contains(" @ ") {
+        return None;
+    }
+    Some(text.replace(" @ ", " ＠ "))
+}
+
+/// **国内版**出站前的主动清洗：抹掉渠道校验会认的「指令文本指纹」。
+///
+/// 2026-10-28 起国内版也按**指令文本内容**拦 11128（不只是出站头）：
+/// `system` / `developer` / **`assistant` 历史**里出现两词品牌名
+/// （`DeepSeek Harness`，空格/Tab、大小写不敏感）就整条拒；
+/// `user` / `tool` 消息里的同名词**不触发**。
+///
+/// 为什么必须主动做（而不是等 11128 再自愈）：
+/// 自愈是在**已经撞墙之后**才发生，每个新会话都要先花一次 400 + 一次重发；
+/// 而且自愈只对 `unapproved channel` 变体生效，对文本指纹这一道命中不了。
+///
+/// `assistant` 历史也在扫描范围内 —— 不洗它的话，「对话里提到过品牌名」
+/// 会让后续每一轮都复发。
+///
+/// 🔴 `user` / `tool` 内容一个字不动：实测不触发，改了就是篡改用户内容。
+fn neutralize_domestic_fingerprints(messages: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = messages.as_array_mut() else {
+        return;
+    };
+    let mut hits = 0usize;
+    for item in arr.iter_mut() {
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+        if !matches!(role, "system" | "developer" | "assistant") {
+            continue;
+        }
+        let Some(content) = item.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::String(s) => {
+                let mut next = s.clone();
+                if let Some(v) = strip_identity_declarations(&next) {
+                    next = v;
+                    hits += 1;
+                }
+                if let Some(v) = neutralize_bare_at(&next) {
+                    next = v;
+                    hits += 1;
+                }
+                *s = next;
+            }
+            Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    // 先拷成 owned String 再写回：避免同时持有只读借用与可变借用。
+                    let Some(mut next) = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if let Some(v) = strip_identity_declarations(&next) {
+                        next = v;
+                        hits += 1;
+                    }
+                    if let Some(v) = neutralize_bare_at(&next) {
+                        next = v;
+                        hits += 1;
+                    }
+                    part["text"] = Value::String(next);
+                }
+            }
+            _ => {}
+        }
+    }
+    if hits > 0 {
+        degraded.push(format!("domestic-fingerprint:{hits}"));
+    }
+}
+
+/// 工具描述同样在扫描范围内（`tools[].function.description`）。
+fn neutralize_domestic_tool_descriptions(tools: &mut Value, degraded: &mut Vec<String>) {
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    let mut hits = 0usize;
+    for tool in arr.iter_mut() {
+        let Some(mut next) = tool
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(v) = strip_identity_declarations(&next) {
+            next = v;
+            hits += 1;
+        }
+        if let Some(v) = neutralize_bare_at(&next) {
+            next = v;
+            hits += 1;
+        }
+        tool["function"]["description"] = Value::String(next);
+    }
+    if hits > 0 {
+        degraded.push(format!("domestic-tool-desc:{hits}"));
     }
 }
 
@@ -2132,6 +2258,11 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
     let messages = incoming.get("messages").cloned().unwrap_or_else(|| json!([]));
     let mut sanitized = sanitize_messages(&messages, degraded);
     ensure_leading_system(edition, &mut sanitized, degraded);
+    // 🔴 国内版必须**主动**清洗渠道指纹（2026-10-28 起按文本内容判）。
+    // 放在默认路径而不是等撞了 11128 再自愈 —— 自愈要多付一次 400 + 一次重发。
+    if edition == Edition::Domestic {
+        neutralize_domestic_fingerprints(&mut sanitized, degraded);
+    }
     let mut body = json!({
         "model": model,
         "messages": sanitized,
@@ -2151,7 +2282,11 @@ fn build_upstream_body(incoming: &Value, edition: Edition, degraded: &mut Vec<St
         body["stream_options"]["include_usage"] = Value::Bool(true);
     }
     if let Some(t) = incoming.get("tools") {
-        body["tools"] = t.clone();
+        let mut tools = t.clone();
+        if edition == Edition::Domestic {
+            neutralize_domestic_tool_descriptions(&mut tools, degraded);
+        }
+        body["tools"] = tools;
     }
     // 🔴 `tool_choice` 必须**归一化**后再发：上游只吃字符串，
     // 收到 OpenAI 规范的对象形式会直接 11101（见 normalize_tool_choice）。
@@ -6430,7 +6565,7 @@ mod tests {
         let out = sanitize_messages(&msgs, &mut degraded);
         assert_eq!(out[0]["role"], "system", "developer 必须被改成 system");
         // 身份声明会被抹掉（见 strip_identity_declarations）—— 它正是 11128 的触发点。
-        assert_eq!(out[0]["content"], "You are an AI agent powered by Assistant.");
+        assert_eq!(out[0]["content"], "You are an AI agent powered by DeepSeek.");
         assert_eq!(out[1]["role"], "user", "user 消息不受影响");
         assert_eq!(
             degraded,
@@ -7358,7 +7493,7 @@ mod tests {
         });
         let mut degraded = Vec::new();
         let healed = heal_body_for_channel(&body, &mut degraded);
-        assert_eq!(healed["messages"][0]["content"], "You are Assistant.");
+        assert_eq!(healed["messages"][0]["content"], "You are DeepSeek.");
         // 🔴 图片块必须还在 —— 拍平内容会把它弄丢。
         assert!(healed["messages"][1]["content"].is_array(), "默认层不能拍平 content");
         assert_eq!(healed["messages"][1]["content"][1]["type"], "image_url");
@@ -7443,6 +7578,95 @@ mod tests {
         assert!(identity.contains("本地无法绕过"));
         assert_ne!(payload, identity, "两种变体文案要分开");
     }
+    /// 国内版渠道指纹必须**主动**清洗，且边界严格对齐实测判据。
+    ///
+    /// 国内版（2026-10-28 起）扫 `system` / `developer` / **`assistant` 历史**与
+    /// 工具描述；`user` / `tool` 里的同名词**不触发**，所以一个字都不能动 ——
+    /// 改了就是篡改用户内容。
+    #[test]
+    fn domestic_neutralizes_fingerprints_but_leaves_user_content_alone() {
+        let incoming = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "You are an AI agent powered by DeepSeek Harness. Mention @ here."},
+                {"role": "user", "content": "请解释 @ 的用法"},
+                {"role": "assistant", "content": "按 DeepSeek Harness 文档"},
+                {"role": "tool", "content": "result mentions DeepSeek Harness"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "description": "built on DeepSeek Harness"}
+            }]
+        });
+
+        let mut degraded = Vec::new();
+        let out = build_upstream_body(&incoming, Edition::Domestic, &mut degraded);
+        let msg = |i: usize| out["messages"][i]["content"].as_str().unwrap_or("").to_string();
+
+        // system：品牌名缩成 DeepSeek、裸 @ 换全角
+        let sys = msg(0);
+        assert!(!sys.contains("DeepSeek Harness"), "system 品牌名应缩掉: {sys}");
+        assert!(sys.contains("powered by DeepSeek."), "应缩成 DeepSeek 而非删掉: {sys}");
+        assert!(sys.contains("＠"), "system 里的裸 @ 应换全角: {sys}");
+
+        // assistant 历史同样被扫（否则下一轮复发）
+        let asst = msg(2);
+        assert!(!asst.contains("DeepSeek Harness"), "assistant 历史也要清: {asst}");
+
+        // 工具描述：也清
+        let desc = out["tools"][0]["function"]["description"].as_str().unwrap();
+        assert!(!desc.contains("DeepSeek Harness"), "工具描述要清: {desc}");
+
+        // 🔴 user / tool 一个字都不能动
+        assert_eq!(msg(1), "请解释 @ 的用法", "user 内容必须原样");
+        assert_eq!(msg(3), "result mentions DeepSeek Harness", "tool 内容必须原样");
+
+        // 国际版：**system 里的身份声明照旧抹**（本仓库 2026-10-24 起的既有行为，
+        // 与上游只在自愈时抹不同），但国内版新增的三项（assistant 历史 /
+        // 工具描述 / 裸 @）都不做 —— 国际版判据不同，无谓改动。
+        let mut d2 = Vec::new();
+        let intl = build_upstream_body(&incoming, Edition::International, &mut d2);
+        let intl_sys = intl["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !intl_sys.contains("DeepSeek Harness"),
+            "国际版的 system 身份声明照旧要抹（既有行为）"
+        );
+        assert!(intl_sys.contains(" @ "), "国际版不该动裸 @");
+        assert!(
+            intl["messages"][2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("DeepSeek Harness"),
+            "国际版不该清洗 assistant 历史"
+        );
+        assert!(
+            intl["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("DeepSeek Harness"),
+            "国际版不该清洗工具描述"
+        );
+    }
+
+    /// 裸 `@` 的替换边界：只动「两侧都是空格」的形态，路径 / 邮箱 / 引用一律不动。
+    #[test]
+    fn bare_at_only_rewrites_space_surrounded_mentions() {
+        assert_eq!(
+            neutralize_bare_at("ask @ bob about it").as_deref(),
+            Some("ask ＠ bob about it")
+        );
+        // 以下都不该动
+        for untouched in [
+            "see @file for details",
+            "@scope/pkg is here",
+            "mail someone@example.com",
+            "quote @\"path with spaces\"",
+            "@nospace",
+        ] {
+            assert_eq!(neutralize_bare_at(untouched), None, "不该改：{untouched}");
+        }
+    }
+
     #[test]
     fn identity_declarations_are_stripped_in_system_only() {
         let msgs = json!([
@@ -7454,19 +7678,19 @@ mod tests {
             { "role": "user", "content": "what is DeepSeek Harness?" }
         ]);
         let out = sanitize_messages(&msgs, &mut Vec::new());
-        assert_eq!(out[0]["content"], "You are Assistant. Rules.");
-        assert_eq!(out[1]["content"][0]["text"], "powered by Assistant");
+        assert_eq!(out[0]["content"], "You are DeepSeek. Rules.");
+        assert_eq!(out[1]["content"][0]["text"], "powered by DeepSeek");
         assert_eq!(out[1]["content"][1]["text"], "keep me");
         assert_eq!(out[2]["content"], "what is DeepSeek Harness?", "user 消息不动");
         // 直接测函数本身
         assert_eq!(
             strip_identity_declarations("a DeepSeek Harness b"),
-            Some("a Assistant b".to_string())
+            Some("a DeepSeek b".to_string())
         );
         assert_eq!(strip_identity_declarations("中文里没有身份声明"), None);
         assert_eq!(
             strip_identity_declarations("DeepSeek Harness"),
-            Some("Assistant".to_string())
+            Some("DeepSeek".to_string())
         );
     }
     // ---------------------------------------------------------------- 本次修复的回归测试
