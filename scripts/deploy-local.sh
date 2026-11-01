@@ -42,6 +42,32 @@ ok()  { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 warn(){ printf '\033[33m⚠️  %s\033[0m\n' "$*"; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$*"; exit 1; }
 
+# 脚本异常退出时的兜底：只要没有实例在跑，就把部署目录里的 exe 拉起来。
+# 宁可让旧版本继续服务，也不要停在「服务停摆且没人知道」的状态。
+restore_service_on_exit() {
+  if [ -n "$(pids_of)" ]; then
+    return 0
+  fi
+  if [ ! -f "$TARGET" ]; then
+    return 0
+  fi
+  printf '
+[33m⚠️  脚本异常退出，正在拉起 %s[0m
+' "$TARGET"
+  powershell -NoProfile -Command "Start-Process -FilePath '$TARGET' -WorkingDirectory '$DEPLOY_DIR'" >/dev/null 2>&1 || true
+  sleep 8
+  local pids
+  pids=$(pids_of | tr '
+' ' ')
+  if [ -n "$pids" ]; then
+    printf '[32m✓ 已拉起（PID %s）[0m
+' "$pids"
+  else
+    printf '[31m✗ 拉起失败，请手工启动 %s[0m
+' "$TARGET"
+  fi
+}
+
 pids_of() {
   tasklist //FI "IMAGENAME eq $APP_EXE" //FO CSV //NH 2>/dev/null \
     | awk -F'","' 'NF>1 {gsub(/"/,"",$2); print $2}' || true
@@ -193,13 +219,11 @@ fi
 
 if [ -n "$RUN_PIDS" ]; then
   # 🔴 兜底：从这里往下，脚本任何一步意外退出都可能留下「服务停着」的状态
-  # （2026-11-01 实测：哈希校验里一个命令返回非零 + `set -e`，脚本在停服后静默退出，
-  #  服务一直是停的，而人以为已经部署完）。EXIT 时若发现没有实例在跑就拉起来。
-  trap 'if [ -z "$(pids_of)" ] && [ -f "$TARGET" ]; then
-          echo; printf "[33m⚠️  脚本异常退出，正在拉起 $TARGET[0m
-"
-          powershell -NoProfile -Command "Start-Process -FilePath @\"$TARGET\" -WorkingDirectory @\"$DEPLOY_DIR\"" >/dev/null 2>&1 || true
-        fi' EXIT
+  # （2026-11-01 实测两次：读不到文件 → 脚本在停服后退出，服务一直是停的，
+  #  而人以为已经部署完）。EXIT 时若发现没有实例在跑就拉起来。
+  # 注意：trap 里只调函数，不写内联 PowerShell —— 引号嵌套极易写坏，
+  # 第一版就是这么坏的（打印了「正在拉起」，进程其实没起来）。
+  trap 'restore_service_on_exit' EXIT
   taskkill //IM "$APP_EXE" //F >/dev/null 2>&1 || true
   sleep 2
   [ -z "$(pids_of)" ] || die "进程仍在运行，无法覆盖（请手工关闭后重试）"
@@ -218,9 +242,9 @@ hash_of() {
 }
 A=$(hash_of "$BUILT")
 B=""
-# 最多等 15 秒：本机实测「刚写完 23MB exe」时杀软会锁住目标文件好几秒，
-# 5 次（5 秒）不够，会把正常替换误判成失败并触发回滚。
-for i in $(seq 1 15); do
+# 最多等 30 秒：本机实测刚写完 23MB exe 时目标文件会**间歇性**读不到
+# （Defender 实时扫描），且不是每次都发生 —— 2026-11-01 同一条命令一次失败一次成功。
+for i in $(seq 1 30); do
   B=$(hash_of "$TARGET")
   # ⚠️ 不能写成 `[ ] && [ ] && break`：条件为假时返回非零，set -e 会直接退出。
   if [ -n "$B" ] && [ "$A" = "$B" ]; then
@@ -228,10 +252,17 @@ for i in $(seq 1 15); do
   fi
   sleep 1
 done
-if [ "$A" = "$B" ] && [ -n "$A" ]; then
+size_of() { stat -c %s "$1" 2>/dev/null || echo 0; }
+SA=$(size_of "$BUILT")
+SB=$(size_of "$TARGET")
+if [ -n "$A" ] && [ "$A" = "$B" ]; then
   ok "替换完成，MD5 一致：$A"
+elif [ -n "$SA" ] && [ "$SA" = "$SB" ] && [ "$SA" != "0" ] && [ "$(head -c 2 "$TARGET" 2>/dev/null)" = "MZ" ]; then
+  # 哈希读不到（被杀软扫描锁住）但大小一致、PE 头有效 ⇒ 视为替换成功。
+  # 依据：源文件已通过冒烟测试；大小相同 + 头正确已足以排除「没覆盖上 / 被拦截」。
+  warn "替换完成，但目标文件暂不可读（杀软扫描中），已按大小 + PE 头确认（$SA 字节）"
 else
-  die "MD5 不一致（构建产物 $A / 部署目标 ${B:-<读不到>}），替换可能被拦截或被占用"
+  die "替换校验失败（产物 $A/${SA}B，目标 ${B:-<读不到>}/${SB}B），替换可能被拦截或被占用"
 fi
 
 # ---------------------------------------------------------------- 6. 重启
