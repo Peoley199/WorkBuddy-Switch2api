@@ -124,6 +124,19 @@
 | 5xx 三连熔断 30m→6h | **不取** | 国内版只有一个号，3 次 5xx 就让整池停摆 30 分钟 —— 2026-10-11 的教训正是「5xx 冻号把网络抖动放大成整池故障」（见 `MAX_TRANSPORT_RETRY`）。上游这条与换号重试配套，但我们的池子规模撑不住它的代价 |
 | 4 条单测 | 部分移植 | 粘性/并发用本仓库的结构重写；429 退避与 5xx 熔断随实现一并跳过 |
 
+### 2026-11-05 · 上游 `b042e82`（v1.6.30：反代出网代理，默认直连）
+
+纯新增功能，与本仓库独有实现无冲突，全量移植。仅接线方式有一处本地差异：
+
+| 上游内容 | 我们的处理 | 本地修正与理由 |
+|---|---|---|
+| `ProxyConfig.upstream_proxy` + `effective_upstream_proxy()`（空/direct/none=直连，配置 > `WB_UPSTREAM_PROXY`） | 原样移植 | — |
+| `apply_upstream_proxy()`（未配置显式 `.no_proxy()`，防 GUI 继承 `HTTP_PROXY` 悄悄走代理） | 原样移植 | — |
+| chat client 套代理 | 移植 + 接线差异 | 本仓库 chat 请求全部走 `AppState.stream_upstream`（**建一次复用**），在 `run_endpoint_until` 里对该 client 套代理；上游是每请求新建 client。行为等价 |
+| models client 套代理 | 原样移植 | — |
+| 前端「出网代理」输入框 + 「填 7897」按钮 | 原样移植 | dist 不入库，由 CI 构建（本地 `npm run build` 已验证通过） |
+| v1/v2 旧配置迁移补 `upstream_proxy: None` | 原样移植 | — |
+
 ## 刻意不同步（同步时必须保护）
 
 | 项 | 原因 |
