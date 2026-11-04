@@ -297,6 +297,13 @@ pub struct ProxyConfig {
     /// 国际版入口。
     #[serde(default)]
     pub international: Endpoint,
+    /// 反代**出网**代理：反代请求上游时走的代理，形如 `http://127.0.0.1:7897`。
+    ///
+    /// 留空 = **直连**（并且会显式关掉 reqwest 的「跟随环境变量代理」，
+    /// 避免 GUI 从 shell 继承了 `HTTP_PROXY` 却没人知道）。
+    /// `direct` / `none` 也视为直连，方便临时关掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -304,11 +311,49 @@ impl Default for ProxyConfig {
         Self {
             domestic: Endpoint::default(),
             international: Endpoint::default(),
+            upstream_proxy: None,
         }
     }
 }
 
 impl ProxyConfig {
+    /// 实际生效的出网代理地址（`None` = 直连）。
+    ///
+    /// 优先级：配置文件 → 环境变量 `WB_UPSTREAM_PROXY`。
+    /// `""` / `direct` / `none` 都按直连处理，方便临时关掉而不用删字段。
+    pub fn effective_upstream_proxy(&self) -> Option<String> {
+        let raw = self
+            .upstream_proxy
+            .clone()
+            .or_else(|| std::env::var("WB_UPSTREAM_PROXY").ok())?;
+        let v = raw.trim().to_string();
+        if v.is_empty() || v.eq_ignore_ascii_case("direct") || v.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// 给上游请求用的 client builder 套上出网策略。
+    ///
+    /// 🔴 未配置时必须显式 `.no_proxy()`：reqwest 默认会读 `HTTP_PROXY` /
+    /// `HTTPS_PROXY` / `ALL_PROXY` 环境变量。GUI 应用从 shell 启动时会继承这些变量，
+    /// 于是「我明明没配代理」却实际走了代理，行为不可预期、排查极难。
+    /// 显式声明直连，配置说了算。
+    pub fn apply_upstream_proxy(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self.effective_upstream_proxy() {
+            Some(url) => match reqwest::Proxy::all(&url) {
+                Ok(p) => builder.proxy(p),
+                // 地址写错不该让整个入口起不来：退回直连并留一条日志。
+                Err(e) => {
+                    eprintln!("[反代] 出网代理地址无效，已退回直连：{url} ({e})");
+                    builder.no_proxy()
+                }
+            },
+            None => builder.no_proxy(),
+        }
+    }
+
     /// 取某个版本的接入点。
     pub fn endpoint(&self, e: Edition) -> &Endpoint {
         match e {
@@ -404,6 +449,8 @@ impl ProxyConfig {
                 ..Endpoint::default()
             },
             international: Endpoint::default(),
+            // 旧配置没有出网代理概念 → 保持直连，不擅自改用户网络行为。
+            upstream_proxy: None,
         }
         .resolved()
     }
@@ -428,6 +475,8 @@ impl ProxyConfig {
                 accounts: old.accounts,
                 ..Endpoint::default()
             },
+            // v2 也没有出网代理字段 → 直连。
+            upstream_proxy: None,
         }
         .resolved()
     }
@@ -2911,8 +2960,8 @@ async fn fetch_edition_models(
         )
     })?;
     let url = models_url(&acc);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+    let client = cfg
+        .apply_upstream_proxy(reqwest::Client::builder().timeout(Duration::from_secs(20)))
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(&url);
@@ -6001,17 +6050,18 @@ async fn run_endpoint_until(
         let _ = ready.send(Err(msg.clone()));
         return Err(msg);
     }
+    // 🔴 client 要在 `cfg` 被 move 进 AppState **之前**建好 —— 字段初始化按书写
+    // 顺序求值，`cfg` 先被 move 进第一个字段，后面再借就会 E0382。
+    let stream_client = cfg
+        .apply_upstream_proxy(reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT))
+        .build()
+        .expect("reqwest client 构建失败只在 TLS 后端异常时发生");
     let st = AppState {
         cfg,
         pool,
         edition,
         endpoint: Arc::new(endpoint),
-        stream_upstream: Arc::new(
-            reqwest::Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .build()
-                .expect("reqwest client 构建失败只在 TLS 后端异常时发生"),
-        ),
+        stream_upstream: Arc::new(stream_client),
         sticky: sticky_for(edition),
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -6764,6 +6814,33 @@ mod tests {
     /// 真实响应体长这样（上游把内层 JSON 当字符串塞进 `message`）：
     /// `400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an
     /// unapproved channel\",...}","type":"upstream_error"}`
+    /// 出网代理的取值口径：空 / direct / none 一律视为直连。
+    ///
+    /// 这条不能想当然：如果 `""` 被当成「有一个空的代理地址」交给 reqwest，
+    /// 要么建 client 失败，要么静默退回环境变量代理 —— 两种都很难查。
+    #[test]
+    fn upstream_proxy_blank_means_direct() {
+        // 环境变量优先级低于配置；这里只测配置本身的解析口径。
+        let mut cfg = ProxyConfig::default();
+        assert_eq!(cfg.effective_upstream_proxy(), None, "默认必须是直连");
+
+        for blank in ["", "   ", "direct", "NONE"] {
+            cfg.upstream_proxy = Some(blank.to_string());
+            assert_eq!(
+                cfg.effective_upstream_proxy(),
+                None,
+                "{blank:?} 应视为直连"
+            );
+        }
+
+        cfg.upstream_proxy = Some("  http://127.0.0.1:7897  ".to_string());
+        assert_eq!(
+            cfg.effective_upstream_proxy().as_deref(),
+            Some("http://127.0.0.1:7897"),
+            "正常地址应去掉首尾空白后返回"
+        );
+    }
+
     #[test]
     fn detects_channel_block_from_upstream_body() {
         let real = r#"400: {"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"000000000000000046302613c7e69e4d\"}","type":"upstream_error"}"#;
